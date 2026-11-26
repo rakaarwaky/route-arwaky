@@ -1,0 +1,27 @@
+[package]
+name = "aisix-ratelimit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aisix: fixed-window rate limiter (commit/read-only modes) + semaphore-based concurrency"
+
+[dependencies]
+aisix-core = { path = "../aisix-core" }
+aisix-redis = { path = "../aisix-redis" }
+aisix-obs = { path = "../aisix-obs" }
+tokio.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+redis.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+# Paused Tokio time makes the unavailable-lease fail-open regression
+# deterministic without introducing a wall-clock scheduling race in CI.
+tokio = { workspace = true, features = ["test-util"] }
