@@ -4,15 +4,11 @@
 //! coherent rebuild (compaction, initial load) and atomically swaps it into
 //! a [`SnapshotHandle<AisixSnapshot>`]. The data plane only sees the handle.
 
-use super::a2a_agent::A2aAgent;
 use super::apikey::ApiKey;
 use super::budget::{Budget, BudgetPolicy};
 use super::cache_policy::CachePolicy;
 use super::claim_mapping::ClaimMapping;
 use super::guardrail::{Guardrail, GuardrailAttachment};
-use super::mcp_auth_settings::McpAuthSettings;
-use super::mcp_policy::McpPolicy;
-use super::mcp_server::McpServer;
 use super::model::Model;
 use super::observability_exporter::ObservabilityExporter;
 use super::oidc_provider::OidcProvider;
@@ -37,7 +33,7 @@ pub struct AisixSnapshot {
     pub guardrails: ResourceTable<Guardrail>,
     /// Attachment rows: `/aisix/<env>/guardrail_attachments/<uuid>`.
     /// Each row binds a guardrail definition to a scope (env / model /
-    /// mcp_server / api_key / team). `GuardrailIndex::build_from_snapshot` consumes
+    /// api_key / team). `GuardrailIndex::build_from_snapshot` consumes
     /// both this table and `guardrails` to build the per-request resolver.
     pub guardrail_attachments: ResourceTable<GuardrailAttachment>,
     /// Per-env cache policies. Stage 2 honors only the existence of an
@@ -48,18 +44,6 @@ pub struct AisixSnapshot {
     /// fan-out POST per chat completion (see `aisix-obs::OtlpHttpFanOut`).
     pub observability_exporters: ResourceTable<ObservabilityExporter>,
     pub rate_limit_policies: ResourceTable<RateLimitPolicy>,
-    /// Registered upstream MCP servers: `/aisix/<env>/mcp_servers/<uuid>`. The
-    /// MCP gateway endpoint aggregates each enabled server's tools and routes
-    /// tool calls back to the owning server.
-    pub mcp_servers: ResourceTable<McpServer>,
-    /// MCP access policies: `/aisix/<env>/mcp_policies/<uuid>`. Environment-
-    /// default and team-scoped rows the MCP gateway endpoint combines with
-    /// each caller key's `mcp_access` block into the per-request tool ACL.
-    pub mcp_policies: ResourceTable<McpPolicy>,
-    /// Registered upstream A2A agents: `/aisix/<env>/a2a_agents/<uuid>`. The
-    /// A2A gateway endpoint fronts each enabled agent, forwarding JSON-RPC
-    /// requests to it and serving its card with URLs rewritten to the gateway.
-    pub a2a_agents: ResourceTable<A2aAgent>,
     /// Trusted external identity providers for inbound JWT authentication:
     /// `/aisix/<env>/oidc_providers/<uuid>`. The proxy auth path matches a
     /// JWT bearer's `iss` against these rows and, on success, binds the
@@ -77,12 +61,6 @@ pub struct AisixSnapshot {
     /// proxy matches them after the typed routes (path) or before them
     /// (foreign `Host`).
     pub passthrough_routes: ResourceTable<PassthroughRoute>,
-    /// The environment's inbound MCP OAuth discovery identity:
-    /// `/aisix/<env>/mcp_auth_settings/<env-uuid>` — a singleton row
-    /// (cp-api keys it by the environment id). Together with at least
-    /// one enabled `oidc_providers` row it activates the `/mcp`
-    /// RFC 9728 discovery surface (AISIX-Cloud#1143).
-    pub mcp_auth_settings: ResourceTable<McpAuthSettings>,
     /// The environment's own pricing documents:
     /// `/aisix/<env>/pricing/<uuid>`. Indexed by `key`, and consulted
     /// before [`AisixSnapshot::global_pricing`] so an organization can
@@ -129,13 +107,9 @@ impl AisixSnapshot {
             + self.cache_policies.len()
             + self.observability_exporters.len()
             + self.rate_limit_policies.len()
-            + self.mcp_servers.len()
-            + self.mcp_policies.len()
-            + self.a2a_agents.len()
             + self.oidc_providers.len()
             + self.claim_mappings.len()
             + self.passthrough_routes.len()
-            + self.mcp_auth_settings.len()
             + self.pricing.len()
             + self.global_pricing.len()
             + self.teams.len()

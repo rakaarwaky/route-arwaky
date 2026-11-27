@@ -1,7 +1,7 @@
 //! `ProviderKey` entity — managed upstream provider credential.
 //!
 //! A ProviderKey lets operators store an upstream provider's API key
-//! (OpenAI, Anthropic, Gemini, DeepSeek, …) once and have many Models
+//! (OpenAI, DeepSeek, …) once and have many Models
 //! reference it by id (`provider_key_id`). Rotating the key then
 //! becomes a single PUT against the ProviderKey rather than rewriting
 //! every Model that uses it.
@@ -53,51 +53,14 @@ pub struct ProviderKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter: Option<Adapter>,
 
-    /// Azure OpenAI REST API version for this key's requests. Applies only
-    /// when `adapter` is `azure-openai`; every other adapter ignores it.
-    ///
-    /// A dated version (`2024-10-21`, `2025-04-01-preview`) keeps each
-    /// request on its versioned route with that value as the `api-version`
-    /// query parameter: `/openai/deployments/<deployment>/<operation>` for
-    /// chat completions, embeddings, images and audio,
-    /// `/openai/realtime?deployment=<deployment>` for realtime sessions, and
-    /// `/openai/files`, `/openai/batches` and `/openai/fine_tuning/jobs` for
-    /// files, batches and fine-tuning. `v1` sends requests to the v1 API,
-    /// `/openai/v1/<operation>`, with no `api-version` query and, for the
-    /// operations addressed to a deployment, the deployment name as the
-    /// request's `model` (realtime sessions take it as the `model` query
-    /// parameter); `preview` and `latest` are
-    /// accepted as aliases of `v1` and behave identically. A dated value
-    /// applies to every operation sent with this key, so it must be one
-    /// that each operation in use supports (realtime sessions, for
-    /// example, are not in every dated version); use a separate key per
-    /// version when they differ.
-    ///
-    /// When omitted, each operation uses its own default dated version:
-    /// `2024-10-21` for chat completions (and the Responses and Messages
-    /// requests translated to it), embeddings, audio transcriptions, audio
-    /// translations, files, batches and fine-tuning; `2025-04-01-preview` for
-    /// audio speech, image generations and image edits; `2024-10-01-preview`
-    /// for realtime sessions.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(regex(pattern = r"^(\d{4}-\d{2}-\d{2}(-preview)?|v1|preview|latest)$"))]
-    pub api_version: Option<String>,
-
     /// API surfaces this upstream serves natively, beyond the one its
     /// `adapter` already implies, and the base URL each one lives at.
     ///
-    /// One upstream account often exposes more than one protocol, on
-    /// different paths of the same host — an OpenAI-compatible
-    /// `/v1/chat/completions` under `…/v1` and an Anthropic-compatible
-    /// `/v1/messages` under `…/anthropic`, both authenticated by the same
-    /// credential. `api_base` can only name one of them, so without this
-    /// field every request the declared path cannot serve gets translated
-    /// instead — losing whatever the target protocol carries that the
-    /// canonical chat shape does not (prompt-cache breakpoints, thinking
-    /// blocks). Declaring the second entry here lets each inbound protocol
-    /// reach its own native path under the one credential.
+    /// `/v1/chat/completions` is always reached through the bridge at
+    /// `api_base`, so there is no choice to declare there. The Responses
+    /// API, by contrast, is not something every OpenAI-compatible endpoint
+    /// serves, which is what this map declares — see [`ProviderApis`].
     ///
-    /// Each surface resolves on its own terms; see [`ProviderApis`].
     /// Surfaces this map has no key for — embeddings, audio, images,
     /// videos, files/batches/fine-tuning, rerank — always use `api_base`,
     /// exactly as before.
@@ -155,11 +118,10 @@ pub struct ProviderKey {
     ///
     /// Honoured on every surface that dispatches through the Provider
     /// Key's own client: chat completions, completions, embeddings,
-    /// images, audio, `/v1/messages` (and `count_tokens`), `/v1/responses`,
-    /// rerank, videos, the files/batches/fine-tuning surface and
-    /// `/passthrough/*`. Not honoured for Amazon Bedrock or `/v1/realtime`,
-    /// which connect on their own transports — the same two that
-    /// `tls` does not reach.
+    /// images, audio, `/v1/responses`, rerank, videos, the
+    /// files/batches/fine-tuning surface and `/passthrough/*`. Not
+    /// honoured for `/v1/realtime`, which connects on its own transport —
+    /// the same one `tls` does not reach.
     ///
     /// Not applicable when the gateway reaches its upstreams through a
     /// forward proxy (`HTTPS_PROXY` / `ALL_PROXY` in the gateway's
@@ -184,25 +146,10 @@ pub struct ProviderKey {
 pub enum ApiSurface {
     /// OpenAI-wire `/v1/responses`.
     Responses,
-    /// Anthropic-wire `/v1/messages`, and its `/count_tokens` sub-route.
-    Messages,
-    /// Google Gemini generateContent and streamGenerateContent.
-    Gemini,
 }
 
 /// Per-surface native entry points on one upstream.
 ///
-/// Each protocol can use a separate base URL:
-///
-/// - `messages` is **additive**. An `adapter: anthropic` key (or the
-///   `anthropic` vendor) speaks that wire by declaration and keeps serving
-///   `/v1/messages` natively whatever this map says; listing it here adds
-///   the route to a key whose adapter is something else. That is the
-///   DeepSeek/Zhipu shape — an OpenAI-compatible key whose vendor also
-///   fronts an Anthropic-compatible path. An entry's own `base` always
-///   decides WHERE the Anthropic wire lives, for the verbatim
-///   passthrough and for the bridge that translates into it alike;
-///   without one it is `api_base`.
 /// - `responses` is **authoritative**. Once this map exists, `/v1/responses`
 ///   is served natively only if it is listed. The Responses API is a strict
 ///   superset of chat completions rather than a rename, so an
@@ -212,27 +159,12 @@ pub enum ApiSurface {
 ///   gets the request translated to chat completions instead of 404'd
 ///   upstream.
 ///
-/// - `gemini` enables native Google Gemini generation for Gemini requests.
-///   Without this entry, the gateway translates those requests to chat.
-///
-/// With no map at all, the gateway infers `/v1/messages` from the vendor id or the
-/// `anthropic` adapter, `/v1/responses` from the vendor id alone.
+/// With no map at all, the gateway infers the surface from the vendor id.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 pub struct ProviderApis {
     /// OpenAI-wire `/v1/responses`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub responses: Option<ApiEndpoint>,
-
-    /// Anthropic-wire `/v1/messages` (and `/v1/messages/count_tokens`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub messages: Option<ApiEndpoint>,
-
-    /// Google Gemini generateContent and streamGenerateContent. Set `base`
-    /// to the versioned Gemini API root. When omitted, the gateway uses
-    /// `api_base`, or Google's `https://generativelanguage.googleapis.com/v1beta`
-    /// when neither base is set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gemini: Option<ApiEndpoint>,
 }
 
 impl ProviderApis {
@@ -240,8 +172,6 @@ impl ProviderApis {
     pub fn get(&self, surface: ApiSurface) -> Option<&ApiEndpoint> {
         match surface {
             ApiSurface::Responses => self.responses.as_ref(),
-            ApiSurface::Messages => self.messages.as_ref(),
-            ApiSurface::Gemini => self.gemini.as_ref(),
         }
     }
 }
@@ -474,8 +404,8 @@ pub struct TelemetryTags {
     #[serde(default)]
     pub featured: bool,
 
-    /// Branded provider slug for catalog entries, such as `"openai"` or
-    /// `"anthropic"`. Bring-your-own providers leave this field unset.
+    /// Branded provider slug for catalog entries, such as `"openai"`.
+    /// Bring-your-own providers leave this field unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branded_provider: Option<String>,
 
@@ -519,7 +449,7 @@ pub struct RequestOverrides {
 
     /// Inbound client headers forwarded to the upstream, as single-`*`
     /// glob patterns matched case-insensitively against the header name
-    /// (`"anthropic-beta"`, `"x-trace-*"`, `"authorization"`). Empty — the
+    /// (`"x-trace-*"`, `"authorization"`). Empty — the
     /// default — forwards nothing, which is the behavior of every
     /// standard-protocol endpoint before AISIX-Cloud#1167.
     ///
@@ -547,17 +477,11 @@ pub struct RequestOverrides {
     /// consent to hand a third party the caller's credential or to graft
     /// the caller's trace onto that party's telemetry.
     ///
-    /// Two cases where a named header still does not reach the upstream. A
-    /// `default_headers` entry of the same name wins it for every name
-    /// except a credential slot: both are operator configuration and the
-    /// static one is the more specific choice, but in a credential slot the
-    /// forwarded value is precisely the one that was asked for, so it takes
-    /// the slot from the static entry. And on an AWS Bedrock provider the
-    /// request signer owns `authorization`, `x-amz-date`,
-    /// `x-amz-content-sha256`, `x-amz-security-token`, `x-amz-target` and
-    /// `x-amzn-bedrock-accept`, and drops any supplied value — a value
-    /// there would not authenticate anyone: it either loses to the signer
-    /// or breaks the signature.
+    /// A `default_headers` entry of the same name wins a named header for
+    /// every name except a credential slot: both are operator configuration
+    /// and the static one is the more specific choice, but in a credential
+    /// slot the forwarded value is precisely the one that was asked for,
+    /// so it takes the slot from the static entry.
     ///
     /// Naming a credential slot needs a data plane new enough to honor
     /// it; an older one refuses those names outright, so the pattern has
@@ -568,9 +492,9 @@ pub struct RequestOverrides {
     /// say: `host`, the hop-by-hop headers that describe the caller's own
     /// connection, and the gateway's `x-aisix-*` namespace. The headers
     /// describing a body this gateway re-serializes or a response shape it
-    /// parses (`content-type`, `content-length`, `accept`,
-    /// `anthropic-version`, `x-stainless-*`) are excluded for the same
-    /// reason. `traceparent` and `tracestate` are forwarded only when a
+    /// parses (`content-type`, `content-length`, `accept`) are excluded
+    /// for the same reason. `traceparent` and `tracestate` are forwarded
+    /// only when a
     /// pattern names them exactly — a glob is not read as consent to graft
     /// the caller's trace onto the upstream's telemetry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -751,10 +675,10 @@ mod tests {
         );
     }
 
-    /// The override follows the NAME, so a second protocol declared on
-    /// the same host is covered by the same entry — and one on a
-    /// different host is deliberately not, rather than being silently
-    /// redirected onto the private link.
+    /// A declared surface on a DIFFERENT host does not inherit the
+    /// override — rather than being silently redirected onto the private
+    /// link — while one on the same host is covered, because it is the
+    /// same name.
     #[test]
     fn resolve_addresses_are_scoped_to_the_api_base_hostname() {
         let key = pk(serde_json::json!({
@@ -762,8 +686,7 @@ mod tests {
             "api_key": "sk-x",
             "api_base": "https://vendor.example.com/v1",
             "apis": {
-                "messages": {"base": "https://elsewhere.example.net/v1"},
-                "responses": {"base": "https://vendor.example.com/openai"},
+                "responses": {"base": "https://elsewhere.example.net/v1"},
             },
             "resolve_addresses": ["2001:db8::5"],
         }));
@@ -967,7 +890,6 @@ mod tests {
             api_base: None,
             provider: String::new(),
             adapter: None,
-            api_version: None,
             apis: None,
             telemetry_tags: TelemetryTags::default(),
             request: None,

@@ -142,25 +142,15 @@ pub(crate) struct SettledWinner {
 
 /// What a route that never names a model reports in place of one.
 ///
-/// `/mcp`, `/a2a/:agent` and the passthrough namespace tunnel to an upstream
-/// the caller addressed by route rather than by model, and their own usage
-/// events are attributed by those names instead. A cancelled request on one
-/// of them has to carry the same ones, or its row is the only one of that
-/// family an operator cannot tell apart from any other (AISIX-Cloud#1571).
-/// Every field is empty on the model-named families.
+/// The passthrough namespace tunnels to an upstream the caller addressed
+/// by route rather than by model, and its own usage events are attributed
+/// by that name instead. A cancelled request on one has to carry the same
+/// one, or its row is the only one of that family an operator cannot tell
+/// apart from any other (AISIX-Cloud#1571). Empty on the model-named
+/// families.
 #[derive(Clone, Default)]
 pub(crate) struct RouteIdentity {
     pub passthrough_route: String,
-    pub mcp_server: String,
-    /// The tool the JSON-RPC body named, once it has been parsed — a cancel
-    /// landing before that leaves it empty rather than guessing.
-    pub mcp_tool: String,
-    pub a2a_agent: String,
-    /// The caller's raw JSON-RPC method, unbounded by nature.
-    pub a2a_method: String,
-    /// The canonical operation that method names, from a fixed set — what a
-    /// per-operation figure groups by, and what the completed row carries.
-    pub a2a_operation: String,
 }
 
 /// What a cancelled request needs to emit its own usage events. See the
@@ -168,8 +158,8 @@ pub(crate) struct RouteIdentity {
 #[derive(Default)]
 pub(crate) struct CancelContext {
     /// The caller, as the [`ClientContext`] extractor resolved it. `None`
-    /// on the routes that resolve their principal themselves — `/mcp` and
-    /// `/a2a` never run that extractor — where [`auth`](Self::auth) carries
+    /// on the routes that resolve their principal themselves — a passthrough
+    /// route never runs that extractor — where [`auth`](Self::auth) carries
     /// the identity instead and the two IP-derived fields stay empty,
     /// exactly as those families' own events leave them.
     pub client: Option<ClientContext>,
@@ -179,8 +169,8 @@ pub(crate) struct CancelContext {
     pub auth: Option<crate::auth::AuthenticatedKey>,
     /// See [`RouteIdentity`].
     pub route: RouteIdentity,
-    /// `UsageEvent::request_headers`, from [`note_client`] or, on `/mcp`
-    /// and `/a2a`, from [`note_request_headers`].
+    /// `UsageEvent::request_headers`, from [`note_client`] or, on the
+    /// passthrough routes, from [`note_request_headers`].
     pub request_headers: std::collections::BTreeMap<String, String>,
     /// The surface the request RESOLVED, when the path cannot say.
     ///
@@ -193,10 +183,9 @@ pub(crate) struct CancelContext {
     /// would then be filed as an abandoned chat call with no model.
     pub surface: Option<crate::operation::Surface>,
     /// Set by a route that files no usage row at ANY outcome but shares a
-    /// normalized endpoint label with a metering sibling — the A2A agent
-    /// card, which normalizes to `/a2a` like the calls do. The guard has
+    /// normalized endpoint label with a metering sibling. The guard has
     /// only the label, so the route has to say so itself or a cancelled
-    /// discovery fetch is filed as an agent call.
+    /// unmetered request is filed as a metered one.
     pub unmetered: bool,
     /// The authenticated `api_key` row's id. Empty on an unauthenticated
     /// path, which the cancel emitter treats as "nothing to attribute".
@@ -384,7 +373,6 @@ impl PendingAccessLog {
             routing_fallback_count: self.routing_fallback_count,
             error_kind: (!event.error_class.is_empty()).then_some(event.error_class.as_str()),
             error: (!event.error_message.is_empty()).then_some(event.error_message.as_str()),
-            mcp: None,
             // Off the EVENT, not the cell: this emitter writes the line
             // beside the row cp-api stores, and the two must not be able to
             // disagree about the same request. Empty means the surface had
@@ -570,7 +558,7 @@ impl UpstreamClock {
 impl Cell {
     /// Complete the request's line from the terminal usage event with what
     /// its writer did not have in hand: the failure, for the families that
-    /// hand back an already-rendered response (`/a2a`, `/mcp`) or report a
+    /// hand back an already-rendered response (a passthrough route) or report a
     /// refusal as a success (a buffered output guardrail block); and the
     /// token counts, for every inline writer that never reads them itself
     /// (`/v1/messages`, `/v1/embeddings`, `/v1/responses`, …). The line is
@@ -647,9 +635,10 @@ struct BodyCounters {
 #[derive(Default)]
 pub(crate) struct InternalCall {
     pub(crate) purpose: Option<aisix_obs::InternalCallPurpose>,
-    /// `UsageEvent::operation` of the call: `embeddings`, `systemone`, or `decisions`.
+    /// `UsageEvent::operation` of the call: `embeddings`.
     pub(crate) operation: &'static str,
-    /// The Model the call went to, empty for an inline classifier.
+    /// The Model the call went to, empty when it could not be resolved
+    /// (a dangling reference).
     pub(crate) model_id: String,
     pub(crate) model_name: String,
     /// The Provider Key the call went out on.
@@ -1303,7 +1292,7 @@ pub(crate) fn note_client(client: &ClientContext, api_key_id: &str) {
     with_cancel(|c| {
         // Never blank an id the auth chokepoint already resolved: this
         // extractor reads the api_key EXTENSION, which a route that
-        // authenticates inside its own handler (passthrough, `/mcp`) has
+        // authenticates inside its own handler (a passthrough route) has
         // not set yet, and an empty write here would undo it.
         if !api_key_id.is_empty() {
             c.api_key_id = api_key_id.to_string();
@@ -1314,15 +1303,16 @@ pub(crate) fn note_client(client: &ClientContext, api_key_id: &str) {
 }
 
 /// Note the request headers a usage event records, for the routes that
-/// build no [`ClientContext`] (`/mcp`, `/a2a`).
+/// build no [`ClientContext`] (the passthrough routes).
 pub(crate) fn note_request_headers(headers: &std::collections::BTreeMap<String, String>) {
     with_cancel(|c| c.request_headers = headers.clone());
 }
 
 /// Note the authenticated principal. Called from the `AuthenticatedKey`
 /// extractor — the one place every authenticated route resolves who is
-/// calling, including the two that build no [`ClientContext`] and would
-/// otherwise reach the cancel emitter with nothing to attribute the row to.
+/// calling, including the passthrough routes, which build no
+/// [`ClientContext`] and would otherwise reach the cancel emitter with
+/// nothing to attribute the row to.
 ///
 /// `api_key_id` is written here as well as by [`note_client`]. Both assign
 /// unconditionally, so the later writer wins — which changes nothing,
@@ -1350,36 +1340,6 @@ pub(crate) fn note_passthrough_route(route: &str) {
         // [`CancelContext::surface`] for the two route shapes whose path
         // says something else entirely.
         c.surface = Some(crate::operation::PASSTHROUGH);
-    });
-}
-
-/// Note the MCP server the request addressed, and the tool its JSON-RPC body
-/// named. Called twice: once with an empty `tool` before the body is read,
-/// so a cancel during the upload still reports the server a scoped entry
-/// named in its path, and again once the body has been parsed. Empty
-/// arguments never overwrite what is already there.
-pub(crate) fn note_mcp_call(server: &str, tool: &str) {
-    with_cancel(|c| {
-        if !server.is_empty() {
-            c.route.mcp_server = server.to_string();
-        }
-        if !tool.is_empty() {
-            c.route.mcp_tool = tool.to_string();
-        }
-    });
-}
-
-/// Note the A2A agent the request addressed and the JSON-RPC method it
-/// called.
-pub(crate) fn note_a2a_call(agent: &str, method: &str, operation: &str) {
-    with_cancel(|c| {
-        c.route.a2a_agent = agent.to_string();
-        if !method.is_empty() {
-            c.route.a2a_method = method.to_string();
-        }
-        if !operation.is_empty() {
-            c.route.a2a_operation = operation.to_string();
-        }
     });
 }
 
@@ -1465,7 +1425,8 @@ pub(crate) fn defer_access_log(
 /// emitter will write the access-log line.
 ///
 /// For the handlers that wrap their whole dispatch and log the wrapper's
-/// status (`/a2a`): the streaming branch is several frames below the tail
+/// status (a streaming passthrough route): the streaming branch is several
+/// frames below the tail
 /// that owns the line's fields, so it raises a flag there and the tail
 /// parks the line instead of writing it.
 pub(crate) fn note_stream_owns_access_log() {
@@ -1592,7 +1553,7 @@ pub(crate) fn note_error_source(source: aisix_obs::ErrorSource) {
 }
 
 /// What ended a request whose emit holds only the status of a rendered
-/// response (`/a2a`, `/mcp`, the discovery documents): what was noted, else
+/// response (a passthrough route): what was noted, else
 /// what its terminal usage event names, else a response the gateway wrote
 /// itself.
 pub(crate) fn rendered_error_source(status: u16) -> aisix_obs::ErrorSource {

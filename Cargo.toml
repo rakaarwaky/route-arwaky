@@ -1,16 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/aisix-a2a",
     "crates/aisix-core",
     "crates/aisix-etcd",
     "crates/aisix-gateway",
-    "crates/aisix-mcp",
     "crates/aisix-provider-openai",
-    "crates/aisix-provider-anthropic",
-    "crates/aisix-provider-vertex",
-    "crates/aisix-provider-azure-openai",
-    "crates/aisix-provider-bedrock",
     "crates/aisix-proxy",
     "crates/aisix-admin",
     "crates/aisix-obs",

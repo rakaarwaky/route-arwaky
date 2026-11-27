@@ -14,6 +14,11 @@
 //! Only OpenAI models support this endpoint. Non-OpenAI models receive a
 //! 400 with an explanatory message.
 
+// 1 MiB upper bound on an in-flight SSE frame buffer. Kept
+// from the Anthropic messages handler (#436); shared with the
+// `/v1/responses` streaming usage parser (#808).
+pub(crate) const MAX_SSE_FRAME_BUF_BYTES: usize = 1 << 20; // 1 MiB
+
 use aisix_gateway::{ChatFormat, ChatMessage, Role};
 use aisix_obs::{
     content_capture_cap, AccessLog, CapturedContent, LatencyLabels, UsageEvent, UsageLabels,
@@ -631,7 +636,6 @@ async fn dispatch(
     let guardrail_ctx = aisix_guardrails::RequestContext {
         passthrough_route_id: "",
         model_id: &model_entry.id,
-        mcp_server_id: "",
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
@@ -734,7 +738,6 @@ async fn dispatch(
             api_key_id: auth.entry.id.as_str(),
             source_ip: &client.source_ip,
             context_origin: affinity.origin(),
-            gemini_target: None,
             budget: Some(&budget_gate),
             client: Some(client),
         },
@@ -1132,7 +1135,7 @@ pub(crate) fn responses_item_role(item: &Value) -> Role {
 /// - `content` — message items;
 /// - `output` — tool-result items (`function_call_output`,
 ///   `custom_tool_call_output`, `*_call_output`) the caller feeds back;
-/// - `reason` — an `mcp_approval_response` justification;
+/// - `reason` — an approval justification;
 /// - `summary` — a `reasoning` item's summary parts;
 /// - `name` plus `arguments` / `input` — a replayed tool call. These carry
 ///   caller-controlled text straight to the model and a `function_call`
@@ -3782,7 +3785,7 @@ where
                 // carries the whole Response object, so a caller with a very
                 // large `tools[]` can get there. Named in the PR description as
                 // a known limit rather than papered over.
-                if buf.len() > crate::messages::MAX_SSE_FRAME_BUF_BYTES {
+                if buf.len() > MAX_SSE_FRAME_BUF_BYTES {
                     tracing::warn!(
                         buffered = buf.len(),
                         "responses stream: SSE frame buffer exceeded cap without a \
@@ -4010,12 +4013,11 @@ fn responses_stream_event_text(event: &Value) -> String {
             "response.output_text.delta"
             | "response.refusal.delta"
             | "response.function_call_arguments.delta"
-            | "response.mcp_call_arguments.delta"
             | "response.custom_tool_call_input.delta",
         ) => fields(&["delta"]),
         Some("response.output_text.done") => fields(&["text"]),
         Some("response.refusal.done") => fields(&["refusal"]),
-        Some("response.function_call_arguments.done" | "response.mcp_call_arguments.done") => {
+        Some("response.function_call_arguments.done") => {
             fields(&["name", "arguments"])
         }
         Some("response.custom_tool_call_input.done") => fields(&["name", "input"]),
@@ -4079,8 +4081,8 @@ fn responses_sse_output_text(bytes: &[u8]) -> String {
                     deltas.push_str(d);
                 }
             }
-            // Tool-call argument deltas across all tool kinds — function calls,
-            // MCP tool calls, and custom tools each stream their args/input via
+            // Tool-call argument deltas across all tool kinds — function calls
+            // and custom tools each stream their args/input via
             // their own event, not output_text.delta. On a terminal `response`
             // object these are already covered by responses_output_text; this
             // matters only when the stream aborts before any terminal object.
@@ -4089,7 +4091,6 @@ fn responses_sse_output_text(bytes: &[u8]) -> String {
             // two deltas (e.g. "BLOCK"+"ME") and miss the match.
             Some(
                 "response.function_call_arguments.delta"
-                | "response.mcp_call_arguments.delta"
                 | "response.custom_tool_call_input.delta",
             ) => {
                 if let Some(d) = json.get("delta").and_then(|d| d.as_str()) {
@@ -4125,7 +4126,6 @@ fn responses_sse_guardrail_text(bytes: &[u8]) -> String {
                 "response.output_text.delta"
                     | "response.refusal.delta"
                     | "response.function_call_arguments.delta"
-                    | "response.mcp_call_arguments.delta"
                     | "response.custom_tool_call_input.delta"
             )
         );
@@ -4572,7 +4572,6 @@ fn emit_access_log(
         routing_fallback_count: summary.fallback_count,
         error_kind,
         error: error.as_deref(),
-        mcp: None,
         cache: None,
         request_body_bytes: None,
         response_body_bytes: None,
@@ -5373,45 +5372,6 @@ mod tests {
                 "model": "gpt-4o-resp",
                 "instructions": "you must BLOCKME",
                 "input": "hello"
-            })))
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["error"]["type"], "content_filter");
-    }
-
-    /// #719 (re-audit LOW-1): an `mcp_approval_response` item carries
-    /// caller-supplied justification text under `reason`, which reaches the
-    /// model. It is scanned too, so no input-bearing channel is silently
-    /// skipped. A blocked literal in `reason` must 422.
-    #[tokio::test]
-    async fn input_guardrail_blocks_mcp_approval_response_reason() {
-        let upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/responses"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"id":"x","object":"response","output":[]})),
-            )
-            .expect(0)
-            .mount(&upstream)
-            .await;
-
-        let snap = new_snap_openai(&upstream.uri());
-        snap.models.insert(openai_model("gpt-4o-resp"));
-        snap.apikeys.insert(apikey_entry(&["*"]));
-        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
-        let app = build_app(snap);
-
-        let resp = app
-            .oneshot(make_req(serde_json::json!({
-                "model": "gpt-4o-resp",
-                "input": [
-                    {"type": "mcp_approval_response", "approve": true, "approval_request_id": "ar_1", "reason": "BLOCKME please"}
-                ]
             })))
             .await
             .unwrap();
@@ -6412,45 +6372,6 @@ mod tests {
             !String::from_utf8_lossy(&bytes).contains("BLOCK"),
             "streamed tool-call args leaked with no terminal event",
         );
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["error"]["type"], "content_filter");
-    }
-
-    /// #546 (re-audit): MCP tool-call argument deltas stream via their own
-    /// event too; a no-terminal stream of `response.mcp_call_arguments.delta`
-    /// carrying a blocked literal must still be scanned and held back.
-    #[tokio::test]
-    async fn output_guardrail_blocks_mcp_tool_call_delta_without_terminal() {
-        let upstream = MockServer::builder().start().await;
-        let d = serde_json::json!({"type":"response.mcp_call_arguments.delta","delta":"{\"q\":\"BLOCKME\"}"});
-        let sse =
-            format!("event: response.mcp_call_arguments.delta\ndata: {d}\n\ndata: [DONE]\n\n");
-        Mock::given(method("POST"))
-            .and(path("/v1/responses"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_string(sse),
-            )
-            .expect(1)
-            .mount(&upstream)
-            .await;
-
-        let snap = new_snap_openai(&upstream.uri());
-        snap.models.insert(openai_model("gpt-4o-resp"));
-        snap.apikeys.insert(apikey_entry(&["*"]));
-        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
-        let app = build_app(snap);
-
-        let resp = app
-            .oneshot(make_req(
-                serde_json::json!({"model":"gpt-4o-resp","input":"hi","stream":true}),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
-        assert!(!String::from_utf8_lossy(&bytes).contains("BLOCKME"));
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "content_filter");
     }
@@ -7692,10 +7613,6 @@ data: [DONE]\n\n";
             (
                 serde_json::json!({"type":"response.function_call_arguments.done","name":"lookup","arguments":"FUNCTION_DONE"}),
                 "FUNCTION_DONE",
-            ),
-            (
-                serde_json::json!({"type":"response.mcp_call_arguments.done","arguments":"MCP_DONE"}),
-                "MCP_DONE",
             ),
             (
                 serde_json::json!({"type":"response.custom_tool_call_input.done","input":"CUSTOM_DONE"}),

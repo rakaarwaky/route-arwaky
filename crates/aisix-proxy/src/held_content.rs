@@ -319,13 +319,6 @@ impl ResponsesHeldContent {
                 event.get("delta").and_then(Value::as_str),
                 ResponsesCarrierMode::Delta,
             ),
-            Some("response.mcp_call_arguments.delta") => self.observe_event_tool(
-                event,
-                "mcp_call",
-                "arguments",
-                event.get("delta").and_then(Value::as_str),
-                ResponsesCarrierMode::Delta,
-            ),
             Some("response.custom_tool_call_input.delta") => self.observe_event_tool(
                 event,
                 "custom_tool_call",
@@ -343,21 +336,6 @@ impl ResponsesHeldContent {
                 ) + self.observe_event_tool(
                     event,
                     "function_call",
-                    "arguments",
-                    event.get("arguments").and_then(Value::as_str),
-                    ResponsesCarrierMode::Snapshot,
-                )
-            }
-            Some("response.mcp_call_arguments.done") => {
-                self.observe_event_tool(
-                    event,
-                    "mcp_call",
-                    "name",
-                    event.get("name").and_then(Value::as_str),
-                    ResponsesCarrierMode::Snapshot,
-                ) + self.observe_event_tool(
-                    event,
-                    "mcp_call",
                     "arguments",
                     event.get("arguments").and_then(Value::as_str),
                     ResponsesCarrierMode::Snapshot,
@@ -581,7 +559,7 @@ impl ResponsesHeldContent {
                         .unwrap_or(0)
                 })
                 .sum(),
-            Some("function_call" | "mcp_call") => {
+            Some("function_call") => {
                 let tool_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
                 self.observe_text(
                     base.as_ref()
@@ -818,7 +796,7 @@ fn responses_item_parts(parts: &mut Parts, item: &Value) {
                 responses_part_parts(parts, part, false);
             }
         }
-        Some("function_call" | "mcp_call") => {
+        Some("function_call") => {
             parts.scan_str(item.get("name"));
             parts.scan_str(item.get("arguments"));
         }
@@ -844,12 +822,11 @@ pub(crate) fn responses_event_parts(v: &Value) -> Parts {
             "response.output_text.delta"
             | "response.refusal.delta"
             | "response.function_call_arguments.delta"
-            | "response.mcp_call_arguments.delta"
             | "response.custom_tool_call_input.delta",
         ) => p.scan_str(v.get("delta")),
         Some("response.output_text.done") => p.scan_str(v.get("text")),
         Some("response.refusal.done") => p.scan_str(v.get("refusal")),
-        Some("response.function_call_arguments.done" | "response.mcp_call_arguments.done") => {
+        Some("response.function_call_arguments.done") => {
             p.scan_str(v.get("name"));
             p.scan_str(v.get("arguments"));
         }

@@ -222,25 +222,30 @@ describe("gateway-side failures name themselves on the usage event", () => {
       provider_key_id: leakyPk.id,
     });
 
-    // A classifier the gateway cannot reach, under a `fail` policy.
-    const typesafe = await seed.createProviderKey({
-      display_name: "gem-typesafe-pk",
-      api_key: "ts-mock",
-      provider: "typesafe",
-      adapter: undefined,
-      api_base: "http://127.0.0.1:9",
+    // A semantic router whose embedding provider is unreachable, under a
+    // `fail` policy.
+    const embedPk = await seed.createProviderKey({
+      display_name: "gem-embedding-pk",
+      api_key: "sk-mock",
+      api_base: "http://127.0.0.1:9/v1",
+    });
+    await seed.createModel({
+      display_name: "gem-embed",
+      provider: "openai",
+      model_name: "text-embedding-3-small",
+      provider_key_id: embedPk.id,
+      embedding: { dimensions: 4, normalize: true },
     });
     await seed.createModel({
       display_name: "gem-semantic",
       semantic: {
-        classifier: {
-          type: "jev",
-          provider_key_id: typesafe.id,
-          timeout_ms: 500,
-          on_failure: "fail",
-        },
-        routes: [{ name: "code", target: "gem-chat", description: "programming questions" }],
+        embedding_model: "gem-embed",
+        routes: [
+          { name: "code", target: "gem-chat", examples: ["programming questions"] },
+        ],
         default: "gem-chat",
+        match: { threshold: 0.9 },
+        on_embedding_failure: "fail",
       },
     });
 
@@ -511,7 +516,7 @@ describe("gateway-side failures name themselves on the usage event", () => {
     await expectNamed(await chat("gem-semantic", "fix my python"), "semantic", {
       status: 503,
       errorClass: "semantic_decision_failed",
-      message: "semantic router 'gem-semantic' could not pick a route (classifier_upstream)",
+      message: "semantic router 'gem-semantic' could not pick a route (embedding_upstream)",
     });
 
     await expectNamed(await chat("gem-ghost-chat"), "unknown model", notFound("gem-ghost-chat"));

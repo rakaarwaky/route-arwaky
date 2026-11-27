@@ -58,7 +58,6 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::metrics::Metrics;
-use crate::sink::is_mcp;
 use crate::sink::{
     build_object_store_sink, resolve_datadog_credential, resolve_sls_credential, AliyunSlsSink,
     BatchUnit, CapturedContent, DatadogSink, ErrorRedactor, EventBatch, ExporterPipelines,
@@ -854,8 +853,7 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
         "traceId": trace_id,
         "spanId":  span_id,
         "name":    operation_span_name(record),
-        // SPAN_KIND_CLIENT: the gateway is the client of a remote model,
-        // agent or MCP server.
+        // SPAN_KIND_CLIENT: the gateway is the client of a remote model.
         "kind":    3,
         "startTimeUnixNano": start_unix_nano.to_string(),
         "endTimeUnixNano":   end_unix_nano.to_string(),
@@ -1026,12 +1024,6 @@ fn error_type_value(event: &UsageEvent) -> String {
 /// applies, else the gateway's own operation, verbatim. `None` only for an
 /// event that carries no operation at all.
 fn genai_operation_name(event: &UsageEvent) -> Option<&str> {
-    if is_a2a(event) {
-        return Some("invoke_agent");
-    }
-    if is_mcp(event) {
-        return Some("execute_tool");
-    }
     match event.operation.as_str() {
         "chat" | "messages" | "responses" => Some("chat"),
         "completions" => Some("text_completion"),
@@ -1041,37 +1033,21 @@ fn genai_operation_name(event: &UsageEvent) -> Option<&str> {
     }
 }
 
-fn is_a2a(event: &UsageEvent) -> bool {
-    event.operation == "a2a" || event.inbound_protocol == "a2a"
-}
-
-/// The JSON-RPC method of every MCP call the gateway records: usage is
-/// emitted for tool calls only.
-const MCP_TOOL_CALL_METHOD: &str = "tools/call";
-
 /// Longest target this will append to a span name.
 ///
-/// An A2A agent name is a registered resource, but an MCP tool name is the
-/// caller's own `tools/call` `params.name` and is recorded before the tool is
-/// known to exist — including on the quota-rejection path, which emits without
-/// ever contacting an upstream. A trace backend indexes span names and most
-/// derive RED metrics from them, so the one field a caller picks freely is
-/// bounded before it gets there.
+/// A trace backend indexes span names and most derive RED metrics from
+/// them, so the one field a caller picks freely is bounded before it
+/// gets there, however large it grows.
 const MAX_SPAN_NAME_TARGET: usize = 64;
 
 /// The name of the GenAI operation span (and of a logical span grouping its
 /// attempts): `{operation} {target}`, where the target is the model the
-/// request was made to, the agent invoked, or the passthrough route, and
-/// MCP's own `{mcp.method.name} {gen_ai.tool.name}`. A target that is absent
+/// request was made to or the passthrough route. A target that is absent
 /// or outside [`MAX_SPAN_NAME_TARGET`] leaves the bare operation, which the
 /// conventions name as the fallback.
 fn operation_span_name(record: &SinkRecord) -> String {
     let event = &record.usage;
-    let (operation, target) = if is_mcp(event) {
-        (MCP_TOOL_CALL_METHOD, event.mcp_tool_name.as_str())
-    } else if is_a2a(event) {
-        ("invoke_agent", event.a2a_agent_name.as_str())
-    } else {
+    let (operation, target) = {
         let operation = genai_operation_name(event).unwrap_or("unknown");
         let target = if event.inbound_protocol == "passthrough" {
             event.passthrough_route_name.as_str()
@@ -1185,16 +1161,11 @@ fn event_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
     let event = &record.usage;
     let facts = record.facts.as_deref();
     let upstream = facts.and_then(|f| f.upstream.as_ref());
-    let mcp = is_mcp(event);
-    let a2a = is_a2a(event);
     let operation = genai_operation_name(event);
 
     let mut attributes = joining_attributes(event, exporter_name);
     if let Some(operation) = operation {
         attributes.push(attr_string("gen_ai.operation.name", operation));
-    }
-    if mcp {
-        attributes.push(attr_string("mcp.method.name", MCP_TOOL_CALL_METHOD));
     }
     if let Some(upstream) = upstream {
         if !upstream.provider_name.is_empty() {
@@ -1246,9 +1217,7 @@ fn event_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
             f64::from(event.upstream_ttft_ms) / 1000.0,
         ));
     }
-    if !mcp {
-        push_usage(&mut attributes, event, operation);
-    }
+    push_usage(&mut attributes, event, operation);
     attributes.push(attr_int(
         "http.response.status_code",
         event.status_code as i64,
@@ -1382,48 +1351,9 @@ fn event_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
             &event.jwt_claim_mapping,
         ));
     }
-    // Gateway-protocol attribution. An A2A or MCP call is not a model
-    // inference, and encoding one as a bare `chat` span left every agent and
-    // tool call in a trace backend indistinguishable from an LLM request —
-    // with the agent, the method and the task it touched recorded nowhere at
-    // all (AISIX-Cloud#1215).
-    if a2a {
-        if !event.a2a_agent_name.is_empty() {
-            attributes.push(attr_string("gen_ai.agent.name", &event.a2a_agent_name));
-        }
-        // An A2A context ties a multi-turn exchange's tasks together —
-        // exactly what semconv means by a conversation id.
-        if !event.a2a_context_id.is_empty() {
-            attributes.push(attr_string_capped(
-                "gen_ai.conversation.id",
-                &event.a2a_context_id,
-            ));
-        }
-        for (key, value) in [
-            ("aisix.a2a.method", &event.a2a_method),
-            ("aisix.a2a.operation", &event.a2a_operation),
-            ("aisix.a2a.protocol_version", &event.a2a_protocol_version),
-            ("aisix.a2a.task_id", &event.a2a_task_id),
-            ("aisix.a2a.task_state", &event.a2a_task_state),
-        ] {
-            if !value.is_empty() {
-                attributes.push(attr_string_capped(key, value));
-            }
-        }
-        if event.a2a_stream_event_count > 0 {
-            attributes.push(attr_int(
-                "aisix.a2a.stream_event_count",
-                i64::from(event.a2a_stream_event_count),
-            ));
-        }
-    } else if mcp {
-        if !event.mcp_tool_name.is_empty() {
-            attributes.push(attr_string_capped("gen_ai.tool.name", &event.mcp_tool_name));
-        }
-        if !event.mcp_server_name.is_empty() {
-            attributes.push(attr_string("aisix.mcp.server_name", &event.mcp_server_name));
-        }
-    } else if event.inbound_protocol == "passthrough" && !event.passthrough_route_name.is_empty() {
+    // Passthrough-route attribution: the registered route that served the
+    // request, on a forward-proxy deployment's spans.
+    if event.inbound_protocol == "passthrough" && !event.passthrough_route_name.is_empty() {
         attributes.push(attr_string(
             "aisix.passthrough.route_name",
             &event.passthrough_route_name,
@@ -1595,8 +1525,6 @@ fn push_usage(attributes: &mut Vec<Value>, event: &UsageEvent, operation: Option
 fn push_content(attributes: &mut Vec<Value>, event: &UsageEvent, content: &SinkContent) {
     let enc = content.encode(event);
     for (key, value) in [
-        ("gen_ai.tool.call.arguments", enc.tool_call_arguments),
-        ("gen_ai.tool.call.result", enc.tool_call_result),
         (
             "gen_ai.input.messages",
             enc.structured.input_messages.as_deref(),
@@ -2916,40 +2844,6 @@ mod tests {
     }
 
     #[test]
-    fn an_a2a_call_exports_as_an_agent_span_not_a_chat_one() {
-        // Every gateway-protocol event used to be encoded as `chat` /
-        // `chat.completions`, so an agent call was indistinguishable from a
-        // model inference in a trace backend and the agent, method and task it
-        // touched appeared nowhere (AISIX-Cloud#1215).
-        let mut ev = sample_event();
-        ev.inbound_protocol = "a2a".into();
-        ev.a2a_agent_name = "invoice-processor".into();
-        ev.a2a_method = "SendStreamingMessage".into();
-        ev.a2a_operation = "message/stream".into();
-        ev.a2a_protocol_version = "1.0".into();
-        ev.a2a_task_id = "task-9".into();
-        ev.a2a_context_id = "ctx-4".into();
-        ev.a2a_task_state = "working".into();
-
-        let body = build_otlp_traces_payload(&ev, "test-exp");
-        let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
-        assert_eq!(span["name"], "invoke_agent invoice-processor");
-        let attrs = span["attributes"].as_array().unwrap();
-        let find = |k: &str| attrs.iter().find(|a| a["key"] == k);
-        let string_at = |k: &str| find(k).unwrap()["value"]["stringValue"].clone();
-        assert_eq!(string_at("gen_ai.operation.name"), "invoke_agent");
-        assert_eq!(string_at("gen_ai.agent.name"), "invoice-processor");
-        // A2A's context id is semconv's conversation id — the thread a
-        // multi-turn exchange's tasks hang off.
-        assert_eq!(string_at("gen_ai.conversation.id"), "ctx-4");
-        assert_eq!(string_at("aisix.a2a.method"), "SendStreamingMessage");
-        assert_eq!(string_at("aisix.a2a.operation"), "message/stream");
-        assert_eq!(string_at("aisix.a2a.protocol_version"), "1.0");
-        assert_eq!(string_at("aisix.a2a.task_id"), "task-9");
-        assert_eq!(string_at("aisix.a2a.task_state"), "working");
-    }
-
-    #[test]
     fn a_passthrough_relay_exports_route_and_identity_not_a_chat_span() {
         // The passthrough handler emits usage events with
         // `inbound_protocol = "passthrough"`; without the explicit branch a
@@ -2989,93 +2883,27 @@ mod tests {
     }
 
     #[test]
-    fn a_streamed_a2a_call_carries_its_event_count() {
-        // A unary call has no count, and exporting a zero would read as "the
-        // stream carried nothing" rather than "there was no stream".
-        let mut streamed = sample_event();
-        streamed.inbound_protocol = "a2a".into();
-        streamed.a2a_agent_name = "invoice-processor".into();
-        streamed.a2a_stream_event_count = 17;
-        let body = build_otlp_traces_payload(&streamed, "test-exp");
-        let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
-            .as_array()
-            .unwrap()
-            .clone();
-        assert_eq!(
-            attrs
-                .iter()
-                .find(|a| a["key"] == "aisix.a2a.stream_event_count")
-                .unwrap()["value"]["intValue"],
-            "17"
-        );
-
-        let mut unary = sample_event();
-        unary.inbound_protocol = "a2a".into();
-        let body = build_otlp_traces_payload(&unary, "test-exp");
-        let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
-            .as_array()
-            .unwrap()
-            .clone();
-        assert!(attrs
-            .iter()
-            .all(|a| a["key"] != "aisix.a2a.stream_event_count"));
-    }
-
-    #[test]
-    fn an_mcp_call_exports_as_a_tool_span() {
+    fn a_caller_named_target_cannot_grow_the_span_name() {
+        // A trace backend indexes span names, so an oversized target —
+        // however the caller set it — leaves the bare operation and travels
+        // as an attribute instead, itself cut to a fixed cap.
         let mut ev = sample_event();
-        ev.inbound_protocol = "mcp".into();
-        ev.mcp_server_name = "github".into();
-        ev.mcp_tool_name = "create_issue".into();
+        ev.inbound_protocol = "passthrough".into();
+        ev.operation = "passthrough".into();
+        ev.passthrough_route_name = "t".repeat(4096);
+        ev.client_identity = "u".repeat(4096);
 
         let body = build_otlp_traces_payload(&ev, "test-exp");
         let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
-        // MCP's own naming: `{mcp.method.name} {gen_ai.tool.name}`.
-        assert_eq!(span["name"], "tools/call create_issue");
+        assert_eq!(span["name"], "passthrough");
         let attrs = span["attributes"].as_array().unwrap();
-        let find = |k: &str| attrs.iter().find(|a| a["key"] == k);
-        assert_eq!(
-            find("gen_ai.operation.name").unwrap()["value"]["stringValue"],
-            "execute_tool"
-        );
-        assert_eq!(
-            find("gen_ai.tool.name").unwrap()["value"]["stringValue"],
-            "create_issue"
-        );
-        assert_eq!(
-            find("aisix.mcp.server_name").unwrap()["value"]["stringValue"],
-            "github"
-        );
-        assert_eq!(
-            find("mcp.method.name").unwrap()["value"]["stringValue"],
-            "tools/call"
-        );
-        // A tool call has no token usage to report.
-        assert!(find("gen_ai.usage.input_tokens").is_none());
-    }
-
-    #[test]
-    fn a_caller_chosen_target_cannot_grow_the_span_name() {
-        // An MCP tool name is the caller's own `tools/call` `params.name`,
-        // recorded before the tool is known to exist, and the request body
-        // limit defaults to unlimited. A trace backend indexes span names, so
-        // an oversized one falls back to the bare operation and travels as an
-        // attribute instead — itself cut to a fixed cap.
-        let mut ev = sample_event();
-        ev.inbound_protocol = "mcp".into();
-        ev.mcp_tool_name = "t".repeat(4096);
-
-        let body = build_otlp_traces_payload(&ev, "test-exp");
-        let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
-        assert_eq!(span["name"], "tools/call");
-        let attrs = span["attributes"].as_array().unwrap();
-        let tool = attrs
+        let identity = attrs
             .iter()
-            .find(|a| a["key"] == "gen_ai.tool.name")
+            .find(|a| a["key"] == "aisix.client_identity")
             .unwrap()["value"]["stringValue"]
             .as_str()
             .unwrap();
-        assert_eq!(tool.len(), MAX_PROTOCOL_ATTR_BYTES);
+        assert_eq!(identity.len(), MAX_PROTOCOL_ATTR_BYTES);
     }
 
     #[test]
@@ -3083,36 +2911,21 @@ mod tests {
         // A multi-byte character straddling the cap must not produce invalid
         // UTF-8 in the export body.
         let mut ev = sample_event();
-        ev.inbound_protocol = "a2a".into();
-        ev.a2a_method = "情".repeat(200);
+        ev.client_identity = "情".repeat(200);
 
         let body = build_otlp_traces_payload(&ev, "test-exp");
         let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
             .as_array()
             .unwrap()
             .clone();
-        let method = attrs
+        let identity = attrs
             .iter()
-            .find(|a| a["key"] == "aisix.a2a.method")
+            .find(|a| a["key"] == "aisix.client_identity")
             .unwrap()["value"]["stringValue"]
             .as_str()
             .unwrap();
-        assert!(method.len() <= MAX_PROTOCOL_ATTR_BYTES);
-        assert!(method.chars().all(|c| c == '情'));
-    }
-
-    #[test]
-    fn a_gateway_protocol_span_without_a_target_keeps_a_bare_name() {
-        // A pre-dispatch rejection resolves no agent, so there is no
-        // low-cardinality target to append — semconv says name the span after
-        // the operation alone rather than inventing one.
-        let mut ev = sample_event();
-        ev.inbound_protocol = "a2a".into();
-        let body = build_otlp_traces_payload(&ev, "test-exp");
-        assert_eq!(
-            body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"],
-            "invoke_agent"
-        );
+        assert!(identity.len() <= MAX_PROTOCOL_ATTR_BYTES);
+        assert!(identity.chars().all(|c| c == '情'));
     }
 
     /// A wildcard row's upstream model is the caller's own substitution, so

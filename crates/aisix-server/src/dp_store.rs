@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use aisix_mcp::{PutCondition, SharedStore, StoreError, StoredValue};
+use aisix_proxy::shared_store::{PutCondition, SharedStore, StoreError, StoredValue};
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -31,7 +31,7 @@ impl DpManagerStore {
     pub fn new(origin: &str, mtls: &MtlsBundle) -> Self {
         let client = crate::heartbeat::build_client(mtls)
             .inspect_err(|error| {
-                tracing::error!(error = %format_args!("{error:#}"), "shared storage (per-user MCP tokens, session pins) is unavailable: \
+                tracing::error!(error = %format_args!("{error:#}"), "shared storage (semantic-router session pins) is unavailable: \
                     could not build the dp-manager client");
             })
             .ok();
@@ -215,7 +215,7 @@ mod tests {
         DpManagerStore::with_client(&server.uri(), Some(reqwest::Client::new()))
     }
 
-    const KEY_PATH: &str = "/dp/store/v1/mcp_oauth_token/abc";
+    const KEY_PATH: &str = "/dp/store/v1/session_affinity/abc";
 
     #[tokio::test]
     async fn get_decodes_the_value_and_ignores_unknown_fields() {
@@ -229,7 +229,7 @@ mod tests {
             .await;
         let stored = store(&server)
             .await
-            .get("mcp_oauth_token", "abc")
+            .get("session_affinity", "abc")
             .await
             .unwrap()
             .unwrap();
@@ -243,7 +243,7 @@ mod tests {
         let server = MockServer::builder().start().await;
         let store = store(&server).await;
         Mock::given(method("GET"))
-            .and(path("/dp/store/v1/mcp_oauth_token/missing"))
+            .and(path("/dp/store/v1/session_affinity/missing"))
             .respond_with(ResponseTemplate::new(404))
             .mount(&server)
             .await;
@@ -252,9 +252,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(503))
             .mount(&server)
             .await;
-        assert_eq!(store.get("mcp_oauth_token", "missing").await, Ok(None));
+        assert_eq!(store.get("session_affinity", "missing").await, Ok(None));
         assert_eq!(
-            store.get("mcp_oauth_token", "abc").await,
+            store.get("session_affinity", "abc").await,
             Err(StoreError::Unavailable)
         );
     }
@@ -262,11 +262,11 @@ mod tests {
     #[tokio::test]
     async fn put_sends_the_wire_shape_for_each_precondition() {
         let server = MockServer::builder().start().await;
-        let labels = BTreeMap::from([("mcp_server_id", "srv"), ("subject", "member:u")]);
+        let labels = BTreeMap::from([("session_id", "srv"), ("subject", "member:u")]);
         let body = serde_json::json!({
             "value": "aGk=",
             "ttl_seconds": 60,
-            "labels": { "mcp_server_id": "srv", "subject": "member:u" },
+            "labels": { "session_id": "srv", "subject": "member:u" },
         });
         Mock::given(method("PUT"))
             .and(path(KEY_PATH))
@@ -291,7 +291,7 @@ mod tests {
         let store = store(&server).await;
         let put = |condition| {
             store.put(
-                "mcp_oauth_token",
+                "session_affinity",
                 "abc",
                 b"hi".to_vec(),
                 Duration::from_secs(60),
@@ -321,7 +321,7 @@ mod tests {
             let got = store(&server)
                 .await
                 .put(
-                    "mcp_oauth_token",
+                    "session_affinity",
                     "abc",
                     Vec::new(),
                     Duration::from_secs(1),
@@ -345,7 +345,7 @@ mod tests {
             .await;
         store(&server)
             .await
-            .delete("mcp_oauth_token", "abc", Some(3))
+            .delete("session_affinity", "abc", Some(3))
             .await
             .unwrap();
     }
@@ -354,7 +354,7 @@ mod tests {
     async fn no_client_means_unavailable() {
         let store = DpManagerStore::with_client("https://dpm.example", None);
         assert_eq!(
-            store.get("mcp_oauth_token", "abc").await,
+            store.get("session_affinity", "abc").await,
             Err(StoreError::Unavailable)
         );
     }
@@ -368,9 +368,9 @@ mod tests {
     #[tokio::test]
     async fn a_failed_request_logs_its_cause_without_the_url() {
         let store = DpManagerStore::with_client(&refused_url(""), Some(reqwest::Client::new()));
-        let (result, logged) = capture_logs(store.get("mcp_oauth_token", "abc")).await;
+        let (result, logged) = capture_logs(store.get("session_affinity", "abc")).await;
         assert!(matches!(result, Err(StoreError::Unavailable)));
         assert!(logged.to_lowercase().contains("refused"), "{logged}");
-        assert!(!logged.contains("mcp_oauth_token"), "{logged}");
+        assert!(!logged.contains("session_affinity"), "{logged}");
     }
 }

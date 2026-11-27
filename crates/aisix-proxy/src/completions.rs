@@ -431,7 +431,6 @@ async fn dispatch(
     let guardrail_ctx = aisix_guardrails::RequestContext {
         passthrough_route_id: "",
         model_id: &model_entry.id,
-        mcp_server_id: "",
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
@@ -1175,7 +1174,6 @@ fn emit_access_log(
         routing_fallback_count: summary.fallback_count,
         error_kind,
         error: error.as_deref(),
-        mcp: None,
         cache: None,
         request_body_bytes: None,
         response_body_bytes: None,

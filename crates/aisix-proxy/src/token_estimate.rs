@@ -2044,7 +2044,7 @@ mod tests {
         let loaded_none =
             count(json!({"input": [user.clone(), output(json!([]))], "tools": [search.clone()]}));
         let loaded = count(json!({"input": [user, output(json!([
-            {"type": "namespace", "name": "mcp__docs", "tools": [member]},
+            {"type": "namespace", "name": "docs__ns", "tools": [member]},
         ]))], "tools": [search]}));
         // Loading one tool adds at least its definition's description.
         assert!(loaded >= loaded_none + 5, "{loaded} vs {loaded_none}");

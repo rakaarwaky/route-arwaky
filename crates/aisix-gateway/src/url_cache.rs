@@ -157,7 +157,7 @@ thread_local! {
 }
 
 /// Parse `raw` once, for a caller whose URL *is* a configured string with
-/// nothing derived from the request — an A2A agent's JSON-RPC endpoint.
+/// nothing derived from the request — an upstream whose identity is not the request's model.
 ///
 /// No resource id and no fingerprint: the string is its own identity, so
 /// an edited agent simply lands on a different row and a renamed or

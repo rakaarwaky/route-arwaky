@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aisix_mcp::{PutCondition, SharedStore, StoreError, StoredValue};
+use crate::shared_store::{PutCondition, SharedStore, StoreError, StoredValue};
 use sha2::{Digest, Sha256};
 use tokio::time::Instant;
 use tracing::Instrument;
@@ -388,7 +388,7 @@ fn decode(stored: &StoredValue) -> Option<(Pin, StoreRecord)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aisix_mcp::MemoryStore;
+    use super::shared_store::MemoryStore;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 

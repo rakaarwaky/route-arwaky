@@ -6104,7 +6104,7 @@ mod tests {
 
     /// A Codex-shaped request with a client tool search: the declaration
     /// (in `additional_tools`, as lite mode sends it), and a search the
-    /// client already ran that loaded two deferred MCP tools.
+    /// client already ran that loaded two deferred hosted tools.
     fn tool_search_request() -> Value {
         json!({
             "model": "m",
@@ -6119,7 +6119,7 @@ mod tests {
                  "status": "completed", "arguments": {"query": "docs", "limit": 8}},
                 {"type": "tool_search_output", "call_id": "ts_1", "execution": "client",
                  "status": "completed", "tools": [
-                    {"type": "namespace", "name": "mcp__docs", "description": "Docs server.", "tools": [
+                    {"type": "namespace", "name": "docs__ns", "description": "Docs server.", "tools": [
                         {"type": "function", "name": "read", "description": "Read a page.",
                          "defer_loading": true, "parameters": {"type": "object"}},
                         {"type": "function", "name": "search", "defer_loading": true,
@@ -6145,8 +6145,8 @@ mod tests {
             [
                 "shell",
                 "tool_search",
-                "mcp__docs__read",
-                "mcp__docs__search"
+                "docs__ns__read",
+                "docs__ns__search"
             ]
         );
         assert_eq!(tools[1]["function"]["description"], "Find tools.");
@@ -6164,7 +6164,7 @@ mod tests {
         assert!(matches!(result.role, Role::Tool));
         assert_eq!(result.tool_call_id.as_deref(), Some("ts_1"));
         let text = result.content.as_deref().unwrap();
-        assert!(text.contains("mcp__docs__read") && text.contains("mcp__docs__search"));
+        assert!(text.contains("docs__ns__read") && text.contains("docs__ns__search"));
     }
 
     #[test]
@@ -6185,7 +6185,7 @@ mod tests {
                 {"id": "c1", "type": "function",
                  "function": {"name": "tool_search", "arguments": "{\"query\":\"wiki\"}"}},
                 {"id": "c2", "type": "function",
-                 "function": {"name": "mcp__docs__read", "arguments": "{}"}},
+                 "function": {"name": "docs__ns__read", "arguments": "{}"}},
                 {"id": "c3", "type": "function",
                  "function": {"name": "tool_search", "arguments": "not json"}},
             ])),
@@ -6201,7 +6201,7 @@ mod tests {
         assert!(search["id"].as_str().unwrap().starts_with("tsc_"));
         let loaded = &out["output"][1];
         assert_eq!(loaded["type"], "function_call");
-        assert_eq!(loaded["namespace"], "mcp__docs");
+        assert_eq!(loaded["namespace"], "docs__ns");
         assert_eq!(loaded["name"], "read");
         let broken = &out["output"][2];
         assert_eq!(broken["arguments"], json!({}));

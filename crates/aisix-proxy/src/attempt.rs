@@ -603,8 +603,6 @@ pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
         | ProxyError::JwtInsufficientScope { .. }
         | ProxyError::JwtIdentityUnmapped
         | ProxyError::JwksUnavailable
-        | ProxyError::McpTokenExchange(_)
-        | ProxyError::McpUserOAuth { .. }
         | ProxyError::ModelNotFound(_)
         | ProxyError::VideoNotFound(_)
         | ProxyError::ModelForbidden(_)
@@ -807,11 +805,11 @@ mod tests {
     fn gateway_error_message_carries_every_failures_text() {
         let semantic = ProxyError::SemanticDecisionFailed {
             router: "router-a".into(),
-            reason: crate::semantic::DecisionFailure::ClassifierTimeout,
+            reason: crate::semantic::DecisionFailure::EmbeddingTimeout,
         };
         assert_eq!(
             gateway_error_message(&semantic),
-            "semantic router 'router-a' could not pick a route (classifier_timeout)"
+            "semantic router 'router-a' could not pick a route (embedding_timeout)"
         );
         assert_eq!(
             gateway_error_message(&ProxyError::ModelNotFound("ghost".into())),

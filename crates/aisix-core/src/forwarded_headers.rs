@@ -1,8 +1,8 @@
 //! Forwarding inbound client headers to an upstream.
 //!
-//! Four resources let an operator name headers that must reach the
+//! Two resources let an operator name headers that must reach the
 //! upstream — `provider_key`'s `request.forward_client_headers`, and the
-//! same field on `passthrough_route`, `mcp_server` and `a2a_agent` —
+//! same field on `passthrough_route` —
 //! because the gateway fronts upstreams on four different surfaces and the
 //! choice is made per upstream, never gateway-wide: the same deployment
 //! reaches internal services that need the caller's own credentials and
@@ -95,13 +95,10 @@ pub fn strip_bearer_scheme(value: &str) -> Option<&str> {
 /// The content and negotiation entries describe a body this gateway
 /// re-serializes and a response shape it parses, so relaying the caller's
 /// copies would describe the wrong message. `set-cookie` is a response
-/// header with no meaning on a request. `anthropic-version` selects the
-/// wire format an Anthropic-shaped upstream answers in, which the gateway
-/// then decodes — a caller's value there breaks the decode.
+/// header with no meaning on a request.
 pub const NEVER_FORWARD_FROM_CLIENT: &[&str] = &[
     "accept",
     "accept-encoding",
-    "anthropic-version",
     "content-encoding",
     "content-length",
     "content-type",
@@ -130,23 +127,23 @@ pub const NEVER_FORWARD_FROM_CLIENT_PREFIXES: &[&str] = &["x-stainless-"];
 /// own: `x-amz-security-token` IS a credential, and the other two are the
 /// timestamp and body hash the signature is computed over, which is why
 /// they belong to the same request's identity and are listed together.
-/// A Bedrock upstream never sees a forwarded copy — its signer owns all
-/// three and drops any supplied value — so what this entry governs is
-/// every OTHER upstream, where relaying the caller's AWS session token
-/// under a `"x-*"` glob would hand a third party a live AWS credential.
+/// What this entry governs is any upstream other than one the gateway
+/// itself signs with SigV4, where relaying the caller's AWS session
+/// token under a `"x-*"` glob would hand a third party a live AWS
+/// credential.
 ///
 /// A `passthrough_route` forwards by default, so `credential_mode: inject`
 /// strips this whole list rather than relying on a pattern to withhold it.
 pub const CREDENTIAL_SLOT_HEADERS: &[&str] = &[
-    "api-key",              // Azure OpenAI key
-    "authorization",        // OpenAI / Anthropic / Vertex Bearer
+    "api-key",              // raw provider key slot, common on Azure deployments
+    "authorization",        // bearer tokens generally
     "cookie",               // session credential
     "proxy-authorization",  // proxy auth
     "x-amz-content-sha256", // AWS SigV4 body hash
     "x-amz-date",           // AWS SigV4 timestamp
     "x-amz-security-token", // AWS SigV4 session token
-    "x-api-key",            // Anthropic raw, also OpenAI legacy proxies
-    "x-goog-api-key",       // Gemini API key
+    "x-api-key",            // raw provider key slot, also legacy proxies
+    "x-goog-api-key",       // Google API key
 ];
 
 /// Trace-context headers, which a glob never sweeps in.
@@ -174,7 +171,7 @@ pub const TRACE_CONTEXT_HEADERS: &[&str] = &["traceparent", "tracestate"];
 ///
 /// The list here is the one every surface shares, and it is complete only
 /// where the caller's credential always arrives in a slot it names — on
-/// `/v1/*`, MCP and `/a2a/*` the gateway reads `authorization` or
+/// `/v1/*` the gateway reads `authorization` or
 /// `x-api-key` and nothing else. A surface where the OPERATOR chooses the
 /// slot has to add its own; see [`exact_match_only_with`].
 pub fn exact_match_only(name: &str) -> bool {
@@ -223,7 +220,7 @@ pub fn header_forward_blocked(name: &str) -> bool {
 
 /// Whether a client's copy of `name` (already lowercase) may be forwarded
 /// by a surface that rebuilds the outbound message — the standard `/v1/*`
-/// endpoints and the MCP faces.
+/// endpoints.
 pub fn client_header_forwardable(name: &str) -> bool {
     !header_forward_blocked(name)
         && !NEVER_FORWARD_FROM_CLIENT.contains(&name)
@@ -262,10 +259,9 @@ pub fn forward_pattern_admits_with(
 /// that rebuilds the outbound message.
 ///
 /// `extra_blocked` carries the names one surface owns that the shared
-/// lists cannot know about (the MCP protocol slots, which the upstream
-/// transport rejects outright when they carry a foreign value).
+/// lists cannot know about.
 ///
-/// A repeated header (`anthropic-beta: a` twice) forwards its first value
+/// A repeated header (`x-trace-id: a` twice) forwards its first value
 /// only: the upstream sees one well-formed header rather than a list this
 /// gateway never interpreted.
 pub fn resolve_forwarded_client_headers(
@@ -359,7 +355,7 @@ mod tests {
     /// and `x-amz-content-sha256` were blocked outright before the
     /// forwarding rules moved into this module, and came out of the split
     /// naming no list at all, which left a `["x-*"]` pattern relaying the
-    /// caller's AWS session token to any non-Bedrock upstream.
+    /// caller's AWS session token to any third-party upstream.
     ///
     /// Spelling them out is the point: this assertion goes red if one is
     /// removed again, and the loop above would not.
@@ -391,7 +387,7 @@ mod tests {
         // A provider's own wire-shape selectors are gateway decisions, not
         // identity: `x-dashscope-async` picks the submission mode and
         // `x-runway-version` the API revision the gateway then decodes.
-        for name in ["x-dashscope-async", "x-runway-version", "anthropic-beta"] {
+        for name in ["x-dashscope-async", "x-runway-version", "openai-beta"] {
             assert!(!displaces_a_gateway_header(name), "{name}");
         }
     }
@@ -414,14 +410,13 @@ mod tests {
         assert!(!client_header_forwardable("content-type"));
         assert!(!header_forward_blocked("content-type"));
         assert!(!client_header_forwardable("x-stainless-lang"));
-        assert!(!client_header_forwardable("anthropic-version"));
         // Named rather than left to the list: a surface that negotiates its
-        // own response shape relies on this one — the A2A streaming path
-        // asks for `text/event-stream` and then parses SSE, so a caller's
+        // own response shape relies on this one — the SSE-relaying paths
+        // ask for `text/event-stream` and then parse SSE, so a caller's
         // `accept` reaching the upstream changes a body it has to read.
         assert!(!client_header_forwardable("accept"));
         assert!(!header_forward_blocked("accept"));
-        assert!(client_header_forwardable("anthropic-beta"));
+        assert!(client_header_forwardable("openai-beta"));
     }
 
     #[test]
@@ -438,7 +433,7 @@ mod tests {
         ));
         // An ordinary header still answers to a glob — the exact-name
         // rule is the exception, not the policy.
-        assert!(forward_pattern_admits(&["*".into()], "anthropic-beta"));
+        assert!(forward_pattern_admits(&["*".into()], "openai-beta"));
         assert!(forward_pattern_admits(&["x-trace-*".into()], "x-trace-id"));
         assert!(!forward_pattern_admits(&["x-trace-*".into()], "x-other"));
         // Header names are case-insensitive on the wire, so a pattern
@@ -446,8 +441,8 @@ mod tests {
         // matches the lowercase name the parser hands us.
         assert!(forward_pattern_admits(&["X-Trace-*".into()], "x-trace-id"));
         assert!(forward_pattern_admits(
-            &["Anthropic-Beta".into()],
-            "anthropic-beta"
+            &["OpenAI-Beta".into()],
+            "openai-beta"
         ));
     }
 
@@ -531,20 +526,20 @@ mod tests {
             ("content-type", "application/json"),
             ("host", "gateway.internal"),
             ("x-aisix-request-id", "forged"),
-            ("mcp-session-id", "s1"),
+            ("x-gw-frame", "s1"),
             ("x-trace-id", "t"),
         ]);
         let got = resolve_forwarded_client_headers(
             &["*".into(), "authorization".into()],
             &client,
-            &["mcp-session-id"],
+            &["x-gw-frame"],
         );
         let mut got = names(&got);
         got.sort_unstable();
         assert_eq!(got, vec!["authorization", "x-trace-id"]);
     }
 
-    /// The `provider_key`, `mcp_server` and `a2a_agent` field
+    /// The `provider_key` and `passthrough_route` field
     /// descriptions promise this to users, so it is pinned here rather
     /// than left to the `keys()` + `get()` pair that happens to produce
     /// it. `append` is the whole point: `map()` above builds with

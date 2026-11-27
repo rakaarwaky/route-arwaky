@@ -78,24 +78,21 @@ impl SinkContent {
 /// conventions' structured content, each value held to the exporter's
 /// per-field cap; the two sides are judged independently. Everything else —
 /// a non-message payload, content the cap cut, content that does not
-/// convert — is left in `raw_prompt` / `raw_response`. An MCP call's whole
-/// arguments and successful result are named on their own.
+/// convert — is left in `raw_prompt` / `raw_response`.
 #[derive(Debug, Default)]
 pub(crate) struct ContentEncoding<'a> {
     /// Only the sides that were accepted are set.
     pub structured: crate::genai::StructuredContent,
-    pub tool_call_arguments: Option<&'a str>,
-    pub tool_call_result: Option<&'a str>,
     pub raw_prompt: Option<&'a str>,
     pub raw_response: Option<&'a str>,
 }
 
 impl ContentEncoding<'_> {
-    /// The flat prompt text for a sink without the MCP-specific fields:
+    /// The flat prompt text for a sink without structured fields:
     /// whatever was not structured, written even when empty, as these
     /// sinks always have.
     pub fn flat_prompt(&self) -> Option<&str> {
-        self.raw_prompt.or(self.tool_call_arguments).or(self
+        self.raw_prompt.or(self
             .structured
             .input_messages
             .is_none()
@@ -104,16 +101,12 @@ impl ContentEncoding<'_> {
 
     /// The flat response counterpart of [`Self::flat_prompt`].
     pub fn flat_response(&self) -> Option<&str> {
-        self.raw_response.or(self.tool_call_result).or(self
+        self.raw_response.or(self
             .structured
             .output_messages
             .is_none()
             .then_some(""))
     }
-}
-
-pub(crate) fn is_mcp(event: &UsageEvent) -> bool {
-    event.operation == "mcp" || event.inbound_protocol == "mcp"
 }
 
 impl SinkContent {
@@ -131,16 +124,7 @@ impl SinkContent {
             raw_response: (!self.response.is_empty()).then_some(self.response.as_str()),
             ..Default::default()
         };
-        if is_mcp(event) {
-            // Arguments and result are captured as JSON already; the result
-            // is reported only for a call that succeeded.
-            if prompt_whole {
-                enc.tool_call_arguments = enc.raw_prompt.take();
-            }
-            if response_whole && (200..300).contains(&event.status_code) {
-                enc.tool_call_result = enc.raw_response.take();
-            }
-        } else if let Some(wire) = crate::genai::PromptWire::for_operation(&event.operation) {
+        if let Some(wire) = crate::genai::PromptWire::for_operation(&event.operation) {
             let structured = crate::genai::structured_content(
                 wire,
                 if prompt_whole { &self.prompt } else { "" },

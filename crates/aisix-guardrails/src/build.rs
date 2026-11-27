@@ -1409,7 +1409,6 @@ fn build_index_from_snapshot_reported(
         let scope_kind = match attachment.scope_type {
             GuardrailScopeType::Env => ScopeKind::Env,
             GuardrailScopeType::Model => ScopeKind::Model,
-            GuardrailScopeType::McpServer => ScopeKind::McpServer,
             GuardrailScopeType::ApiKey => ScopeKind::ApiKey,
             GuardrailScopeType::Team => ScopeKind::Team,
             GuardrailScopeType::PassthroughRoute => ScopeKind::PassthroughRoute,
@@ -1617,7 +1616,7 @@ fn emit_unattached_notice(id: &str, name: &str) {
         guardrail_id = %id,
         guardrail_name = %name,
         "guardrail is enabled but has no attachment, so it inspects no traffic; \
-         attach it to an environment, model, MCP server, API key, team or \
+         attach it to an environment, model, API key, team or \
          passthrough route to put it in force",
     );
 }
@@ -3119,7 +3118,6 @@ mod tests {
         let chain = index.resolve(&RequestContext {
             passthrough_route_id: "",
             model_id: "m",
-            mcp_server_id: "",
             api_key_id: "k",
             team_id: None,
         });
@@ -3183,7 +3181,6 @@ mod tests {
         let ctx = RequestContext {
             passthrough_route_id: "",
             model_id: "m1",
-            mcp_server_id: "",
             api_key_id: "k1",
             team_id: None,
         };
@@ -3230,7 +3227,6 @@ mod tests {
         let ctx = RequestContext {
             passthrough_route_id: "",
             model_id: "m",
-            mcp_server_id: "",
             api_key_id: "k",
             team_id: None,
         };
@@ -3285,7 +3281,6 @@ mod tests {
         let ctx = RequestContext {
             passthrough_route_id: "",
             model_id: "any",
-            mcp_server_id: "",
             api_key_id: "any",
             team_id: None,
         };
@@ -3642,7 +3637,6 @@ mod tests {
         let ctx = RequestContext {
             passthrough_route_id: "",
             model_id: "any-model",
-            mcp_server_id: "",
             api_key_id: "any-key",
             team_id: None,
         };
@@ -3787,7 +3781,6 @@ mod tests {
         RequestContext {
             passthrough_route_id: "",
             model_id: "m1",
-            mcp_server_id: "",
             api_key_id: "k1",
             team_id: None,
         }
@@ -3864,7 +3857,6 @@ mod tests {
         let ctx = RequestContext {
             passthrough_route_id: "",
             model_id: "m1",
-            mcp_server_id: "",
             api_key_id: "k1",
             team_id: None,
         };
@@ -4297,7 +4289,6 @@ mod tests {
         let chain = live.resolve(&RequestContext {
             passthrough_route_id: "",
             model_id: "m",
-            mcp_server_id: "",
             api_key_id: "k",
             team_id: None,
         });
@@ -4381,7 +4372,6 @@ mod tests {
         let ctx = RequestContext {
             passthrough_route_id: "",
             model_id: "m1",
-            mcp_server_id: "",
             api_key_id: "k1",
             team_id: None,
         };
@@ -4613,7 +4603,6 @@ mod tests {
         let chain = index.resolve(&RequestContext {
             passthrough_route_id: "",
             model_id: "m-A",
-            mcp_server_id: "",
             api_key_id: "k",
             team_id: None,
         });
@@ -4626,67 +4615,6 @@ mod tests {
             }],
             "applied mirrors the deduplicated chain, not the raw entry count",
         );
-    }
-
-    #[tokio::test]
-    async fn mcp_server_attachment_builds_into_the_index() {
-        // The wire `scope_type: "mcp_server"` survives the snapshot build and
-        // selects on the called server, leaving model traffic alone.
-        let guardrails: ResourceTable<DomainGuardrail> = ResourceTable::default();
-        guardrails.insert(entry(
-            "kw",
-            "g-1",
-            parse(
-                r#"{
-                    "name": "kw",
-                    "kind": "keyword",
-                    "hook_point": "input",
-                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
-                }"#,
-            ),
-        ));
-        let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
-        attachments.insert(attachment_entry(
-            "a-mcp",
-            parse_attachment(
-                r#"{ "guardrail_id": "g-1", "scope_type": "mcp_server", "scope_id": "mcp-A", "priority": 50 }"#,
-            ),
-        ));
-
-        let index = build_index_from_snapshot(
-            &guardrails,
-            &attachments,
-            None,
-            &GuardrailEmbedderSlot::none(),
-        );
-        assert_eq!(index.len(), 1, "the attachment must not be skipped");
-
-        let matched = index.resolve(&RequestContext {
-            passthrough_route_id: "",
-            model_id: "",
-            mcp_server_id: "mcp-A",
-            api_key_id: "k",
-            team_id: None,
-        });
-        assert_eq!(matched.len(), 1);
-
-        let other_server = index.resolve(&RequestContext {
-            passthrough_route_id: "",
-            model_id: "",
-            mcp_server_id: "mcp-B",
-            api_key_id: "k",
-            team_id: None,
-        });
-        assert!(other_server.is_empty());
-
-        let llm = index.resolve(&RequestContext {
-            passthrough_route_id: "",
-            model_id: "m-A",
-            mcp_server_id: "",
-            api_key_id: "k",
-            team_id: None,
-        });
-        assert!(llm.is_empty(), "model traffic carries no MCP server");
     }
 
     #[tokio::test]
@@ -4724,7 +4652,6 @@ mod tests {
         let chain = index.resolve(&RequestContext {
             passthrough_route_id: "",
             model_id: "m-OTHER",
-            mcp_server_id: "",
             api_key_id: "k",
             team_id: None,
         });

@@ -120,7 +120,7 @@ fn redact_str(
 //
 // Call sites pair this with `check_*_non_segment` so a segment-moderating
 // member is consulted exactly once per hook. Families without a wire
-// walker (embeddings, rerank, images, audio, passthrough, MCP) keep the
+// walker (embeddings, rerank, images, audio, passthrough) keep the
 // plain `check_*` path, where an ANONYMIZE disposition still maps to
 // Block — there is no write-back channel, and releasing the un-masked
 // content would defeat the operator's policy.
@@ -936,8 +936,8 @@ pub fn anthropic_signed_reasoning_texts(body: &Value) -> Vec<(String, bool)> {
 
 /// Mask an Anthropic-native `/v1/messages` RESPONSE body in place (the
 /// non-streaming passthrough JSON): top-level `content` blocks (`text` +
-/// `tool_use` input). Server-tool blocks (`server_tool_use`,
-/// `mcp_tool_use`, and the `*_tool_result` blocks) are not walked, so the
+/// `tool_use` input). Server-tool blocks (`server_tool_use`
+/// and the `*_tool_result` blocks) are not walked, so the
 /// kinds judged by this walk (`keyword`, `pii`, and the segment-moderating
 /// kinds) neither scan nor mask them; the block-only kinds that read the
 /// serialized content in `messages.rs` still see them. The stream differs,
@@ -1122,7 +1122,7 @@ fn redact_responses_item(
     // request, `responses::responses_output_text` on the response), while
     // the arms above know only the common types. Walking the rest here is
     // what keeps the mask surface equal to the scan surface for items like
-    // `mcp_call` / `mcp_approval_response` (#1027).
+    // any unlisted item type (#1027).
     let ty = item.get("type").and_then(Value::as_str).map(str::to_owned);
     let covered: &[&str] = match ty.as_deref() {
         Some("message") | None => &["content"],
@@ -1135,7 +1135,7 @@ fn redact_responses_item(
         _ => &[],
     };
     // On the response side `output` is not in the list: a hosted tool's
-    // result (`mcp_call.output`) is neither scanned nor masked there.
+    // result is neither scanned nor masked there.
     let scanned: &[&str] = if dir.is_input() {
         &[
             "content",
@@ -1194,7 +1194,7 @@ fn apply_to_text_slot(
 /// surface the output check scans: message `output_text`, `text`,
 /// `input_text`, and `refusal` parts, and each item's tool-call `name`
 /// (scan-only) / `arguments` / `input`. Hosted-tool results
-/// (`mcp_call.output`, `file_search_call` results, `code_interpreter_call`
+/// (`file_search_call` results, `code_interpreter_call`
 /// logs) and hosted-tool code or action text are neither scanned nor masked.
 pub fn redact_responses_response(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
     let mut counts = RedactionCounts::new();
@@ -1965,7 +1965,7 @@ fn excise_unscannable_frames(buf: &mut Vec<u8>) -> (Vec<String>, usize) {
 /// `index` (a masked span can cross frame boundaries), masked once, and
 /// the full masked text re-emitted on the channel's first frame;
 /// `input_json_delta` channels are masked as complete JSON documents — for
-/// every block that streams one, so a `server_tool_use` / `mcp_tool_use`
+/// every block that streams one, so a `server_tool_use`
 /// input is masked here although the non-streaming walk
 /// ([`redact_anthropic_response`]) does not reach it. Tool-result blocks
 /// arriving in `content_block_start` are not scanned or masked. `None` =
@@ -2210,7 +2210,7 @@ pub fn responses_sse_text(raw: &[u8]) -> String {
 /// Mask a fully-buffered Responses-API SSE byte stream (the `/v1/responses`
 /// verbatim hold-back and the cross-provider bridge release). Delta events
 /// are reassembled per channel (`output_text.delta`, `refusal.delta`,
-/// `function_call_arguments.delta`, `mcp_call_arguments.delta`,
+/// `function_call_arguments.delta`,
 /// `custom_tool_call_input.delta`, each by item), masked once, and
 /// re-emitted on the channel's first frame; the aggregate events carry
 /// complete texts and are masked directly — each channel's own `*.done`
@@ -2273,11 +2273,9 @@ pub fn redact_responses_sse(
                         .push(fi);
                 }
             }
-            // MCP tool calls stream their JSON-encoded arguments on their
+            // Tool calls stream their JSON-encoded arguments on their
             // own event; the scan reads it, so the mask has to (#1027).
-            Some(
-                "response.function_call_arguments.delta" | "response.mcp_call_arguments.delta",
-            ) => {
+            Some("response.function_call_arguments.delta") => {
                 if data
                     .get("delta")
                     .and_then(Value::as_str)
@@ -2413,7 +2411,7 @@ pub fn redact_responses_sse(
                     apply_to_value_string(chain, aggregate, slot, &mut local);
                 }
             }
-            "response.function_call_arguments.done" | "response.mcp_call_arguments.done" => {
+            "response.function_call_arguments.done" => {
                 if let Some(Value::String(args)) = data.get_mut("arguments") {
                     let mut owned = std::mem::take(args);
                     redact_json_encoded(chain, aggregate, &mut owned, &mut local);
@@ -3603,29 +3601,6 @@ mod tests {
             "reasoning part was rewritten: {out}"
         );
         assert!(out.contains("mail [EMAIL_REDACTED]"), "{out}");
-        assert_eq!(counts.get("email"), Some(&1));
-    }
-
-    /// AISIX-Cloud#1621: an `mcp_call`'s arguments stream on their own
-    /// event pair, and `redact_responses_item` masks the same string on the
-    /// terminal item — so the pair must be masked too, or one stream
-    /// carries the raw value beside its masked copy.
-    #[test]
-    fn responses_sse_masks_the_mcp_call_arguments_channel() {
-        let chain = both();
-        let raw = concat!(
-            "event: response.mcp_call_arguments.delta\ndata: {\"type\":\"response.mcp_call_arguments.delta\",\"item_id\":\"mcp_1\",\"output_index\":0,\"delta\":\"{\\\"to\\\":\\\"a@\"}\n\n",
-            "event: response.mcp_call_arguments.delta\ndata: {\"type\":\"response.mcp_call_arguments.delta\",\"item_id\":\"mcp_1\",\"output_index\":0,\"delta\":\"x.com\\\"}\"}\n\n",
-            "event: response.mcp_call_arguments.done\ndata: {\"type\":\"response.mcp_call_arguments.done\",\"item_id\":\"mcp_1\",\"output_index\":0,\"arguments\":\"{\\\"to\\\":\\\"a@x.com\\\"}\"}\n\n",
-            "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"mcp_call\",\"id\":\"mcp_1\",\"server_label\":\"s\",\"name\":\"send\",\"arguments\":\"{\\\"to\\\":\\\"a@x.com\\\"}\"}}\n\n",
-        );
-        let (out, counts) = redact_responses_sse(chain.as_ref(), raw.as_bytes()).unwrap();
-        let out = String::from_utf8(out).unwrap();
-        assert!(
-            !out.contains("a@"),
-            "an mcp_call argument fragment reached the client unmasked: {out}"
-        );
-        assert_eq!(out.matches("[EMAIL_REDACTED]").count(), 3, "out: {out}");
         assert_eq!(counts.get("email"), Some(&1));
     }
 

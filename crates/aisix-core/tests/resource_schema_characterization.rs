@@ -368,9 +368,29 @@ fn provider_key_corpus() {
                 json!({"display_name": "x", "api_key": ""}),
             ),
             (
-                "adapter azure-openai",
-                true,
+                "adapter anthropic (no longer supported)",
+                false,
+                json!({"display_name": "x", "api_key": "k", "adapter": "anthropic"}),
+            ),
+            (
+                "adapter bedrock (no longer supported)",
+                false,
+                json!({"display_name": "x", "api_key": "k", "adapter": "bedrock"}),
+            ),
+            (
+                "adapter vertex (no longer supported)",
+                false,
+                json!({"display_name": "x", "api_key": "k", "adapter": "vertex"}),
+            ),
+            (
+                "adapter azure-openai (no longer supported)",
+                false,
                 json!({"display_name": "x", "api_key": "k", "adapter": "azure-openai"}),
+            ),
+            (
+                "adapter openai",
+                true,
+                json!({"display_name": "x", "api_key": "k", "adapter": "openai"}),
             ),
             (
                 "adapter invalid",
@@ -703,145 +723,6 @@ fn guardrail_corpus() {
                 false,
                 json!({"name": "k", "kind": "keyword", "patterns": [], "hook_point": "sideways"}),
             ),
-            // bedrock
-            (
-                "bedrock serial",
-                true,
-                json!({"name": "b", "kind": "bedrock", "guardrail_id": "gid", "guardrail_version": "DRAFT", "region": "us-east-1", "aws_credentials": {"kind": "static", "access_key_id": "AKIA", "secret_access_key": "s"}, "latency_mode": {"kind": "serial"}}),
-            ),
-            (
-                "bedrock timed",
-                true,
-                json!({"name": "b", "kind": "bedrock", "guardrail_id": "gid", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "static", "access_key_id": "AKIA", "secret_access_key": "s"}, "latency_mode": {"kind": "timed", "timeout_ms": 500}}),
-            ),
-            (
-                "bedrock api_key credentials",
-                true,
-                json!({"name": "b", "kind": "bedrock", "guardrail_id": "gid", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "api_key", "api_key": "ABSK"}, "latency_mode": {"kind": "serial"}}),
-            ),
-            (
-                "bedrock default_chain credentials",
-                true,
-                json!({"name": "b", "kind": "bedrock", "guardrail_id": "gid", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "default_chain"}, "latency_mode": {"kind": "serial"}}),
-            ),
-            (
-                "bedrock default_chain assuming a role",
-                true,
-                json!({"name": "b", "kind": "bedrock", "guardrail_id": "gid", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "default_chain", "role_arn": "arn:aws:iam::1:role/r", "external_id": "x", "role_session_name": "s"}, "latency_mode": {"kind": "serial"}}),
-            ),
-            (
-                "bedrock static with session token and role",
-                true,
-                json!({"name": "b", "kind": "bedrock", "guardrail_id": "gid", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "static", "access_key_id": "a", "secret_access_key": "s", "session_token": "t", "role_arn": "arn:aws:iam::1:role/r"}, "latency_mode": {"kind": "serial"}}),
-            ),
-            (
-                "bedrock api_key with role_arn",
-                false,
-                json!({"name": "b", "kind": "bedrock", "guardrail_id": "gid", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "api_key", "api_key": "ABSK", "role_arn": "arn:aws:iam::1:role/r"}, "latency_mode": {"kind": "serial"}}),
-            ),
-            (
-                "bedrock api_key without api_key",
-                false,
-                json!({"name": "b", "kind": "bedrock", "guardrail_id": "gid", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "api_key"}, "latency_mode": {"kind": "serial"}}),
-            ),
-            (
-                "bedrock default_chain with access keys",
-                false,
-                json!({"name": "b", "kind": "bedrock", "guardrail_id": "gid", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "default_chain", "access_key_id": "a", "secret_access_key": "s"}, "latency_mode": {"kind": "serial"}}),
-            ),
-            (
-                "bedrock external_id without role_arn",
-                false,
-                json!({"name": "b", "kind": "bedrock", "guardrail_id": "gid", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "default_chain", "external_id": "x"}, "latency_mode": {"kind": "serial"}}),
-            ),
-            (
-                "bedrock missing guardrail_id",
-                false,
-                json!({"name": "b", "kind": "bedrock", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "static", "access_key_id": "a", "secret_access_key": "s"}, "latency_mode": {"kind": "serial"}}),
-            ),
-            (
-                "bedrock timed timeout < 100",
-                false,
-                json!({"name": "b", "kind": "bedrock", "guardrail_id": "g", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "static", "access_key_id": "a", "secret_access_key": "s"}, "latency_mode": {"kind": "timed", "timeout_ms": 50}}),
-            ),
-            (
-                "bedrock latency_mode extra field",
-                false,
-                json!({"name": "b", "kind": "bedrock", "guardrail_id": "g", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "static", "access_key_id": "a", "secret_access_key": "s"}, "latency_mode": {"kind": "timed", "timeout_ms": 500, "extra": 1}}),
-            ),
-            (
-                "bedrock aws_credentials extra field",
-                false,
-                json!({"name": "b", "kind": "bedrock", "guardrail_id": "g", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "static", "access_key_id": "a", "secret_access_key": "s", "junk": 1}, "latency_mode": {"kind": "serial"}}),
-            ),
-            // azure_content_safety
-            (
-                "azure cs minimal",
-                true,
-                json!({"name": "a", "kind": "azure_content_safety", "endpoint": "https://x.cognitiveservices.azure.com", "api_key": "k"}),
-            ),
-            (
-                "azure cs missing endpoint",
-                false,
-                json!({"name": "a", "kind": "azure_content_safety", "api_key": "k"}),
-            ),
-            (
-                "azure cs timeout overflow (u32)",
-                false,
-                json!({"name": "a", "kind": "azure_content_safety", "endpoint": "https://x", "api_key": "k", "timeout_ms": 4_294_967_296u64}),
-            ),
-            // azure_content_safety_text_moderation
-            (
-                "azure tm minimal",
-                true,
-                json!({"name": "m", "kind": "azure_content_safety_text_moderation", "endpoint": "https://x", "api_key": "k"}),
-            ),
-            (
-                "azure tm full",
-                true,
-                json!({"name": "m", "kind": "azure_content_safety_text_moderation", "endpoint": "https://x", "api_key": "k", "output_type": "EightSeverityLevels", "categories": ["Hate", "Violence"], "severity_threshold": 0, "stream_processing_mode": "buffer_full", "window_size": 5000, "on_buffer_exceeded": "fail_open"}),
-            ),
-            (
-                "azure tm severity > 7",
-                false,
-                json!({"name": "m", "kind": "azure_content_safety_text_moderation", "endpoint": "https://x", "api_key": "k", "severity_threshold": 8}),
-            ),
-            (
-                "azure tm window_size > 10000",
-                false,
-                json!({"name": "m", "kind": "azure_content_safety_text_moderation", "endpoint": "https://x", "api_key": "k", "window_size": 20000}),
-            ),
-            (
-                "azure tm output_type enum (injected)",
-                false,
-                json!({"name": "m", "kind": "azure_content_safety_text_moderation", "endpoint": "https://x", "api_key": "k", "output_type": "Twelve"}),
-            ),
-            (
-                "azure tm categories item enum (injected)",
-                false,
-                json!({"name": "m", "kind": "azure_content_safety_text_moderation", "endpoint": "https://x", "api_key": "k", "categories": ["Nope"]}),
-            ),
-            // aliyun_text_moderation
-            (
-                "aliyun minimal",
-                true,
-                json!({"name": "al", "kind": "aliyun_text_moderation", "region": "cn-shanghai", "access_key_id": "LTAI", "access_key_secret": "s"}),
-            ),
-            (
-                "aliyun missing region",
-                false,
-                json!({"name": "al", "kind": "aliyun_text_moderation", "access_key_id": "id", "access_key_secret": "s"}),
-            ),
-            (
-                "aliyun risk_level enum (injected)",
-                false,
-                json!({"name": "al", "kind": "aliyun_text_moderation", "region": "cn", "access_key_id": "id", "access_key_secret": "s", "risk_level_threshold": "critical"}),
-            ),
-            (
-                "aliyun window_size > 2000",
-                false,
-                json!({"name": "al", "kind": "aliyun_text_moderation", "region": "cn", "access_key_id": "id", "access_key_secret": "s", "window_size": 3000}),
-            ),
         ],
     );
 }
@@ -1005,38 +886,26 @@ fn published_strict_schemas_are_what_the_write_path_compiles() {
 /// `additionalProperties: false` stripped) and the lenient file disagree.
 ///
 /// A consumer that models the lenient set as "the strict set with the
-/// closures removed" is wrong for these five, and the difference is not
-/// cosmetic: the loader accepts an `mcp_policy` with no `allow` and reads the
-/// field's default. Registering the paths rather than a prose reason is what
-/// makes the table checkable — a claim that some OTHER field relaxed, or that
-/// one of these stopped relaxing, moves a path and fails.
+/// closures removed" is wrong for these, and the difference is not
+/// cosmetic. Registering the paths rather than a prose reason is what
+/// makes the table checkable — a claim that some OTHER field relaxed, or
+/// that one of these stopped relaxing, moves a path and fails.
 ///
 /// Three shapes appear here, and `schemas/README.md` must keep telling them
 /// apart:
 ///
 /// - a `required` / `minLength` / `pattern` / `not` change, which really does
-///   let the loader accept a document the write path rejects (`api_key`,
-///   `mcp_policy`, `mcp_server`, `model`, and the `semantic` guardrail
-///   branch). `mcp_server`'s is the label pattern, which forbids a `*` only
-///   on the write path — a stored row that already carries one must keep
-///   loading, and a read-path tightening would drop the row rather than the
-///   character. The
-///   `McpToolRef` `required` / `minLength` paths are this shape: a
-///   half-written entry has to keep deserializing, because the loader
-///   skips a row it cannot deserialize whole and for an `api_key` that
-///   costs the key every kind of traffic, not just MCP access;
+///   let the loader accept a document the write path rejects (`model`, and
+///   the `semantic` guardrail branch);
 /// - an `allOf` overlay the STRICT producer injects and the lenient one
-///   does not. `mcp_policy`'s `/allOf` holds both the team-scope guard,
-///   which is on both sets, and the strict-only "write the name form beside
-///   the id form" guard — so the whole keyword differs even though half of
-///   its contents do not. `api_key`'s two are strict-only outright;
+///   does not. `budget`'s and the `semantic` guardrail branch's are this
+///   shape;
 /// - a `default` annotation the STRICT producer strips on purpose and the
 ///   lenient one keeps, which changes nothing about what validates but does
 ///   feed a schema-driven form generator a value the same branch would refuse
 ///   (the `custom` guardrail's `script`, whose `default: ""` sits beside
-///   `minLength: 1`; both halves of `McpToolRef`, for the same reason; the
-///   semantic thresholds' `default: 0.75`). `script` itself is required on
-///   BOTH sets.
+///   `minLength: 1`; the semantic thresholds' `default: 0.75`). `script`
+///   itself is required on BOTH sets.
 const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
     (
         "budget",
@@ -1046,14 +915,6 @@ const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
     (
         "api_key",
         &[
-            "/allOf",
-            "/definitions/McpAccess/allOf",
-            "/definitions/McpAccess/required",
-            "/definitions/McpToolRef/properties/server_id/default",
-            "/definitions/McpToolRef/properties/server_id/minLength",
-            "/definitions/McpToolRef/properties/tool/default",
-            "/definitions/McpToolRef/properties/tool/minLength",
-            "/definitions/McpToolRef/required",
             "/properties/tags/additionalProperties/maxLength",
             "/properties/tags/additionalProperties/minLength",
             "/properties/tags/maxProperties",
@@ -1064,27 +925,12 @@ const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
     (
         "guardrail",
         &[
-            "/definitions/BedrockAWSCredentials/oneOf/0/dependencies",
-            "/definitions/BedrockAWSCredentials/oneOf/2/dependencies",
-            "/oneOf/10/allOf",
-            "/oneOf/10/properties/allow_threshold/default",
-            "/oneOf/10/properties/deny_threshold/default",
-            "/oneOf/11/properties/script/default",
+            "/oneOf/5/allOf",
+            "/oneOf/5/properties/allow_threshold/default",
+            "/oneOf/5/properties/deny_threshold/default",
+            "/oneOf/6/properties/script/default",
         ],
     ),
-    (
-        "mcp_policy",
-        &[
-            "/allOf",
-            "/definitions/McpToolRef/properties/server_id/default",
-            "/definitions/McpToolRef/properties/server_id/minLength",
-            "/definitions/McpToolRef/properties/tool/default",
-            "/definitions/McpToolRef/properties/tool/minLength",
-            "/definitions/McpToolRef/required",
-            "/required",
-        ],
-    ),
-    ("mcp_server", &["/properties/name/pattern"]),
     (
         "oidc_provider",
         &[
@@ -1382,14 +1228,6 @@ const UNKNOWN_FIELD_TOLERANCE: &[Probe] = &[
                    "resolve": {"api_key_id": "k"}})
         },
     },
-    Probe {
-        resource: "mcp_auth_settings",
-        pointer: "/anonymous",
-        document: || {
-            json!({"anonymous": {"api_key_id": "k", "servers": ["s"],
-                                 "source_cidrs": ["10.0.0.0/8"]}})
-        },
-    },
     // Root-only: these resources embed no object their write contract closes.
     Probe {
         resource: "observability_exporter",
@@ -1398,21 +1236,6 @@ const UNKNOWN_FIELD_TOLERANCE: &[Probe] = &[
             json!({"name": "e", "kind": "otlp_http",
                    "endpoint": "https://collector.example/v1/traces"})
         },
-    },
-    Probe {
-        resource: "mcp_server",
-        pointer: "",
-        document: || json!({"name": "s", "url": "https://example.com/mcp"}),
-    },
-    Probe {
-        resource: "mcp_policy",
-        pointer: "",
-        document: || json!({"scope": "env", "allow": ["*"]}),
-    },
-    Probe {
-        resource: "a2a_agent",
-        pointer: "",
-        document: || json!({"name": "ag", "url": "https://example.com/a2a"}),
     },
     Probe {
         resource: "oidc_provider",

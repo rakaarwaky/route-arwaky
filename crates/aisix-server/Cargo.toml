@@ -16,16 +16,11 @@ path = "src/main.rs"
 aisix-core = { path = "../aisix-core" }
 aisix-etcd = { path = "../aisix-etcd" }
 aisix-gateway = { path = "../aisix-gateway" }
-aisix-mcp = { path = "../aisix-mcp" }
 aisix-obs = { path = "../aisix-obs" }
 aisix-proxy = { path = "../aisix-proxy" }
 aisix-guardrails = { path = "../aisix-guardrails" }
 aisix-admin = { path = "../aisix-admin" }
 aisix-provider-openai = { path = "../aisix-provider-openai" }
-aisix-provider-anthropic = { path = "../aisix-provider-anthropic" }
-aisix-provider-vertex = { path = "../aisix-provider-vertex" }
-aisix-provider-azure-openai = { path = "../aisix-provider-azure-openai" }
-aisix-provider-bedrock = { path = "../aisix-provider-bedrock" }
 aisix-ratelimit = { path = "../aisix-ratelimit" }
 aisix-redis = { path = "../aisix-redis" }
 aisix-cache = { path = "../aisix-cache", features = ["redis"] }

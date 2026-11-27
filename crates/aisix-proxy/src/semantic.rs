@@ -7,11 +7,6 @@
 //! so semantic routing reuses all of the streaming / failover / telemetry
 //! machinery and only adds the "which target" decision on top.
 //!
-//! A router with a `classifier` block makes the same decision a different
-//! way: one call to a hosted decision model ([`classify`]) picks a route by
-//! its description. Everything after the pick — the member gates, the
-//! failure policy, the served-route attribution — is shared.
-//!
 //! The scoring core ([`decide`], [`failure_target`]) and the
 //! example-vector cache ([`SemanticVectorCache`]) are pure and unit-tested
 //! in isolation; the async embedding call lives in [`resolve`].
@@ -23,8 +18,7 @@ use axum::http::HeaderMap;
 use dashmap::DashMap;
 
 use aisix_core::models::{
-    resolve_model_ref, ClassifierType, EmbeddingFailureMode, OnEmbeddingFailure, Semantic,
-    SemanticClassifier, SemanticRoute, TYPESAFE_PROVIDER,
+    resolve_model_ref, EmbeddingFailureMode, OnEmbeddingFailure, Semantic, SemanticRoute,
 };
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{AisixSnapshot, Model};
@@ -88,14 +82,6 @@ pub(crate) fn decide(
 /// access log. Free text about the failure goes only to the warn line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecisionFailure {
-    ClassifierTimeout,
-    /// The classifier answered a non-2xx status, or the call failed in
-    /// transport.
-    ClassifierUpstream,
-    /// The classifier answered 2xx with no usable choice.
-    ClassifierInvalidResponse,
-    /// The classifier model or its Provider Key is missing or misconfigured.
-    ClassifierUnavailable,
     EmbeddingTimeout,
     /// The embedding upstream answered an error, or the call failed in
     /// transport or decoding.
@@ -108,23 +94,10 @@ pub enum DecisionFailure {
 impl DecisionFailure {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::ClassifierTimeout => "classifier_timeout",
-            Self::ClassifierUpstream => "classifier_upstream",
-            Self::ClassifierInvalidResponse => "classifier_invalid_response",
-            Self::ClassifierUnavailable => "classifier_unavailable",
             Self::EmbeddingTimeout => "embedding_timeout",
             Self::EmbeddingUpstream => "embedding_upstream",
             Self::EmbeddingUnavailable => "embedding_unavailable",
         }
-    }
-
-    fn of_classifier_transport(err: &reqwest::Error) -> (Self, String) {
-        let failure = if err.is_timeout() {
-            Self::ClassifierTimeout
-        } else {
-            Self::ClassifierUpstream
-        };
-        (failure, aisix_gateway::transport_error_message(err))
     }
 
     fn of_embedding_error(err: &EmbedTextsError) -> Self {
@@ -156,9 +129,8 @@ impl std::fmt::Display for DecisionFailure {
 }
 
 /// Model alias (a direct model or a model group) to dispatch to when the router cannot decide — the
-/// embedding call failed (`on_embedding_failure`), or the classifier call
-/// did (`classifier.on_failure`). `None` means the policy is `fail` — the
-/// caller returns `503`.
+/// embedding call failed (`on_embedding_failure`). `None` means the
+/// policy is `fail` — the caller returns `503`.
 ///
 /// Each of the two aliases it can return is a model reference in its own
 /// right, so both are resolved against the snapshot: an id spelling follows
@@ -168,10 +140,7 @@ pub(crate) fn failure_target<'a>(
     snapshot: &AisixSnapshot,
     semantic: &'a Semantic,
 ) -> Option<Cow<'a, str>> {
-    let policy = match &semantic.classifier {
-        Some(classifier) => &classifier.on_failure,
-        None => &semantic.on_embedding_failure,
-    };
+    let policy = &semantic.on_embedding_failure;
     match policy {
         OnEmbeddingFailure::Mode(EmbeddingFailureMode::Default) => {
             Some(semantic.default_ref(snapshot))
@@ -231,7 +200,7 @@ struct Pick {
     /// request to `default`.
     winner: Option<usize>,
     /// The deciding score: the winning (or, with no winner, the best)
-    /// route's cosine similarity, or the classifier's confidence.
+    /// route's cosine similarity.
     score: Option<f64>,
     /// Why there is no winner.
     miss: Option<SemanticFallback>,
@@ -305,7 +274,7 @@ pub(crate) async fn resolve(
         }
     }
 
-    // No user text to classify (e.g. a system-only or tool-only request):
+    // No user text to score (e.g. a system-only or tool-only request):
     // route to `default` without a decision call rather than deciding on
     // an empty string, which could spuriously match a route.
     if prompt.trim().is_empty() {
@@ -314,39 +283,8 @@ pub(crate) async fn resolve(
         return Ok(eligible.into_dispatch(None));
     }
 
-    let pick = match &semantic.classifier {
-        Some(classifier) => match classify(
-            snapshot,
-            &semantic.routes,
-            classifier,
-            prompt,
-            request_id,
-            routing.client,
-        )
-        .await
-        {
-            Ok((picked, confidence)) => {
-                let confident = confidence >= classifier.min_confidence;
-                Ok(Pick {
-                    winner: confident.then_some(picked),
-                    score: Some(confidence),
-                    miss: (!confident).then_some(SemanticFallback::LowConfidence),
-                })
-            }
-            Err((failure, error)) => {
-                tracing::warn!(
-                    router = %router.display_name,
-                    reason = %failure,
-                    error = %error,
-                    "semantic classifier call failed; applying classifier.on_failure",
-                );
-                Err(failure)
-            }
-        },
-        None => {
-            decide_by_embedding(state, snapshot, router_entry, semantic, prompt, request_id).await
-        }
-    };
+    let pick = decide_by_embedding(state, snapshot, router_entry, semantic, prompt, request_id)
+        .await;
     let pick = match pick {
         Ok(pick) => pick,
         Err(failure) => {
@@ -880,407 +818,6 @@ fn fallback(
     }
 }
 
-/// Endpoint a `typesafe` Provider Key reaches when it sets no `api_base`.
-pub(crate) const TYPESAFE_DEFAULT_API_BASE: &str = "https://api.typesafe.ai";
-
-/// The one question every classifier call asks. The wording is the one the
-/// classifier mode was validated with; change it only against a fresh
-/// evaluation.
-const CLASSIFIER_QUESTION: &str = "route";
-const CLASSIFIER_INSTRUCTIONS: &str =
-    "Which route should handle this user request to an AI assistant?";
-const GEMINI_DECISION_MODEL: &str = "gemini-decision-1";
-
-#[derive(serde::Serialize)]
-struct ClassifierRequest<'a> {
-    #[serde(flatten)]
-    input: ClassifierInput<'a>,
-    model: &'a str,
-    questions: ClassifierQuestions<'a>,
-}
-
-#[derive(serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-enum ClassifierInput<'a> {
-    State(&'a str),
-    Input(&'a str),
-}
-
-#[derive(serde::Serialize)]
-struct ClassifierQuestions<'a> {
-    route: ClassifierChoice<'a>,
-}
-
-#[derive(serde::Serialize)]
-struct ClassifierChoice<'a> {
-    r#type: &'static str,
-    instructions: &'static str,
-    criteria: Criteria<'a>,
-}
-
-/// The options: exactly the configured routes, in configured order — which
-/// a `serde_json::Map` (sorted by key) would not keep. The gateway adds no
-/// option of its own; a catch-all is a route the operator configures.
-struct Criteria<'a> {
-    routes: &'a [SemanticRoute],
-    kind: ClassifierType,
-}
-
-impl serde::Serialize for Criteria<'_> {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        let mut map = s.serialize_map(Some(self.routes.len()))?;
-        for (index, route) in self.routes.iter().enumerate() {
-            let description = route.description.as_deref().unwrap_or_default();
-            match self.kind {
-                ClassifierType::Jev => map.serialize_entry(&route.name, description)?,
-                ClassifierType::GeminiDecision => map.serialize_entry(
-                    &gemini_option_key(index),
-                    &format!("{}: {description}", route.name),
-                )?,
-            }
-        }
-        map.end()
-    }
-}
-
-// Gemini sorts the option keys by UTF-8 bytes before scoring them.
-fn gemini_option_key(index: usize) -> String {
-    format!("route_{index:03}")
-}
-
-#[derive(serde::Deserialize)]
-struct ClassifierResponse {
-    #[serde(default)]
-    answers: std::collections::HashMap<String, ClassifierAnswer>,
-}
-
-#[derive(serde::Deserialize)]
-struct ClassifierAnswer {
-    choice: String,
-    confidence: f64,
-}
-
-/// Ask the classifier which route fits `prompt`. Returns the index of the
-/// route it picked and its confidence.
-/// Every way the call can fail comes back as `Err` with a reason for the
-/// log, and the caller applies `classifier.on_failure`.
-///
-/// Detached, like the embedding sub-call: it is a call the GATEWAY decided
-/// to make, not one the caller addressed, so it is recorded as the
-/// request's child usage event rather than as its target.
-async fn classify(
-    snapshot: &AisixSnapshot,
-    routes: &[SemanticRoute],
-    classifier: &SemanticClassifier,
-    prompt: &str,
-    request_id: &str,
-    client: Option<&crate::client_ip::ClientContext>,
-) -> Result<(usize, f64), (DecisionFailure, String)> {
-    crate::attribution::detached(classify_inner(
-        snapshot, routes, classifier, prompt, request_id, client,
-    ))
-    .await
-}
-
-/// What a classifier call goes out on: a direct model when the classifier
-/// names one by `model_id`, else the inline Provider Key and model name.
-struct ClassifierTarget {
-    pk: Arc<ResourceEntry<aisix_core::ProviderKey>>,
-    model: Option<Arc<ResourceEntry<Model>>>,
-    upstream_model: String,
-}
-
-fn classifier_target(
-    snapshot: &AisixSnapshot,
-    classifier: &SemanticClassifier,
-) -> Result<ClassifierTarget, String> {
-    let (pk, model) = match classifier.model_id.as_deref() {
-        Some(id) => {
-            let entry = snapshot
-                .models
-                .get_by_id(id)
-                .ok_or_else(|| format!("classifier model_id {id:?} matches no model"))?;
-            let m = &entry.value;
-            if m.is_routing() || m.is_semantic() || m.is_ensemble() || m.is_embedding() {
-                return Err(format!(
-                    "classifier model {:?} is not a direct model",
-                    m.display_name
-                ));
-            }
-            if classifier.r#type == ClassifierType::GeminiDecision
-                && (m.display_name.contains('*')
-                    || m.provider.as_deref() != Some("google")
-                    || m.model_name.as_deref() != Some(GEMINI_DECISION_MODEL))
-            {
-                return Err(format!(
-                    "classifier model {:?} must have provider google, model_name {GEMINI_DECISION_MODEL}, and a non-wildcard alias",
-                    m.display_name
-                ));
-            }
-            let pk =
-                crate::dispatch::resolve_provider_key(snapshot, m).map_err(|e| e.to_string())?;
-            (pk, Some(entry))
-        }
-        None if classifier.r#type == ClassifierType::GeminiDecision => {
-            return Err("the Gemini Decision classifier requires model_id".to_owned());
-        }
-        None => {
-            let pk = snapshot
-                .provider_keys
-                .get_by_id(&classifier.provider_key_id)
-                .ok_or_else(|| {
-                    format!(
-                        "classifier provider_key_id {:?} matches no provider key",
-                        classifier.provider_key_id
-                    )
-                })?;
-            (pk, None)
-        }
-    };
-    let provider = match classifier.r#type {
-        ClassifierType::Jev => TYPESAFE_PROVIDER,
-        ClassifierType::GeminiDecision => "google",
-    };
-    if pk.value.provider != provider {
-        return Err(format!(
-            "classifier provider key {:?} has provider {:?}, expected {provider:?}",
-            pk.value.display_name, pk.value.provider
-        ));
-    }
-    let upstream_model = match &model {
-        Some(entry) => {
-            crate::dispatch::require_api_key(&pk.value, &entry.value).map_err(|e| e.to_string())?;
-            crate::dispatch::require_upstream_model(&entry.value)
-                .map_err(|e| e.to_string())?
-                .to_string()
-        }
-        None => classifier.model.clone(),
-    };
-    Ok(ClassifierTarget {
-        pk,
-        model,
-        upstream_model,
-    })
-}
-
-fn classifier_headers(
-    target: &ClassifierTarget,
-    kind: ClassifierType,
-    request_id: &str,
-    client: Option<&crate::client_ip::ClientContext>,
-) -> Result<reqwest::header::HeaderMap, String> {
-    use reqwest::header::{HeaderName, HeaderValue};
-    let pk = &target.pk.value;
-    let ctx = match (&target.model, client) {
-        (Some(model), Some(client)) => {
-            crate::dispatch::upstream_header_ctx(pk, &target.pk.id, &model.value, &model.id, client)
-        }
-        _ => aisix_gateway::UpstreamHeaderContext::from_overrides(pk.request.as_ref()),
-    };
-    if kind == ClassifierType::GeminiDecision {
-        return crate::gemini::native::request_headers(&pk.api_key, request_id, &ctx)
-            .map_err(|e| e.to_string());
-    }
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        reqwest::header::AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {}", pk.api_key))
-            .map_err(|_| "classifier api key contains invalid header chars".to_owned())?,
-    );
-    headers.insert(
-        reqwest::header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    if target.model.is_none() {
-        return Ok(headers);
-    }
-    if let Ok(id) = HeaderValue::from_str(request_id) {
-        headers.insert(HeaderName::from_static("x-aisix-request-id"), id);
-    }
-    aisix_gateway::apply_request_headers(&mut headers, &ctx);
-    Ok(headers)
-}
-
-async fn classify_inner(
-    snapshot: &AisixSnapshot,
-    routes: &[SemanticRoute],
-    classifier: &SemanticClassifier,
-    prompt: &str,
-    request_id: &str,
-    client: Option<&crate::client_ip::ClientContext>,
-) -> Result<(usize, f64), (DecisionFailure, String)> {
-    use DecisionFailure::{ClassifierInvalidResponse, ClassifierUnavailable, ClassifierUpstream};
-    let target =
-        classifier_target(snapshot, classifier).map_err(|msg| (ClassifierUnavailable, msg))?;
-    let pk = &target.pk.value;
-    let kind = classifier.r#type;
-    let body = serde_json::to_vec(&ClassifierRequest {
-        input: match kind {
-            ClassifierType::Jev => ClassifierInput::State(prompt),
-            ClassifierType::GeminiDecision => ClassifierInput::Input(prompt),
-        },
-        model: &target.upstream_model,
-        questions: ClassifierQuestions {
-            route: ClassifierChoice {
-                r#type: "choice",
-                instructions: CLASSIFIER_INSTRUCTIONS,
-                criteria: Criteria { routes, kind },
-            },
-        },
-    })
-    .map_err(|e| {
-        (
-            ClassifierUnavailable,
-            format!("encoding the classifier request: {e}"),
-        )
-    })?;
-    let body = match &target.model {
-        Some(_) => crate::decisions::apply_body_overrides(pk, bytes::Bytes::from(body))
-            .map_err(|e| (ClassifierUnavailable, e.to_string()))?,
-        None => bytes::Bytes::from(body),
-    };
-    let headers = classifier_headers(&target, kind, request_id, client)
-        .map_err(|msg| (ClassifierUnavailable, msg))?;
-
-    let client = crate::http_client::client_for(pk.upstream_connection().as_ref());
-    let (request, operation) = match kind {
-        ClassifierType::Jev => (
-            client.post(crate::decisions::typesafe_systemone_url(pk)),
-            crate::operation::SYSTEMONE.operation,
-        ),
-        ClassifierType::GeminiDecision => (
-            client.post(
-                crate::gemini::native::decisions_endpoint(pk)
-                    .map_err(|e| (ClassifierUnavailable, e.to_string()))?,
-            ),
-            crate::operation::DECISIONS.operation,
-        ),
-    };
-    let mut child = crate::attribution::begin_internal_call(internal_call(
-        InternalCallPurpose::SemanticRouteDecision,
-        operation,
-        target.model.as_deref(),
-        &target.pk.id,
-    ));
-    let sent = request
-        .headers(headers)
-        .timeout(classifier.timeout())
-        .body(body)
-        .send()
-        .await;
-    // A refusal's body is never read: the router falls back on the status.
-    let read = match sent {
-        Ok(resp) if resp.status().is_success() => {
-            let status = resp.status();
-            resp.bytes().await.map(|bytes| (status, bytes))
-        }
-        Ok(resp) => Ok((resp.status(), bytes::Bytes::new())),
-        Err(e) => Err(e),
-    };
-    let mut call = child.settle();
-    let (status, bytes) = match read {
-        Ok(read) => read,
-        Err(e) => {
-            let (failure, message) = DecisionFailure::of_classifier_transport(&e);
-            let (code, class) = if e.is_timeout() {
-                (504, "timeout")
-            } else {
-                (502, "transport")
-            };
-            call.status_code = code;
-            call.error_class = class.to_owned();
-            call.error_message = crate::attempt::sanitize_error_message(&message);
-            child.record(call);
-            return Err((failure, message));
-        }
-    };
-    call.status_code = status.as_u16();
-    if !status.is_success() {
-        let message = format!("classifier returned HTTP {}", status.as_u16());
-        call.error_class = "upstream_status".to_owned();
-        call.error_message = message.clone();
-        child.record(call);
-        return Err((ClassifierUpstream, message));
-    }
-    // Record upstream usage even if the answer cannot be used for routing.
-    let parsed = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
-    if let Some(doc) = &parsed {
-        let usage = match kind {
-            ClassifierType::Jev => crate::decisions_convert::systemone_usage(doc),
-            ClassifierType::GeminiDecision => crate::decisions_convert::gemini_decisions_usage(doc),
-        }
-        .unwrap_or_default();
-        call.prompt_tokens = usage.input;
-        call.completion_tokens = usage.output;
-        call.total_tokens = usage.upstream_total;
-        call.provider_request_id = crate::usage_attr::provider_response_id(doc);
-        call.provider_model_version = crate::chat::sanitize_tag(
-            doc.get("model")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-        );
-    }
-    child.record(call);
-    // Neither error below repeats what the classifier answered: its
-    // response can quote the prompt it was sent (`state`), and these
-    // errors end up on the router's warn line.
-    let mut parsed: ClassifierResponse = serde_json::from_slice(&bytes).map_err(|e| {
-        (
-            ClassifierInvalidResponse,
-            format!(
-                "classifier response is not the expected shape (line {} column {})",
-                e.line(),
-                e.column()
-            ),
-        )
-    })?;
-    let answer = parsed.answers.remove(CLASSIFIER_QUESTION).ok_or((
-        ClassifierInvalidResponse,
-        "classifier response carries no answer to the routing question".to_owned(),
-    ))?;
-    let picked = routes
-        .iter()
-        .enumerate()
-        .position(|(index, route)| match kind {
-            ClassifierType::Jev => route.name == answer.choice,
-            ClassifierType::GeminiDecision => gemini_option_key(index) == answer.choice,
-        })
-        .ok_or((
-            ClassifierInvalidResponse,
-            "classifier picked a choice that is not one of the offered routes".to_owned(),
-        ))?;
-    Ok((picked, answer.confidence))
-}
-
-/// A route, default or failure target, resolved: a model group is
-/// dispatched through its own members, anything else as the one attempt.
-enum Candidate {
-    Direct(Arc<ResourceEntry<Model>>),
-    Group(Arc<ResourceEntry<Model>>),
-}
-
-impl Candidate {
-    fn model(&self) -> &Model {
-        match self {
-            Self::Direct(entry) | Self::Group(entry) => &entry.value,
-        }
-    }
-}
-
-fn candidate_for_target(snapshot: &AisixSnapshot, alias: &str) -> Result<Candidate, ProxyError> {
-    let entry = snapshot.models.get_by_name(alias).ok_or_else(|| {
-        ProxyError::InvalidRequest(format!(
-            "semantic router target {alias:?} does not resolve to a known model",
-        ))
-    })?;
-    Ok(if entry.value.is_routing() {
-        Candidate::Group(entry)
-    } else {
-        Candidate::Direct(entry)
-    })
-}
 
 /// The target [`select_eligible`] picked.
 struct Eligible {
@@ -1361,15 +898,6 @@ fn select_eligible(
     });
     if candidates.is_empty() {
         return Err(ProxyError::ModelIpRestricted(router.display_name.clone()));
-    }
-    if let Some(admits) = routing.gemini_target {
-        candidates.retain(|(candidate, _)| match candidate {
-            Candidate::Direct(entry) => admits(&entry.value),
-            Candidate::Group(_) => true,
-        });
-        if candidates.is_empty() {
-            return Err(crate::gemini::unsupported_target());
-        }
     }
     // A candidate on a provider key whose budget is exhausted is excluded
     // as hard as one outside its allowlist. A group carries no provider
@@ -1699,8 +1227,7 @@ async fn estimate_embedding_tokens(model: &Model, texts: &[String]) -> u32 {
 }
 
 /// One internal call as known before it goes out: what it is for, and the
-/// model it calls — `None` for an inline classifier, which names no model
-/// resource.
+/// model it calls.
 fn internal_call(
     purpose: InternalCallPurpose,
     operation: &'static str,

@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
@@ -12,11 +12,7 @@ import {
   metricDelta,
   scrapeMetrics,
   spawnApp,
-  startA2aUpstream,
-  startMcpUpstream,
   waitConfigPropagation,
-  type A2aUpstream,
-  type McpUpstream,
   type MetricSample,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -157,20 +153,6 @@ async function startUpstream(): Promise<{ baseUrl: string; close(): Promise<void
           usage: { total_tokens: 9 },
         });
       }
-      if (path === "/systemone") {
-        return json(200, {
-          model: "jev-1",
-          answers: { is_bug: { type: "noul", noul: 0.9 } },
-          usage: { input_tokens: 30, output_tokens: 4 },
-        });
-      }
-      if (path === "/decisions") {
-        return json(200, {
-          model: "gpt-6-luna",
-          answers: [{ type: "predicate", name: "is_bug", probability: 0.9 }],
-          usage: { input_tokens: 30, output_tokens: 4, total_tokens: 34 },
-        });
-      }
       if (path === "/responses") {
         const response = {
           id: "resp_1",
@@ -189,30 +171,6 @@ async function startUpstream(): Promise<{ baseUrl: string; close(): Promise<void
           ]);
         }
         return json(200, response);
-      }
-      if (path === "/messages/count_tokens") {
-        return json(200, { input_tokens: 42 });
-      }
-      if (path === "/messages") {
-        if (body.stream) {
-          return sse(res, [
-            event("message_start", { type: "message_start", message: { id: "msg_1", type: "message", role: "assistant", content: [], model: "claude-x", stop_reason: null, usage: { input_tokens: 5, output_tokens: 0 } } }),
-            event("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
-            event("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hi" } }),
-            event("content_block_stop", { type: "content_block_stop", index: 0 }),
-            event("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 2 } }),
-            event("message_stop", { type: "message_stop" }),
-          ]);
-        }
-        return json(200, {
-          id: "msg_1",
-          type: "message",
-          role: "assistant",
-          model: "claude-x",
-          content: [{ type: "text", text: "hi" }],
-          stop_reason: "end_turn",
-          usage: { input_tokens: 5, output_tokens: 2 },
-        });
       }
       if (path === "/audio/transcriptions" || path === "/audio/translations") {
         if (/name="stream"\r\n\r\ntrue/.test(raw)) {
@@ -343,8 +301,6 @@ describe("every proxy route emits every per-request metric family", () => {
   let upstream: Awaited<ReturnType<typeof startUpstream>> | undefined;
   let realtime: Awaited<ReturnType<typeof startRealtimeUpstream>> | undefined;
   let asr: Awaited<ReturnType<typeof startFunAsrUpstream>> | undefined;
-  let mcp: McpUpstream | undefined;
-  let a2a: A2aUpstream | undefined;
   let etcdReachable = false;
   /** Filled by the jobs rows as they run, in table order. */
   const jobs = { fileId: "", batchId: "", ftId: "" };
@@ -386,45 +342,7 @@ describe("every proxy route emits every per-request metric family", () => {
     return f;
   };
 
-  const mcpRpc = (path: string, body: unknown) =>
-    expectCall(path, {
-      method: "POST",
-      headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
-      body: JSON.stringify(body),
-    });
-  const mcpToolCall = async (path: string) => {
-    await mcpRpc(path, {
-      jsonrpc: "2.0",
-      id: 1,
-      method: "initialize",
-      params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "parity", version: "0.1" } },
-    });
-    await mcpRpc(path, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "alpha__echo", arguments: { text: "hi" } } });
-  };
-
-  const a2aMessage = (method: string) => ({
-    jsonrpc: "2.0",
-    id: "1",
-    method,
-    params: { message: { role: "user", parts: [{ kind: "text", text: "invoice 42" }], messageId: "m-1" } },
-  });
-
   const jobsModel = { "x-aisix-model": "par-jobs" };
-
-  const geminiCalls = [
-    { route: "/v1beta/models/*model_action", modelPath: "/v1beta/models/par-chat" },
-    {
-      route: "/v1beta1/projects/:project/locations/:location/publishers/google/models/*model_action",
-      modelPath: "/v1beta1/projects/local/locations/us-central1/publishers/google/models/par-chat",
-    },
-  ].flatMap(({ route, modelPath }) =>
-    ["generateContent", "streamGenerateContent"].map((action) => ({
-      route,
-      path: `${modelPath}:${action}`,
-      endpoint: `/v1beta/models/:model:${action}`,
-      stream: action === "streamGenerateContent",
-    })),
-  );
 
   const ROWS: Row[] = [
     { route: "/v1/models", name: "GET /v1/models", endpoint: "/v1/models", families: [...REQUEST], drive: async () => void (await expectCall("/v1/models")) },
@@ -445,17 +363,6 @@ describe("every proxy route emits every per-request metric family", () => {
       drive: async () =>
         void (await postJson("/v1/chat/completions", { model: "par-chat", stream: true, stream_options: { include_usage: true }, messages: [{ role: "user", content: "hi" }] })),
     },
-    ...geminiCalls.map(({ route, path, endpoint, stream }): Row => ({
-      route,
-      name: path,
-      endpoint,
-      protocols: { inbound_protocol: "gemini", upstream_protocol: "openai" },
-      model: "par-chat",
-      families: stream ? [...MODEL_ROUTE, "tokens", "ttft"] : [...MODEL_ROUTE, "tokens"],
-      drive: async () => void (await postJson(stream ? `${path}?alt=sse` : path, {
-        contents: [{ role: "user", parts: [{ text: "hi" }] }],
-      })),
-    })),
     {
       route: "/v1/completions",
       name: "completions",
@@ -490,66 +397,12 @@ describe("every proxy route emits every per-request metric family", () => {
         void (await expectCall("/v1/images/edits", { method: "POST", body: form({ model: "par-images", prompt: "a hat" }, ["image", "a.png"]) })),
     },
     {
-      route: "/v1/messages",
-      name: "messages",
-      endpoint: "/v1/messages",
-      model: "par-claude",
-      families: [...MODEL_ROUTE, "tokens"],
-      drive: async () =>
-        void (await postJson("/v1/messages", { model: "par-claude", max_tokens: 16, messages: [{ role: "user", content: "hi" }] }, { "anthropic-version": "2023-06-01" })),
-    },
-    {
-      route: "/v1/messages",
-      name: "messages stream",
-      endpoint: "/v1/messages",
-      model: "par-claude",
-      families: [...MODEL_ROUTE, "tokens", "ttft"],
-      drive: async () =>
-        void (await postJson("/v1/messages", { model: "par-claude", max_tokens: 16, stream: true, messages: [{ role: "user", content: "hi" }] }, { "anthropic-version": "2023-06-01" })),
-    },
-    {
-      // Counts a prompt; consumes no tokens.
-      route: "/v1/messages/count_tokens",
-      name: "count_tokens",
-      endpoint: "/v1/messages/count_tokens",
-      model: "par-claude",
-      families: [...MODEL_ROUTE],
-      drive: async () =>
-        void (await postJson("/v1/messages/count_tokens", { model: "par-claude", messages: [{ role: "user", content: "hi" }] }, { "anthropic-version": "2023-06-01" })),
-    },
-    {
       route: "/v1/rerank",
       name: "rerank",
       endpoint: "/v1/rerank",
       model: "par-rerank",
       families: [...MODEL_ROUTE, "tokens"],
       drive: async () => void (await postJson("/v1/rerank", { model: "par-rerank", query: "q", documents: ["a"] })),
-    },
-    {
-      route: "/v1/systemone",
-      name: "systemone",
-      endpoint: "/v1/systemone",
-      model: "par-systemone",
-      families: [...MODEL_ROUTE, "tokens"],
-      drive: async () =>
-        void (await postJson("/v1/systemone", {
-          model: "par-systemone",
-          state: "The API returns 500.",
-          questions: { is_bug: { type: "noul", instructions: "Is this a bug?", criteria: { true: "misbehaves", false: null } } },
-        })),
-    },
-    {
-      route: "/v1/decisions",
-      name: "decisions",
-      endpoint: "/v1/decisions",
-      model: "par-decisions",
-      families: [...MODEL_ROUTE, "tokens"],
-      drive: async () =>
-        void (await postJson("/v1/decisions", {
-          model: "par-decisions",
-          input: "The API returns 500.",
-          questions: [{ type: "predicate", name: "is_bug", instructions: "Is this a bug?" }],
-        })),
     },
     {
       route: "/v1/responses",
@@ -803,73 +656,6 @@ describe("every proxy route emits every per-request metric family", () => {
       families: [...REQUEST, "e2e_upstream", "deployment", "ratelimit_remaining"],
       drive: async () => void (await expectCall(`/v1/files/${jobs.fileId}`, { method: "DELETE" })),
     },
-    // Discovery documents: no model call behind them.
-    {
-      route: "/.well-known/oauth-protected-resource",
-      name: "protected-resource metadata",
-      endpoint: "/.well-known/oauth-protected-resource",
-      families: [...REQUEST],
-      // Answered 404 while no MCP OAuth is configured — still a request.
-      drive: async () => void (await expectCall("/.well-known/oauth-protected-resource", {}, 404)),
-    },
-    {
-      route: "/.well-known/oauth-protected-resource/mcp",
-      name: "protected-resource metadata (mcp)",
-      endpoint: "/.well-known/oauth-protected-resource/mcp",
-      families: [...REQUEST],
-      drive: async () => void (await expectCall("/.well-known/oauth-protected-resource/mcp", {}, 404)),
-    },
-    // The sign-in surface of a per-user OAuth server. `alpha` does not run
-    // that flow, so these answer 404; a sign-in callback with no state is a 400.
-    ...(
-      [
-        ["/.well-known/oauth-protected-resource/mcp/:server", "/.well-known/oauth-protected-resource/mcp/{server}", "/.well-known/oauth-protected-resource/mcp/alpha", "GET", 404],
-        ["/.well-known/oauth-authorization-server/mcp/:server", "/.well-known/oauth-authorization-server/mcp/{server}", "/.well-known/oauth-authorization-server/mcp/alpha", "GET", 404],
-        ["/mcp/:server/.well-known/openid-configuration", "/mcp/{server}/.well-known/openid-configuration", "/mcp/alpha/.well-known/openid-configuration", "GET", 404],
-        ["/mcp/:server/.well-known/jwks.json", "/mcp/{server}/.well-known/jwks.json", "/mcp/alpha/.well-known/jwks.json", "GET", 404],
-        ["/mcp/:server/oauth/register", "/mcp/{server}/oauth/register", "/mcp/alpha/oauth/register", "POST", 404],
-        ["/mcp/:server/oauth/authorize", "/mcp/{server}/oauth/authorize", "/mcp/alpha/oauth/authorize", "GET", 404],
-        ["/mcp/:server/oauth/token", "/mcp/{server}/oauth/token", "/mcp/alpha/oauth/token", "POST", 404],
-        ["/mcp/:server/oauth/credential", "/mcp/{server}/oauth/credential", "/mcp/alpha/oauth/credential", "DELETE", 404],
-        ["/mcp-oauth/callback", "/mcp-oauth/callback", "/mcp-oauth/callback", "GET", 400],
-        ["/mcp-oauth/login/callback", "/mcp-oauth/login/callback", "/mcp-oauth/login/callback", "GET", 400],
-        ["/mcp-oauth/consent", "/mcp-oauth/consent", "/mcp-oauth/consent", "POST", 400],
-      ] as const
-    ).map(([route, endpoint, path, method, status]) => ({
-      route,
-      name: `${method} ${route}`,
-      endpoint,
-      families: [...REQUEST],
-      drive: async () => void (await expectCall(path, { method }, status)),
-    })),
-    // MCP: a tool call, no model and no token usage.
-    { route: "/mcp", name: "mcp tools/call", endpoint: "/mcp", families: [...REQUEST, "e2e_upstream"], drive: () => mcpToolCall("/mcp") },
-    { route: "/mcp/", name: "mcp/ tools/call", endpoint: "/mcp", families: [...REQUEST, "e2e_upstream"], drive: () => mcpToolCall("/mcp/") },
-    { route: "/mcp/:server", name: "scoped mcp tools/call", endpoint: "/mcp/{server}", families: [...REQUEST, "e2e_upstream"], drive: () => mcpToolCall("/mcp/alpha") },
-    // A2A: an agent call, no model; its tokens are the gateway's estimate.
-    {
-      route: "/a2a/:agent",
-      name: "a2a message/send",
-      endpoint: "/a2a",
-      model: "a2a",
-      families: [...REQUEST, "e2e_upstream", "tokens"],
-      drive: async () => void (await postJson("/a2a/par-agent", a2aMessage("message/send"))),
-    },
-    {
-      route: "/a2a/:agent",
-      name: "a2a message/stream",
-      endpoint: "/a2a",
-      model: "a2a",
-      families: [...REQUEST, "e2e_upstream", "tokens", "ttft"],
-      drive: async () => void (await postJson("/a2a/par-agent", a2aMessage("message/stream"), { accept: "text/event-stream" })),
-    },
-    {
-      route: "/a2a/:agent/.well-known/agent-card.json",
-      name: "a2a agent card",
-      endpoint: "/a2a/{agent}/.well-known/agent-card.json",
-      families: [...REQUEST],
-      drive: async () => void (await expectCall("/a2a/par-agent/.well-known/agent-card.json")),
-    },
     // Passthrough routes (the router's fallback).
     {
       route: "<fallback>",
@@ -896,16 +682,11 @@ describe("every proxy route emits every per-request metric family", () => {
   const AUTH_ROUTES: Array<[string, string, string]> = [
     ["GET", "/v1/models", "/v1/models"],
     ["POST", "/v1/chat/completions", "/v1/chat/completions"],
-    ...geminiCalls.map(({ path, endpoint }): [string, string, string] => ["POST", path, endpoint]),
     ["POST", "/v1/completions", "/v1/completions"],
     ["POST", "/v1/embeddings", "/v1/embeddings"],
     ["POST", "/v1/images/generations", "/v1/images/generations"],
     ["POST", "/v1/images/edits", "/v1/images/edits"],
-    ["POST", "/v1/messages", "/v1/messages"],
-    ["POST", "/v1/messages/count_tokens", "/v1/messages/count_tokens"],
     ["POST", "/v1/rerank", "/v1/rerank"],
-    ["POST", "/v1/systemone", "/v1/systemone"],
-    ["POST", "/v1/decisions", "/v1/decisions"],
     ["POST", "/v1/responses", "/v1/responses"],
     ["POST", "/v1/audio/transcriptions", "/v1/audio/transcriptions"],
     ["POST", "/v1/audio/translations", "/v1/audio/translations"],
@@ -918,10 +699,6 @@ describe("every proxy route emits every per-request metric family", () => {
     ["GET", "/v1/batches/x", "/v1/batches/:id"],
     ["GET", "/v1/fine_tuning/jobs", "/v1/fine_tuning/jobs"],
     ["GET", "/v1/fine_tuning/jobs/x", "/v1/fine_tuning/jobs/:id"],
-    ["POST", "/mcp", "/mcp"],
-    ["POST", "/mcp/alpha", "/mcp/{server}"],
-    ["POST", "/a2a/par-agent", "/a2a"],
-    ["GET", "/a2a/par-agent/.well-known/agent-card.json", "/a2a/{agent}/.well-known/agent-card.json"],
   ];
 
   beforeAll(async () => {
@@ -932,8 +709,6 @@ describe("every proxy route emits every per-request metric family", () => {
     upstream = await startUpstream();
     realtime = await startRealtimeUpstream();
     asr = await startFunAsrUpstream();
-    mcp = await startMcpUpstream("alpha");
-    a2a = await startA2aUpstream({ streamAnswer: true });
     app = await spawnApp({
       clientTypeRules: [{ pattern: `^${CLIENT_TYPE}/`, client: CLIENT_TYPE }],
     });
@@ -941,8 +716,6 @@ describe("every proxy route emits every per-request metric family", () => {
 
     const openaiPk = await seed.createProviderKey({ display_name: "par-openai-pk", api_key: "sk-mock", api_base: `${upstream.baseUrl}/v1`, provider: "openai" });
     const soraPk = await seed.createProviderKey({ display_name: "par-sora-pk", api_key: "sk-mock", api_base: upstream.baseUrl, provider: "openai" });
-    const anthropicPk = await seed.createProviderKey({ display_name: "par-anthropic-pk", api_key: "sk-ant", api_base: upstream.baseUrl });
-    const typesafePk = await seed.createProviderKey({ display_name: "par-typesafe-pk", provider: "typesafe", adapter: undefined, api_key: "ts", api_base: upstream.baseUrl });
     const realtimePk = await seed.createProviderKey({ display_name: "par-realtime-pk", api_key: "sk-mock", api_base: `http://127.0.0.1:${realtime.port}/v1` });
 
     const model = (display_name: string, model_name: string, provider_key_id: string, provider = "openai") =>
@@ -951,10 +724,7 @@ describe("every proxy route emits every per-request metric family", () => {
     await model("par-completions", "gpt-3.5-turbo-instruct", openaiPk.id);
     await model("par-embeddings", "text-embedding-3-small", openaiPk.id);
     await model("par-images", "gpt-image-1", openaiPk.id);
-    await model("par-claude", "claude-x", anthropicPk.id, "anthropic");
     await model("par-rerank", "rerank-1", openaiPk.id);
-    await model("par-systemone", "jev-latest", typesafePk.id, "typesafe");
-    await model("par-decisions", "gpt-6-luna", openaiPk.id);
     await model("par-responses", "gpt-4o", openaiPk.id);
     await model("par-transcribe", "gpt-4o-transcribe", openaiPk.id);
     await model("par-tts", "tts-1", openaiPk.id);
@@ -964,8 +734,6 @@ describe("every proxy route emits every per-request metric family", () => {
     await model("par-funasr", "fun-asr-realtime", asrPk.id, "alibaba");
     await model("par-jobs", "gpt-4o", openaiPk.id);
 
-    await seed.update("mcp_servers", randomUUID(), { name: "alpha", url: mcp.url, enabled: true });
-    await seed.update("a2a_agents", randomUUID(), { name: "par-agent", url: a2a.url, protocol_version: "1.0", auth_type: "none", enabled: true });
     await seed.createPassthroughRoute({ name: "par-ptr", path_prefix: "/passthrough/parity", target_url: `${upstream.baseUrl}/v1`, provider_key_id: openaiPk.id });
 
     // Seeded last: its authenticating implies everything above landed. A
@@ -973,9 +741,7 @@ describe("every proxy route emits every per-request metric family", () => {
     await seed.createApiKey({
       key_hash: sha256(CALLER),
       allowed_models: ["*"],
-      allowed_agents: ["*"],
       allowed_routes: ["par-ptr"],
-      mcp_access: { allow: ["*"] },
       rate_limit: { rpm: 1_000_000 },
     });
     const probe = new ProxyClient(app.proxyUrl, CALLER);
@@ -987,8 +753,6 @@ describe("every proxy route emits every per-request metric family", () => {
     await upstream?.close();
     await realtime?.close();
     await asr?.close();
-    await mcp?.close();
-    await a2a?.close();
   });
 
   const scrape = () => scrapeMetrics(app!.metricsUrl);
@@ -1063,39 +827,6 @@ describe("every proxy route emits every per-request metric family", () => {
     }
     expect(failures, "route × family cells that did not move").toEqual([]);
   }, 180_000);
-
-  test("the MCP surface, its OAuth discovery documents included, is counted as mcp", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const mcpRoutes = [
-      "/mcp",
-      "/mcp/",
-      "/mcp/:server",
-      "/.well-known/oauth-protected-resource",
-      "/.well-known/oauth-protected-resource/mcp",
-      "/.well-known/oauth-protected-resource/mcp/:server",
-      "/.well-known/oauth-authorization-server/mcp/:server",
-      "/mcp/:server/.well-known/openid-configuration",
-      "/mcp/:server/.well-known/jwks.json",
-      "/mcp/:server/oauth/register",
-      "/mcp/:server/oauth/authorize",
-      "/mcp/:server/oauth/token",
-      "/mcp/:server/oauth/credential",
-      "/mcp-oauth/callback",
-      "/mcp-oauth/login/callback",
-      "/mcp-oauth/consent",
-    ];
-    const mcpRows = ROWS.filter((r) => mcpRoutes.includes(r.route));
-    expect(mcpRows.map((r) => r.route)).toEqual(expect.arrayContaining(mcpRoutes));
-    const failures: string[] = [];
-    for (const row of mcpRows) {
-      const before = await scrape();
-      await row.drive();
-      const after = await scrape();
-      const want = { endpoint: row.endpoint, inbound_protocol: "mcp" };
-      if (metricDelta(before, after, "aisix_proxy_requests_total", want) <= 0) failures.push(row.name);
-    }
-    expect(failures, "MCP rows not counted under inbound_protocol=mcp").toEqual([]);
-  }, 60_000);
 
   test("an authentication denial is counted on every extractor-authenticated route", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();

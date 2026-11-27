@@ -978,49 +978,41 @@ mod tests {
 
     // ── strict structured outputs at the OpenAI edge ──────────────────
 
-    /// The exact `response_format` an Anthropic-shaped `/v1/messages`
-    /// request used to put on the OpenAI wire, when the strict closing
-    /// still happened during the inbound translation. The closing moved
-    /// here so the Anthropic, Bedrock and Gemini edges stop inheriting
-    /// it; this pins that the OpenAI body did not move with it.
+    /// The strict closing `prepare_outbound_body` applies when the
+    /// gateway itself set `strict` on the structured output (instead of
+    /// the caller). This pins that the schema objects are closed —
+    /// `additionalProperties: false` and full `required` — at the edge
+    /// that speaks the OpenAI wire.
     #[test]
-    fn a_translated_messages_request_reaches_openai_byte_for_byte_as_before() {
+    fn a_gateway_strict_response_format_is_closed_at_this_edge() {
         use aisix_gateway::{ChatFormat, ChatMessage};
-        use aisix_provider_anthropic::wire::translate_extras_to_openai_shape;
 
-        // What the `/v1/messages` caller sent.
-        let mut extra = serde_json::json!({
-            "output_config": {
-                "format": {
-                    "type": "json_schema",
-                    "schema": {
+        // What a caller that declared `strict: true` would send, before
+        // the gateway closed the schema.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "city": {"type": "string"},
+                "days": {
+                    "type": "array",
+                    "items": {
                         "type": "object",
-                        "properties": {
-                            "city": {"type": "string"},
-                            "days": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {"high": {"type": "number"}},
-                                },
-                            },
-                        },
+                        "properties": {"high": {"type": "number"}},
                     },
-                }
-            }
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        let gateway_strict =
-            translate_extras_to_openai_shape(&mut extra, aisix_core::MappedEffort::AsWritten);
-        assert!(gateway_strict);
-
+                },
+            },
+        });
         let mut req = ChatFormat::new("m", vec![ChatMessage::user("weather?")]);
-        req.extra = extra;
+        req.extra.insert(
+            "response_format".into(),
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {"name": "structured_output", "schema": schema, "strict": true},
+            }),
+        );
         let messages = messages_from(&req, DeveloperRoleMode::Preserve);
         let typed = build_request(&req, "gpt-4o", &messages, false);
-        let body = prepare_outbound_body(&typed, gateway_strict, false, None, None).unwrap();
+        let body = prepare_outbound_body(&typed, true, false, None, None).unwrap();
 
         assert_eq!(
             body["response_format"],

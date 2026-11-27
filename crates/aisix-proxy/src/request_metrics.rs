@@ -40,8 +40,9 @@
 //!   subset of the above that is a model-inference call, per
 //!   [`LLM_ENDPOINTS`].
 //!
-//! Splitting the two tiers is the point: an MCP tool call, a batch-file
-//! upload and a 413 are all proxy requests, but counting them as LLM
+//! Splitting the two tiers is the point: a passthrough tunnel call, a
+//! batch-file upload and a 413 are all proxy requests, but counting them as
+//! LLM
 //! requests would corrupt every per-request token/cost average and the LLM
 //! success rate. What is NOT a judgement call is that both tiers must cover
 //! every endpoint — before AISIX-Cloud#1234 only chat + messages emitted the
@@ -346,7 +347,6 @@ impl<'a> LastTarget<'a> {
 /// matches, and the endpoint quietly drops out of every LLM query).
 ///
 /// Deliberately absent, and why:
-/// - `/mcp`, `/mcp/{server}`, `/a2a` — tool and agent calls, no model.
 /// - `/passthrough_route` — one endpoint for opaque relays and identified
 ///   LLM exchanges alike, so its tier is decided per request
 ///   ([`record_in_tier`]): an exchange identified as a protocol a typed
@@ -362,18 +362,12 @@ impl<'a> LastTarget<'a> {
 /// a session reports its tokens and cost, that reason is gone and it belongs
 /// with the rest.
 const LLM_ENDPOINTS: &[&str] = &[
-    crate::gemini::ENDPOINT,
-    crate::gemini::STREAM_ENDPOINT,
     "/v1/chat/completions",
     "/v1/completions",
     "/v1/embeddings",
     "/v1/images/generations",
     "/v1/images/edits",
-    "/v1/messages",
-    "/v1/messages/count_tokens",
     "/v1/rerank",
-    "/v1/systemone",
-    "/v1/decisions",
     "/v1/responses",
     "/v1/audio/transcriptions",
     "/v1/audio/translations",
@@ -1104,35 +1098,13 @@ mod tests {
     /// are what force a new endpoint's `endpoint` label and LLM-vs-proxy
     /// tier to be decided rather than defaulted.
     const ROUTES: &[&str] = &[
-        "/v1beta/models/example:generateContent",
-        "/v1beta/models/example:streamGenerateContent",
-        "/v1beta1/projects/example/locations/global/publishers/google/models/example:generateContent",
-        "/v1beta1/projects/example/locations/global/publishers/google/models/example:streamGenerateContent",
         "/v1/models",
-        "/.well-known/oauth-protected-resource",
-        "/.well-known/oauth-protected-resource/mcp",
-        "/.well-known/oauth-protected-resource/mcp/some-server",
-        "/.well-known/oauth-authorization-server/mcp/some-server",
-        "/mcp/some-server/.well-known/openid-configuration",
-        "/mcp/some-server/.well-known/jwks.json",
-        "/mcp/some-server/oauth/register",
-        "/mcp/some-server/oauth/authorize",
-        "/mcp/some-server/oauth/token",
-        "/mcp/some-server/oauth/credential",
-        "/mcp-oauth/callback",
-        "/mcp-oauth/login/callback",
-        "/mcp-oauth/consent",
-        "/a2a/some-agent/.well-known/agent-card.json",
         "/v1/chat/completions",
         "/v1/completions",
         "/v1/embeddings",
         "/v1/images/generations",
         "/v1/images/edits",
-        "/v1/messages",
-        "/v1/messages/count_tokens",
         "/v1/rerank",
-        "/v1/systemone",
-        "/v1/decisions",
         "/v1/responses",
         "/v1/audio/transcriptions",
         "/v1/audio/translations",
@@ -1150,9 +1122,6 @@ mod tests {
         "/v1/batches/batch_abc123/cancel",
         "/v1/fine_tuning/jobs",
         "/v1/fine_tuning/jobs/ft_abc123",
-        "/mcp",
-        "/mcp/some-server",
-        "/a2a/some-agent",
         "/passthrough/openai/v1/anything",
     ];
 
@@ -1197,7 +1166,6 @@ mod tests {
         for route in [
             "/v1/chat/completions",
             "/v1/responses",
-            "/v1/messages/count_tokens",
             "/v1/embeddings",
             "/v1/images/edits",
             "/v1/audio/speech",
@@ -1212,8 +1180,6 @@ mod tests {
             );
         }
         for route in [
-            "/mcp/some-server",
-            "/a2a/some-agent",
             "/v1/batches/batch_abc123",
             "/passthrough/openai/v1/anything",
             "/livez",

@@ -625,7 +625,6 @@ where
             api_key_id: auth.entry.id.as_str(),
             source_ip: &client.source_ip,
             context_origin: None,
-            gemini_target: None,
             budget: Some(&budget_gate),
             client: Some(client),
         },
@@ -1447,14 +1446,11 @@ pub(crate) struct RoutingRequest<'a> {
     /// can read that context are attempted first, ahead of the strategy's
     /// order. `None` everywhere else.
     pub context_origin: Option<&'a crate::responses_affinity::Origin>,
-    /// On Gemini requests, only targets that can serve the generation
-    /// protocol participate in balancing and consume a fallback slot.
-    pub gemini_target: Option<&'a (dyn Fn(&Model) -> bool + Sync)>,
     /// The request's budget gate. A target whose provider key's budget is
     /// exhausted is not a candidate, and a direct model on one is refused.
     /// `None` only in tests that exercise no budget.
     pub budget: Option<&'a crate::budget::BudgetGate>,
-    /// The caller, for a semantic router's classifier call to render the
+    /// The caller, for a semantic router's internal call to render the
     /// request headers a direct call renders. `None` only in tests.
     pub client: Option<&'a crate::client_ip::ClientContext>,
 }
@@ -1531,7 +1527,7 @@ fn targets_within_budget(
 /// snapshot, then apply the health/cooldown filter. For a direct
 /// (non-routing) model, the list is just the model itself.
 ///
-/// Shared by `/v1/chat/completions` and `/v1/messages` so both endpoints
+/// Shared by `/v1/chat/completions` and `/v1/responses` so both endpoints
 /// dispatch Model Groups identically (ai-gateway#471).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_attempt_models(
@@ -1545,12 +1541,6 @@ pub(crate) fn resolve_attempt_models(
     req: RoutingRequest<'_>,
 ) -> Result<Vec<AttemptModel>, ProxyError> {
     let Some(routing) = virtual_model.routing.as_ref() else {
-        if req
-            .gemini_target
-            .is_some_and(|admits| !admits(virtual_model))
-        {
-            return Err(crate::gemini::unsupported_target());
-        }
         if let Some(gate) = req.budget {
             gate.check_model(virtual_model)?;
         }
@@ -1631,17 +1621,6 @@ pub(crate) fn resolve_attempt_models(
         Some(gate) => targets_within_budget(snapshot, gate, eligible)?,
         None => eligible,
     };
-    if let Some(admits) = req.gemini_target {
-        eligible.retain(|t| {
-            snapshot
-                .models
-                .get_by_name(&t.model)
-                .is_none_or(|e| admits(&e.value))
-        });
-        if eligible.is_empty() {
-            return Err(crate::gemini::unsupported_target());
-        }
-    }
     let filtered_routing = Routing {
         targets: eligible,
         ..routing.clone()
@@ -2675,7 +2654,7 @@ mod tests {
         ));
     }
 
-    /// The classifier answering `false` is only worth something if the loop
+    /// `is_retryable` answering `false` is only worth something if the loop
     /// stops on it. This is the half that would go red if
     /// `retrying_dispatch` ever consulted something other than
     /// `is_retryable` — and the `Config` control is what shows the harness

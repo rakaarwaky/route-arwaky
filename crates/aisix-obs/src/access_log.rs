@@ -200,10 +200,6 @@ pub struct AccessLog<'a> {
     /// kernel-level connect timeout, an upstream 500, and a blocked
     /// guardrail (AISIX-Cloud#1093).
     pub error: Option<&'a str>,
-    /// What the request was, on the `/mcp` endpoints — `None` everywhere
-    /// else. MCP tunnels every operation through one `POST`, so `method` and
-    /// `path` alone describe nothing (#1181).
-    pub mcp: Option<McpAccessLog<'a>>,
     /// How the response cache answered — `None` on every line that had no
     /// cache decision to report. See [`CacheAccessLog`].
     pub cache: Option<CacheAccessLog<'a>>,
@@ -242,11 +238,8 @@ pub struct CacheAccessLog<'a> {
 /// matched route. Rendered as `semantic_fallback`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanticFallback {
-    /// Embedding decision: no route reached its threshold.
+    /// No route reached its threshold.
     NoMatch,
-    /// Classifier decision: the model picked a route with a confidence
-    /// below `min_confidence`.
-    LowConfidence,
     /// The request carried no user text to decide on.
     EmptyPrompt,
     /// The embedding or decision call failed or timed out, and the
@@ -262,7 +255,6 @@ impl SemanticFallback {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::NoMatch => "no_match",
-            Self::LowConfidence => "low_confidence",
             Self::EmptyPrompt => "empty_prompt",
             Self::DecisionFailed => "decision_failed",
             Self::TargetUnavailable => "target_unavailable",
@@ -283,36 +275,16 @@ pub struct SemanticAccessLog {
     /// `semantic_route`: the route that served the request. `None` when
     /// `default` or a failure target served it.
     pub route: Option<String>,
-    /// `semantic_score`: the deciding route's cosine similarity (embedding
-    /// routers) or the decision model's confidence in its pick (classifier
-    /// routers). Present whenever a decision was computed, including one
-    /// that fell back because the score was too low; `None` when no
-    /// decision was computed.
+    /// `semantic_score`: the deciding route's cosine similarity. Present
+    /// whenever a decision was computed, including one that fell back
+    /// because the score was too low; `None` when no decision was computed.
     pub score: Option<f64>,
     /// `semantic_fallback`: set only when no matched route served the
     /// request.
     pub fallback: Option<SemanticFallback>,
     /// `semantic_pinned`: the request went where its session is pinned
-    /// instead of being classified. Rendered only when `true`.
+    /// instead of being scored. Rendered only when `true`.
     pub pinned: bool,
-}
-
-/// The `/mcp` half of an access-log line: which JSON-RPC method the single
-/// `POST` carried, and enough of its outcome to tell the three ways a
-/// `tools/list` can come back empty apart.
-#[derive(Debug, Clone, Default)]
-pub struct McpAccessLog<'a> {
-    /// JSON-RPC `method` — `initialize`, `tools/list`, `tools/call`, …
-    /// `None` when the body is not a single JSON-RPC message.
-    pub method: Option<&'a str>,
-    /// `tools/call` only: the tool name as the caller sent it.
-    pub tool: Option<&'a str>,
-    /// `tools/list` only: tools the upstreams returned, summed, before the
-    /// caller's ACL filtered them.
-    pub tools_total: Option<u32>,
-    /// `tools/list` only: tools left after ACL filtering — what the caller
-    /// actually received.
-    pub tools_returned: Option<u32>,
 }
 
 /// What a failure says when nothing more specific reached the record: the
@@ -334,7 +306,6 @@ impl AccessLog<'_> {
         if !ENABLED.load(Ordering::Relaxed) {
             return;
         }
-        let mcp = self.mcp.as_ref();
         let error = self.error.filter(|e| !e.trim().is_empty());
         let fallback_error =
             (self.status >= 400 && error.is_none()).then(|| request_failed_message(self.status));
@@ -361,10 +332,6 @@ impl AccessLog<'_> {
             error = error.or(fallback_error.as_deref()),
             cache_status = self.cache.as_ref().map(|c| c.status),
             cache_hit_layer = self.cache.as_ref().and_then(|c| c.hit_layer),
-            mcp_method = mcp.and_then(|m| m.method),
-            mcp_tool = mcp.and_then(|m| m.tool),
-            tools_total = mcp.and_then(|m| m.tools_total),
-            tools_returned = mcp.and_then(|m| m.tools_returned),
             request_body_bytes = self.request_body_bytes,
             response_body_bytes = self.response_body_bytes,
             semantic_route = semantic.and_then(|s| s.route.as_deref()),
@@ -400,14 +367,6 @@ impl AccessLog<'_> {
             routing_fallback_count: self.routing_fallback_count,
             error_kind: owned(self.error_kind),
             error: owned(self.error),
-            mcp: self.mcp.as_ref().map(|m| {
-                (
-                    owned(m.method),
-                    owned(m.tool),
-                    m.tools_total,
-                    m.tools_returned,
-                )
-            }),
             cache: self
                 .cache
                 .as_ref()
@@ -443,8 +402,6 @@ pub struct AccessLogRecord {
     routing_fallback_count: Option<u32>,
     error_kind: Option<String>,
     error: Option<String>,
-    #[allow(clippy::type_complexity)]
-    mcp: Option<(Option<String>, Option<String>, Option<u32>, Option<u32>)>,
     cache: Option<(String, Option<String>)>,
     pub request_body_bytes: Option<u64>,
     pub response_body_bytes: Option<u64>,
@@ -530,15 +487,6 @@ impl AccessLogRecord {
             routing_fallback_count: self.routing_fallback_count,
             error_kind: borrowed(&self.error_kind),
             error: borrowed(&self.error),
-            mcp: self
-                .mcp
-                .as_ref()
-                .map(|(method, tool, total, returned)| McpAccessLog {
-                    method: method.as_deref(),
-                    tool: tool.as_deref(),
-                    tools_total: *total,
-                    tools_returned: *returned,
-                }),
             cache: self.cache.as_ref().map(|(status, layer)| CacheAccessLog {
                 status,
                 hit_layer: layer.as_deref(),
@@ -615,8 +563,7 @@ mod tests {
                 routing_fallback_count: Some(1),
                 error_kind: None,
                 error: None,
-                mcp: None,
-                cache: None,
+                    cache: None,
                 request_body_bytes: Some(123),
                 response_body_bytes: Some(4567),
             }
@@ -716,8 +663,7 @@ mod tests {
                 routing_fallback_count: None,
                 error_kind: Some("timeout"),
                 error: Some("upstream request timed out after 7167ms"),
-                mcp: None,
-                cache: None,
+                    cache: None,
                 request_body_bytes: None,
                 response_body_bytes: None,
             }
@@ -773,8 +719,7 @@ mod tests {
                 routing_fallback_count: None,
                 error_kind: None,
                 error: None,
-                mcp: None,
-                cache: None,
+                    cache: None,
                 request_body_bytes: None,
                 response_body_bytes: None,
             }
@@ -837,8 +782,7 @@ mod tests {
                 routing_fallback_count: None,
                 error_kind: None,
                 error: None,
-                mcp: None,
-                cache: Some(CacheAccessLog {
+                    cache: Some(CacheAccessLog {
                     status: "hit",
                     hit_layer: Some("semantic"),
                 }),
@@ -894,8 +838,7 @@ mod tests {
                 routing_fallback_count: None,
                 error_kind: None,
                 error: None,
-                mcp: None,
-                cache: Some(CacheAccessLog {
+                    cache: Some(CacheAccessLog {
                     status: "miss",
                     hit_layer: None,
                 }),
@@ -934,7 +877,6 @@ mod tests {
             routing_fallback_count: None,
             error_kind: None,
             error: None,
-            mcp: None,
             cache: None,
             request_body_bytes: None,
             response_body_bytes: None,
@@ -997,7 +939,6 @@ mod tests {
             routing_fallback_count: None,
             error_kind: None,
             error: None,
-            mcp: None,
             cache: None,
             request_body_bytes: None,
             response_body_bytes: None,
@@ -1015,7 +956,7 @@ mod tests {
             fell_back.semantic = Some(SemanticAccessLog {
                 route: None,
                 score: Some(0.2),
-                fallback: Some(SemanticFallback::LowConfidence),
+                fallback: Some(SemanticFallback::NoMatch),
                 pinned: false,
             });
             fell_back.emit();
@@ -1038,7 +979,7 @@ mod tests {
         assert!(!lines[1].contains("semantic_route"), "{out}");
         assert!(lines[1].contains("semantic_score=0.2"), "{out}");
         assert!(
-            lines[1].contains("semantic_fallback=\"low_confidence\""),
+            lines[1].contains("semantic_fallback=\"no_match\""),
             "{out}"
         );
         assert!(!lines[0].contains("semantic_pinned"), "{out}");

@@ -60,7 +60,7 @@ type ScoreKey = (String, &'static str, &'static str);
 /// scores.
 ///
 /// Coalescing matters for correctness, not just tidiness: the redacting
-/// hooks run once per JSON string leaf on the `/mcp` path, so a tool
+/// hooks run once per JSON string leaf on a tool-result path, so a tool
 /// result with forty scannable leaves would otherwise produce forty
 /// identical entries. Entries merge by
 /// `(guardrail_name, hook, action, error_type)`, summing per-detector
@@ -147,7 +147,7 @@ impl GuardrailAuditLog {
     }
 
     /// Record one similarity-screening summary. Repeat calls for the same
-    /// `(guardrail_name, hook, direction)` — a `/mcp` tool result scanned
+    /// `(guardrail_name, hook, direction)` — a tool result scanned
     /// leaf by leaf, a response checked once from cache and once from the
     /// upstream — keep the value CLOSEST to changing the verdict, which is
     /// the maximum on `deny` and the minimum on `allow`. Keeping the last
@@ -363,7 +363,7 @@ mod tests {
 
     #[test]
     fn repeated_deny_scores_keep_the_highest_and_its_example() {
-        // The `/mcp` path scans a tool result leaf by leaf, so one hook can
+        // The tool-result path scans a result leaf by leaf, so one hook can
         // score many times. Keeping the last would make the reported number
         // depend on scan order and routinely under-report the closest call.
         let log = GuardrailAuditLog::new();

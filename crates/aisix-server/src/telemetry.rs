@@ -2792,9 +2792,9 @@ mod tests {
         event.requested_model = "é".repeat(300);
         event.error_message = "é".repeat(5_000);
         event.service_tier = Some("x".repeat(9_000));
-        event.mcp_tool_name = format!("a{}", "é".repeat(5_000));
-        event.a2a_context_id = "y".repeat(10_000);
-        event.a2a_method = "short".to_string();
+        event.passthrough_route_name = format!("a{}", "é".repeat(5_000));
+        event.client_identity = "y".repeat(10_000);
+        event.jwt_claim_mapping = "short".to_string();
         // Nested strings: a list of structs, and a map's values (its keys
         // are left as they are).
         event.guardrail_scores = vec![aisix_core::GuardrailScore {
@@ -2808,12 +2808,12 @@ mod tests {
         assert_eq!(wire["error_message"], "é".repeat(4_096));
         assert_eq!(wire["service_tier"], "x".repeat(8_192));
         assert_eq!(
-            wire["mcp_tool_name"].as_str().unwrap().len(),
+            wire["passthrough_route_name"].as_str().unwrap().len(),
             8_191,
             "the cut backs off to a character boundary"
         );
-        assert_eq!(wire["a2a_context_id"], "y".repeat(8_192));
-        assert_eq!(wire["a2a_method"], "short");
+        assert_eq!(wire["client_identity"], "y".repeat(8_192));
+        assert_eq!(wire["jwt_claim_mapping"], "short");
         assert_eq!(
             wire["guardrail_scores"][0]["guardrail_name"],
             "g".repeat(8_192)

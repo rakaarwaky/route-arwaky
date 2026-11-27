@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use aisix_cache::{Cache, MemoryCache, MemorySemanticCache, SemanticCacheStore};
 use aisix_core::models::CacheBackend;
-use aisix_core::models::{LiveMcpServerIndex, LivePricingIndex};
+use aisix_core::models::LivePricingIndex;
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AisixSnapshot, ProxyConfig};
 use aisix_gateway::Hub;
@@ -281,16 +281,7 @@ pub struct ProxyStateInner {
     /// price goes through it — `least_cost` ranking today — so no reader
     /// can disagree with another about what a model costs.
     pub pricing: Arc<LivePricingIndex>,
-    /// Registered MCP servers by name → resource id, rebuilt only when the
-    /// `mcp_servers` table changes. Both MCP gates that a key can address by
-    /// server id read it — the tool ACL and the per-server rate limit — so
-    /// the two resolve a rename at the same instant.
-    pub mcp_servers: Arc<LiveMcpServerIndex>,
-    /// Per-user tokens of `oauth2_authorization_code` MCP servers.
-    /// [`ProxyState::with_shared_store`] picks where they are kept; until
-    /// then, this process alone.
-    pub(crate) mcp_oauth: Arc<aisix_mcp::UserOAuthManager>,
-    /// Semantic-router session pins, kept in the same store as `mcp_oauth`.
+    /// Semantic-router session pins, shared process-wide.
     pub(crate) session_pins: Arc<crate::session_affinity::SessionPins>,
     /// The `budgets` documents indexed for the per-request budget gate,
     /// rebuilt only when that table changes.
@@ -411,8 +402,8 @@ impl ProxyState {
     pub fn new(snapshot: SnapshotHandle<AisixSnapshot>, hub: Arc<Hub>, cfg: &ProxyConfig) -> Self {
         let metrics = Arc::new(Metrics::new(false));
         let semantic_cache = Arc::new(crate::semantic::SemanticVectorCache::default());
-        let shared_store: Arc<dyn aisix_mcp::SharedStore> =
-            Arc::new(aisix_mcp::MemoryStore::default());
+        let shared_store: Arc<dyn crate::shared_store::SharedStore> =
+            Arc::new(crate::shared_store::MemoryStore::default());
         let guardrail_index = LiveGuardrailIndex::new_with_sink(
             snapshot.clone(),
             None,
@@ -423,7 +414,7 @@ impl ProxyState {
         // "the next request 429s" assertion silently races the fixed-window
         // minute boundary — a test that straddles :00 lands its two requests
         // in different windows and the 429 never comes (seen flaking in the
-        // mcp per-server-limit tests under a loaded runner). Freezing the
+        // per-key-limit tests under a loaded runner). Freezing the
         // clock puts every request of a test in one window by construction.
         // Only this crate's own test build is affected; other crates calling
         // `ProxyState::new` (e.g. aisix-admin's playground) compile the
@@ -447,8 +438,6 @@ impl ProxyState {
             semantic_cache,
             guardrail_index,
             pricing: Arc::new(LivePricingIndex::new()),
-            mcp_servers: Arc::new(LiveMcpServerIndex::new()),
-            mcp_oauth: Arc::new(aisix_mcp::UserOAuthManager::new(Arc::clone(&shared_store))),
             session_pins: Arc::new(crate::session_affinity::SessionPins::new(shared_store)),
             budgets: Arc::new(crate::budget::LiveBudgetIndex::default()),
             managed: false,
@@ -484,8 +473,8 @@ impl ProxyState {
     ) -> Self {
         let metrics = Arc::new(Metrics::new(false));
         let semantic_cache = Arc::new(crate::semantic::SemanticVectorCache::default());
-        let shared_store: Arc<dyn aisix_mcp::SharedStore> =
-            Arc::new(aisix_mcp::MemoryStore::default());
+        let shared_store: Arc<dyn crate::shared_store::SharedStore> =
+            Arc::new(crate::shared_store::MemoryStore::default());
         let guardrail_index = LiveGuardrailIndex::new_with_sink(
             snapshot.clone(),
             None,
@@ -505,8 +494,6 @@ impl ProxyState {
             semantic_cache,
             guardrail_index,
             pricing: Arc::new(LivePricingIndex::new()),
-            mcp_servers: Arc::new(LiveMcpServerIndex::new()),
-            mcp_oauth: Arc::new(aisix_mcp::UserOAuthManager::new(Arc::clone(&shared_store))),
             session_pins: Arc::new(crate::session_affinity::SessionPins::new(shared_store)),
             budgets: Arc::new(crate::budget::LiveBudgetIndex::default()),
             managed: false,
@@ -544,8 +531,8 @@ impl ProxyState {
         cfg: &ProxyConfig,
     ) -> Self {
         let semantic_cache = Arc::new(crate::semantic::SemanticVectorCache::default());
-        let shared_store: Arc<dyn aisix_mcp::SharedStore> =
-            Arc::new(aisix_mcp::MemoryStore::default());
+        let shared_store: Arc<dyn crate::shared_store::SharedStore> =
+            Arc::new(crate::shared_store::MemoryStore::default());
         let guardrail_index = LiveGuardrailIndex::new_with_sink(
             snapshot.clone(),
             None,
@@ -577,8 +564,6 @@ impl ProxyState {
             semantic_cache,
             guardrail_index,
             pricing: Arc::new(LivePricingIndex::new()),
-            mcp_servers: Arc::new(LiveMcpServerIndex::new()),
-            mcp_oauth: Arc::new(aisix_mcp::UserOAuthManager::new(Arc::clone(&shared_store))),
             session_pins: Arc::new(crate::session_affinity::SessionPins::new(shared_store)),
             budgets: Arc::new(crate::budget::LiveBudgetIndex::default()),
             managed: false,
@@ -652,14 +637,11 @@ impl ProxyState {
         self
     }
 
-    /// Attach a CP-side usage telemetry sink. Default is `disabled()`;
-    /// the server bootstrap calls this in managed mode after spawning
-    /// the sender worker.
-    /// Keep per-user MCP tokens and semantic session pins in `store` rather
-    /// than in this process.
-    pub fn with_shared_store(mut self, store: Arc<dyn aisix_mcp::SharedStore>) -> Self {
+    /// Keep semantic-router session pins in `store` rather than in this
+    /// process. Used by the managed-mode bootstrap to share pins across
+    /// gateways of one environment.
+    pub fn with_shared_store(mut self, store: Arc<dyn crate::shared_store::SharedStore>) -> Self {
         let inner = Arc::make_mut(&mut self.inner);
-        inner.mcp_oauth = Arc::new(aisix_mcp::UserOAuthManager::new(Arc::clone(&store)));
         inner.session_pins = Arc::new(crate::session_affinity::SessionPins::new(store));
         self
     }

@@ -24,26 +24,8 @@ pub(crate) fn upstream_facts(
     // bridges a Responses attempt on most keys.
     declares_additional_tools: bool,
 ) -> Option<UpstreamFacts> {
-    match event.operation.as_str() {
-        "mcp" => {
-            let server = snap.mcp_servers.get_by_name(&event.mcp_server_name)?;
-            return Some(UpstreamFacts::default().with_base_url(&server.value.url));
-        }
-        "a2a" => {
-            // A remote agent has no GenAI provider the gateway can name, but
-            // the attribute is required on an `invoke_agent` span as the
-            // telemetry-flavour discriminator: the protocol is the flavour.
-            let facts = UpstreamFacts {
-                provider_name: "a2a".into(),
-                ..UpstreamFacts::default()
-            };
-            return Some(match snap.a2a_agents.get_by_name(&event.a2a_agent_name) {
-                Some(agent) => facts.with_base_url(&agent.value.url),
-                None => facts,
-            });
-        }
-        "passthrough" => return passthrough_facts(snap, event, provider_key_id),
-        _ => {}
+    if event.operation.as_str() == "passthrough" {
+        return passthrough_facts(snap, event, provider_key_id);
     }
     if let Some(row) = snap.models.get_by_id(&event.model_id) {
         let model = &row.value;
@@ -68,20 +50,10 @@ pub(crate) fn upstream_facts(
         };
         return Some(
             match pk.and_then(|p| {
-                if p.provider == "google"
-                    && event.operation == crate::operation::DECISIONS.operation
-                    && event.internal_call_purpose
-                        == Some(InternalCallPurpose::SemanticRouteDecision)
-                {
-                    return crate::gemini::native::decisions_endpoint(p)
-                        .ok()
-                        .map(String::from);
-                }
                 upstream_base(
                     model,
                     p,
                     &event.operation,
-                    &event.inbound_protocol,
                     declares_additional_tools,
                 )
             }) {
@@ -144,7 +116,6 @@ fn upstream_base(
     model: &Model,
     pk: &ProviderKey,
     operation: &str,
-    inbound_protocol: &str,
     declares_additional_tools: bool,
 ) -> Option<String> {
     use aisix_core::Adapter;
@@ -160,8 +131,6 @@ fn upstream_base(
             .map(str::to_string);
     }
     let native = match operation {
-        "chat" if inbound_protocol == "gemini" => Some(ApiSurface::Gemini)
-            .filter(|s| crate::dispatch::serves_natively_with(model, Some(pk), *s)),
         "messages" | "count_tokens" => Some(ApiSurface::Messages)
             .filter(|s| crate::dispatch::serves_natively_with(model, Some(pk), *s)),
         "responses" => Some(ApiSurface::Responses).filter(|_| {

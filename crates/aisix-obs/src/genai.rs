@@ -1083,7 +1083,7 @@ mod tests {
                 {"type": "tool_search_call", "call_id": "ts_1", "execution": "client",
                  "arguments": {"query": "docs"}},
                 {"type": "tool_search_output", "call_id": "ts_1", "execution": "client",
-                 "status": "completed", "tools": [{"type": "namespace", "name": "mcp__docs",
+                 "status": "completed", "tools": [{"type": "namespace", "name": "docs__ns",
                     "tools": [{"type": "function", "name": "read", "defer_loading": true}]}]},
             ]
         });
@@ -1100,7 +1100,7 @@ mod tests {
         let tools: Value = serde_json::from_str(c.tool_definitions.as_deref().unwrap()).unwrap();
         assert_eq!(tools[0]["name"], "tool_search");
         assert_eq!(tools[0]["type"], "tool_search");
-        assert_eq!(tools[1]["name"], "mcp__docs");
+        assert_eq!(tools[1]["name"], "docs__ns");
     }
 
     #[test]

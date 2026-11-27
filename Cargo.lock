@@ -41,26 +41,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aisix-a2a"
-version = "0.0.0"
-dependencies = [
- "aisix-core",
- "aisix-gateway",
- "async-stream",
- "async-trait",
- "axum",
- "futures",
- "http 1.4.0",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "aisix-admin"
 version = "0.0.0"
 dependencies = [
@@ -230,33 +210,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aisix-mcp"
-version = "0.0.0"
-dependencies = [
- "aisix-core",
- "aisix-gateway",
- "async-trait",
- "axum",
- "base64 0.22.1",
- "futures",
- "hex",
- "http 1.4.0",
- "percent-encoding",
- "rand 0.8.7",
- "reqwest 0.12.28",
- "reqwest 0.13.4",
- "ring",
- "rmcp",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "aisix-obs"
 version = "0.0.0"
 dependencies = [
@@ -301,84 +254,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "aisix-provider-anthropic"
-version = "0.0.0"
-dependencies = [
- "aisix-core",
- "aisix-gateway",
- "async-stream",
- "async-trait",
- "bytes",
- "futures",
- "http 1.4.0",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "wiremock",
-]
-
-[[package]]
-name = "aisix-provider-azure-openai"
-version = "0.0.0"
-dependencies = [
- "aisix-core",
- "aisix-gateway",
- "aisix-provider-anthropic",
- "aisix-provider-openai",
- "async-stream",
- "async-trait",
- "bytes",
- "futures",
- "http 1.4.0",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "wiremock",
-]
-
-[[package]]
-name = "aisix-provider-bedrock"
-version = "0.0.0"
-dependencies = [
- "aisix-core",
- "aisix-gateway",
- "aisix-provider-anthropic",
- "aisix-provider-openai",
- "async-stream",
- "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-sdk-bedrockruntime",
- "aws-sigv4",
- "aws-smithy-async",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "base64 0.22.1",
- "bytes",
- "futures",
- "http 1.4.0",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "uuid",
- "wiremock",
-]
-
-[[package]]
 name = "aisix-provider-openai"
 version = "0.0.0"
 dependencies = [
  "aisix-core",
  "aisix-gateway",
- "aisix-provider-anthropic",
  "async-stream",
  "async-trait",
  "bytes",
@@ -389,30 +269,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
- "wiremock",
-]
-
-[[package]]
-name = "aisix-provider-vertex"
-version = "0.0.0"
-dependencies = [
- "aisix-core",
- "aisix-gateway",
- "aisix-provider-anthropic",
- "aisix-provider-openai",
- "async-stream",
- "async-trait",
- "bytes",
- "futures",
- "http 1.4.0",
- "jsonwebtoken",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
  "wiremock",
 ]
 
@@ -420,15 +276,11 @@ dependencies = [
 name = "aisix-proxy"
 version = "0.0.0"
 dependencies = [
- "aisix-a2a",
  "aisix-cache",
  "aisix-core",
  "aisix-gateway",
  "aisix-guardrails",
- "aisix-mcp",
  "aisix-obs",
- "aisix-provider-anthropic",
- "aisix-provider-azure-openai",
  "aisix-provider-openai",
  "aisix-ratelimit",
  "arc-swap",
@@ -507,13 +359,8 @@ dependencies = [
  "aisix-etcd",
  "aisix-gateway",
  "aisix-guardrails",
- "aisix-mcp",
  "aisix-obs",
- "aisix-provider-anthropic",
- "aisix-provider-azure-openai",
- "aisix-provider-bedrock",
  "aisix-provider-openai",
- "aisix-provider-vertex",
  "aisix-proxy",
  "aisix-ratelimit",
  "aisix-redis",
@@ -3275,12 +3122,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
-name = "pastey"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
-
-[[package]]
 name = "pathdiff"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3980,43 +3821,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rmcp"
-version = "3.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "391f153431ab68664d946513ea0cb3edbca78eaf99c5a983036cacab6220d85b"
-dependencies = [
- "async-trait",
- "base64 0.23.1",
- "bytes",
- "chrono",
- "futures",
- "http 1.4.0",
- "http-body 1.0.1",
- "http-body-util",
- "indexmap 2.14.0",
- "libc",
- "pastey",
- "percent-encoding",
- "pin-project-lite",
- "rand 0.10.1",
- "reqwest 0.13.4",
- "schemars 1.2.1",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "sse-stream",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tower-service",
- "tracing",
- "unicode-general-category",
- "unicode-normalization",
- "uuid",
-]
-
-[[package]]
 name = "rquickjs"
 version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4232,36 +4036,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "schemars"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2b42f36aa1cd011945615b92222f6bf73c599a102a300334cd7f8dbeec726cc"
-dependencies = [
- "chrono",
- "dyn-clone",
- "ref-cast",
- "schemars_derive 1.2.1",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "schemars_derive"
 version = "0.8.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32e265784ad618884abaea0600a9adf15393368d840e0222d101a072f3f7534d"
-dependencies = [
- "proc-macro2",
- "quote",
- "serde_derive_internals",
- "syn",
-]
-
-[[package]]
-name = "schemars_derive"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d115b50f4aaeea07e79c1912f645c7513d81715d0420f8bc77a18c6260b307f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4575,19 +4353,6 @@ name = "spin"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
-
-[[package]]
-name = "sse-stream"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c123f296ade4ec4b8b0f6162116e6629f5146922ca5ab40ca9d3c2e73ab4761e"
-dependencies = [
- "bytes",
- "futures-util",
- "http-body 1.0.1",
- "http-body-util",
- "pin-project-lite",
-]
 
 [[package]]
 name = "stable_deref_trait"
@@ -5202,15 +4967,6 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
-
-[[package]]
-name = "unicode-normalization"
-version = "0.1.26"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
-dependencies = [
- "tinyvec",
-]
 
 [[package]]
 name = "unicode-xid"

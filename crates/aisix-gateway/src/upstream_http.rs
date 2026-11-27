@@ -395,7 +395,7 @@ mod tests {
     /// starts reaping connections it still considers usable.
     ///
     /// The first pass of this (AISIX-Cloud#1122) converted the provider
-    /// bridges only, leaving the guardrail, MCP, A2A, telemetry, and
+    /// bridges only, leaving the guardrail, telemetry, and
     /// exporter clients on the defaults — which is what this test exists
     /// to stop repeating (AISIX-Cloud#1126).
     #[test]
@@ -407,17 +407,7 @@ mod tests {
             // Tests build throwaway clients on purpose; only the
             // production half of each file is in scope.
             let production = production_half(&src);
-            // `shared_http_client()` in aisix-mcp is the sanctioned
-            // counterpart of `client_builder()` for rmcp's own reqwest
-            // line (rmcp pins 0.13; it gets the same
-            // `upstream_http::config()` values applied). The exemption is
-            // scoped to that one file so a bare rmcp client anywhere else
-            // still gets flagged.
-            let sanctioned_rmcp_site = file.ends_with("aisix-mcp/src/bridge.rs");
             for (n, line) in production.lines().enumerate() {
-                if sanctioned_rmcp_site && line.contains("rmcp_reqwest::Client::") {
-                    continue;
-                }
                 if line.contains("reqwest::Client::builder()")
                     || line.contains("reqwest::Client::new()")
                 {

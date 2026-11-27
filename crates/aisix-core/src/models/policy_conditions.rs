@@ -26,7 +26,7 @@
 //!   model-property leaves evaluates `true` on model-less requests
 //!   (children all false → `!OR`/`!AND` flips it), exactly like
 //!   lua-resty-expr — "everything except gpt-4" written as `!(...)`
-//!   deliberately includes MCP/A2A traffic;
+//!   deliberately includes every traffic class;
 //! - groups short-circuit (AND on the first false child, OR on the
 //!   first true child);
 //! - the model dimensions (`model` / `model_name`) evaluate against a

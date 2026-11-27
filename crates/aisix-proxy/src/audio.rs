@@ -17,6 +17,11 @@
 //! Auth and model authorisation follow the same rules as every other
 //! proxy endpoint.
 
+// 1 MiB upper bound on an in-flight SSE frame buffer. Kept
+// from the Anthropic messages handler (#436); shared with the
+// `/v1/responses` streaming usage parser (#808).
+pub(crate) const MAX_SSE_FRAME_BUF_BYTES: usize = 1 << 20; // 1 MiB
+
 use aisix_core::AppliedGuardrail;
 use aisix_gateway::{ChatMessage, ChatResponse, FinishReason, UsageStats};
 use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
@@ -1037,7 +1042,7 @@ where
         // telemetry for that pathological case) rather than OOM. Same
         // bound and same trade as the `/v1/responses` passthrough.
         let mut decoder = Some(aisix_gateway::SseDecoder::with_max_frame_bytes(
-            crate::messages::MAX_SSE_FRAME_BUF_BYTES,
+            MAX_SSE_FRAME_BUF_BYTES,
         ));
         futures::pin_mut!(upstream);
         while let Some(item) = upstream.next().await {
@@ -1278,7 +1283,6 @@ async fn multipart_dispatch(
     let guardrail_ctx = aisix_guardrails::RequestContext {
         passthrough_route_id: "",
         model_id: &model_entry.id,
-        mcp_server_id: "",
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
@@ -1923,7 +1927,7 @@ async fn multipart_dispatch(
         // so the bytes `from_utf8_lossy` replaced reach the caller having
         // been read by nothing. Refuse when a member of the chain both
         // reads the response AND fails closed on it — the predicate and
-        // tag `/mcp`'s tool-result arm uses, and the response-side mirror
+        // tag the tool-result arm uses, and the response-side mirror
         // of the one `/v1/messages` and `/v1/messages/count_tokens` apply
         // to a request body they cannot parse. Otherwise the transcript is
         // released unscreened in part, which is a bypass and is recorded
@@ -2178,7 +2182,6 @@ async fn speech_dispatch(
     let guardrail_ctx = aisix_guardrails::RequestContext {
         passthrough_route_id: "",
         model_id: &model_entry.id,
-        mcp_server_id: "",
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
@@ -2973,7 +2976,6 @@ fn emit_access_log(
         routing_fallback_count: summary.fallback_count,
         error_kind,
         error: error.as_deref(),
-        mcp: None,
         cache: None,
         request_body_bytes: None,
         response_body_bytes: None,
@@ -4722,7 +4724,7 @@ mod tests {
     /// A transcript the gateway cannot decode is scanned as a lossy copy,
     /// so the bytes `from_utf8_lossy` replaced would reach the caller read
     /// by nothing. With a guardrail on the response side that fails closed,
-    /// that is a refusal, under `/mcp`'s predicate and the same
+    /// that is a refusal, under the tool-result predicate and the same
     /// `unscannable_body` tag.
     #[tokio::test]
     async fn undecodable_transcript_is_refused_under_a_fail_closed_output_row() {

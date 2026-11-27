@@ -10,12 +10,11 @@
 //! coming back empty reads as "the gateway logged no guardrail activity",
 //! which is how AISIX-Cloud#1428 was reported.
 //!
-//! The flag was set on `/v1/chat/completions` and `/mcp` and nowhere else.
+//! The flag was set on `/v1/chat/completions` and nowhere else.
 //! Every other handler builds its failure event through a different
 //! emitter — `usage_attr::build_error_usage_event` for the single-attempt
-//! family, `responses::emit_zero_token_event` and
-//! `messages::emit_anthropic_usage_event` for the two retrying ones — and
-//! each left the field at its `false` default. So this file drives the
+//! family, `responses::emit_zero_token_event` for the retrying one — and
+//! it left the field at its `false` default. So this file drives the
 //! surfaces themselves rather than any one emitter: an emitter test would
 //! have passed for chat while nine siblings were wrong.
 //!
@@ -52,7 +51,6 @@ const CALLER: &str = "sk-caller";
 /// SHA-256 of `CALLER`.
 const CALLER_HASH: &str = "8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891";
 const PK_ID: &str = "11111111-1111-1111-1111-111111111111";
-const ANTHROPIC_PK_ID: &str = "22222222-2222-2222-2222-222222222222";
 
 /// A port nothing listens on, so a request that gets past the guardrail
 /// gate fails at the network instead of hanging. That failure is the point
@@ -81,7 +79,6 @@ fn snapshot() -> AisixSnapshot {
         "key_hash": CALLER_HASH,
         "allowed_models": ["*"],
         "allowed_routes": ["*"],
-        "allowed_agents": ["*"],
     }))
     .expect("valid api key");
     snap.apikeys.insert(ResourceEntry::new("ak-1", key, 1));
@@ -93,13 +90,6 @@ fn snapshot() -> AisixSnapshot {
             "openai",
             "openai",
             format!("{DEAD_UPSTREAM}/v1"),
-        ),
-        (
-            ANTHROPIC_PK_ID,
-            "anthropic-up",
-            "anthropic",
-            "anthropic",
-            DEAD_UPSTREAM.to_string(),
         ),
     ] {
         let pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
@@ -120,14 +110,6 @@ fn snapshot() -> AisixSnapshot {
             "openai",
             "gpt-4o",
             PK_ID,
-            None,
-        ),
-        (
-            "m-anthropic",
-            "claude-under-test",
-            "anthropic",
-            "claude-3-haiku-20240307",
-            ANTHROPIC_PK_ID,
             None,
         ),
         (
@@ -174,15 +156,6 @@ fn snapshot() -> AisixSnapshot {
     snap.models
         .insert(ResourceEntry::new("g-ensemble", ensemble, 1));
 
-    let agent: aisix_core::A2aAgent = serde_json::from_value(serde_json::json!({
-        "name": "agent-under-test",
-        "url": format!("{DEAD_UPSTREAM}/a2a"),
-        "enabled": true,
-    }))
-    .expect("valid a2a agent");
-    snap.a2a_agents
-        .insert(ResourceEntry::new("agent-1", agent, 1));
-
     let route: aisix_core::PassthroughRoute = serde_json::from_value(serde_json::json!({
         "name": "byo-tunnel",
         "path_prefix": "/passthrough/byo",
@@ -218,10 +191,6 @@ fn router() -> (axum::Router, tokio::sync::mpsc::Receiver<UsageEvent>) {
         "openai",
         Arc::new(aisix_provider_openai::OpenAiBridge::new()),
     );
-    hub.register_specialized(
-        "anthropic",
-        Arc::new(aisix_provider_anthropic::AnthropicBridge::new()),
-    );
     let (tx, rx) = tokio::sync::mpsc::channel(32);
     let state = crate::ProxyState::new(SnapshotHandle::new(snapshot()), hub, &cfg())
         .without_cache()
@@ -232,18 +201,12 @@ fn router() -> (axum::Router, tokio::sync::mpsc::Receiver<UsageEvent>) {
 /// `(id, display_name, target)` of the routing groups [`snapshot`] seeds.
 const GROUPS: &[(&str, &str, &str)] = &[
     ("g-openai", "gpt-group-under-test", "gpt-under-test"),
-    (
-        "g-anthropic",
-        "claude-group-under-test",
-        "claude-under-test",
-    ),
     ("g-embedding", "embed-group-under-test", "embed-under-test"),
 ];
 
 /// The direct model a surface's fixture addresses, as `(id, display_name)`.
 fn direct_model(surface: &str) -> (&'static str, &'static str) {
     match surface {
-        "/v1/messages" => ("m-anthropic", "claude-under-test"),
         "/v1/embeddings" => ("m-embedding", "embed-under-test"),
         _ => ("m-openai", "gpt-under-test"),
     }
@@ -256,7 +219,7 @@ fn fixture(surface: &str, text: &str) -> Request<Body> {
 }
 
 /// [`fixture`], addressing `model` instead of the surface's direct model.
-/// Ignored by the surfaces that carry no model (`/a2a`, `/passthrough/byo`).
+/// Ignored by `/passthrough/byo`, which carries no model.
 fn fixture_for(surface: &str, model: &str, text: &str) -> Request<Body> {
     let json = |uri: &str, body: serde_json::Value| {
         Request::builder()
@@ -283,21 +246,6 @@ fn fixture_for(surface: &str, model: &str, text: &str) -> Request<Body> {
             surface,
             serde_json::json!({ "model": model, "input": text }),
         ),
-        "/v1/messages" => Request::builder()
-            .method("POST")
-            .uri(surface)
-            .header("x-api-key", CALLER)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::json!({
-                    "model": model,
-                    "max_tokens": 16,
-                    "messages": [{ "role": "user", "content": text }],
-                })
-                .to_string(),
-            ))
-            .unwrap(),
         "/v1/embeddings" => json(
             surface,
             serde_json::json!({ "model": model, "input": text }),
@@ -322,30 +270,6 @@ fn fixture_for(surface: &str, model: &str, text: &str) -> Request<Body> {
             surface,
             serde_json::json!({ "model": model, "prompt": text }),
         ),
-        // JSON-RPC rather than an OpenAI envelope: the screened text is
-        // `params.message`, the only caller-authored content A2A carries.
-        "/a2a" => Request::builder()
-            .method("POST")
-            .uri("/a2a/agent-under-test")
-            .header("authorization", format!("Bearer {CALLER}"))
-            .header("content-type", "application/json")
-            .header("accept", "application/json, text/event-stream")
-            .body(Body::from(
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "message/send",
-                    "params": {
-                        "message": {
-                            "role": "user",
-                            "parts": [{ "kind": "text", "text": text }],
-                            "messageId": "m-1",
-                        },
-                    },
-                })
-                .to_string(),
-            ))
-            .unwrap(),
         // The passthrough tunnel forwards the body verbatim, so its
         // screened text is whatever the detected envelope carries.
         "/passthrough/byo" => json(
@@ -375,14 +299,12 @@ const SURFACES: &[&str] = &[
     "/v1/chat/completions",
     "/v1/completions",
     "/v1/responses",
-    "/v1/messages",
     "/v1/embeddings",
     "/v1/rerank",
     "/v1/images/generations",
     "/v1/audio/speech",
     "/v1/videos",
     "/passthrough/byo",
-    "/a2a",
 ];
 
 /// Drive one fixture and collect every usage event it emitted.
@@ -447,18 +369,13 @@ async fn a_guardrail_refusal_is_marked_on_every_surface() {
             ));
             continue;
         }
-        // A refusal costs the caller nothing: no upstream ran. `/a2a` is
-        // exempt because its counters are the gateway's own reading of the
-        // words, flagged `usage_estimated` and never charged — they are
-        // filled from the request before the chain even runs.
-        if *surface != "/a2a" {
-            for event in &events {
-                if event.prompt_tokens != 0 || event.completion_tokens != 0 {
-                    wrong.push(format!(
-                        "{surface}: refused request billed {}+{} tokens",
-                        event.prompt_tokens, event.completion_tokens
-                    ));
-                }
+        // A refusal costs the caller nothing: no upstream ran.
+        for event in &events {
+            if event.prompt_tokens != 0 || event.completion_tokens != 0 {
+                wrong.push(format!(
+                    "{surface}: refused request billed {}+{} tokens",
+                    event.prompt_tokens, event.completion_tokens
+                ));
             }
         }
     }
@@ -511,7 +428,7 @@ fn model_surfaces() -> impl Iterator<Item = &'static str> {
     SURFACES
         .iter()
         .copied()
-        .filter(|s| !matches!(*s, "/a2a" | "/passthrough/byo"))
+        .filter(|s| *s != "/passthrough/byo")
 }
 
 /// `model_id` names only a model that dispatches to an upstream. A refusal

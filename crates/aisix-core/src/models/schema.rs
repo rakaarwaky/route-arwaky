@@ -60,13 +60,9 @@ pub struct Schemas {
     pub cache_policy: Validator,
     pub observability_exporter: Validator,
     pub rate_limit_policy: Validator,
-    pub mcp_server: Validator,
-    pub mcp_policy: Validator,
-    pub a2a_agent: Validator,
     pub oidc_provider: Validator,
     pub claim_mapping: Validator,
     pub passthrough_route: Validator,
-    pub mcp_auth_settings: Validator,
     pub pricing: Validator,
     pub team: Validator,
     pub user: Validator,
@@ -86,7 +82,7 @@ pub static LENIENT_SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::
 /// [`resource_root_schema`] takes. The published schema files and the
 /// validator sets are built from this list, so a new resource cannot reach
 /// one without reaching the other.
-pub const RESOURCES: [&str; 21] = [
+pub const RESOURCES: [&str; 17] = [
     "model",
     "api_key",
     "provider_key",
@@ -95,13 +91,9 @@ pub const RESOURCES: [&str; 21] = [
     "cache_policy",
     "observability_exporter",
     "rate_limit_policy",
-    "mcp_server",
-    "mcp_policy",
-    "a2a_agent",
     "oidc_provider",
     "claim_mapping",
     "passthrough_route",
-    "mcp_auth_settings",
     "pricing",
     "team",
     "user",
@@ -138,13 +130,9 @@ pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
         "cache_policy" => cache_policy_root_schema(),
         "observability_exporter" => observability_exporter_root_schema(strict),
         "rate_limit_policy" => rate_limit_policy_root_schema(),
-        "mcp_server" => mcp_server_root_schema(strict),
-        "mcp_policy" => mcp_policy_root_schema(strict),
-        "a2a_agent" => a2a_agent_root_schema(),
         "oidc_provider" => oidc_provider_root_schema(strict),
         "claim_mapping" => claim_mapping_root_schema(),
         "passthrough_route" => passthrough_route_root_schema(),
-        "mcp_auth_settings" => mcp_auth_settings_root_schema(),
         "pricing" => pricing_root_schema(),
         "team" => team_root_schema(strict),
         "user" => user_root_schema(strict),
@@ -179,13 +167,9 @@ impl Schemas {
             cache_policy: build("cache_policy"),
             observability_exporter: build("observability_exporter"),
             rate_limit_policy: build("rate_limit_policy"),
-            mcp_server: build("mcp_server"),
-            mcp_policy: build("mcp_policy"),
-            a2a_agent: build("a2a_agent"),
             oidc_provider: build("oidc_provider"),
             claim_mapping: build("claim_mapping"),
             passthrough_route: build("passthrough_route"),
-            mcp_auth_settings: build("mcp_auth_settings"),
             pricing: build("pricing"),
             team: build("team"),
             user: build("user"),
@@ -722,18 +706,6 @@ pub fn validate_guardrail_attachment(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.guardrail_attachment, value)
 }
 
-pub fn validate_mcp_server(value: &Value) -> Result<(), SchemaError> {
-    validate(&SCHEMAS.mcp_server, value)
-}
-
-pub fn validate_a2a_agent(value: &Value) -> Result<(), SchemaError> {
-    validate(&SCHEMAS.a2a_agent, value)
-}
-
-pub fn validate_mcp_policy(value: &Value) -> Result<(), SchemaError> {
-    validate(&SCHEMAS.mcp_policy, value)
-}
-
 pub fn validate_oidc_provider(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.oidc_provider, value)
 }
@@ -829,18 +801,6 @@ pub fn validate_guardrail_attachment_lenient(value: &Value) -> Result<(), Schema
     validate(&LENIENT_SCHEMAS.guardrail_attachment, value)
 }
 
-pub fn validate_mcp_server_lenient(value: &Value) -> Result<(), SchemaError> {
-    validate(&LENIENT_SCHEMAS.mcp_server, value)
-}
-
-pub fn validate_a2a_agent_lenient(value: &Value) -> Result<(), SchemaError> {
-    validate(&LENIENT_SCHEMAS.a2a_agent, value)
-}
-
-pub fn validate_mcp_policy_lenient(value: &Value) -> Result<(), SchemaError> {
-    validate(&LENIENT_SCHEMAS.mcp_policy, value)
-}
-
 pub fn validate_oidc_provider_lenient(value: &Value) -> Result<(), SchemaError> {
     validate(&LENIENT_SCHEMAS.oidc_provider, value)
 }
@@ -851,14 +811,6 @@ pub fn validate_claim_mapping_lenient(value: &Value) -> Result<(), SchemaError> 
 
 pub fn validate_passthrough_route_lenient(value: &Value) -> Result<(), SchemaError> {
     validate(&LENIENT_SCHEMAS.passthrough_route, value)
-}
-
-pub fn validate_mcp_auth_settings(value: &Value) -> Result<(), SchemaError> {
-    validate(&SCHEMAS.mcp_auth_settings, value)
-}
-
-pub fn validate_mcp_auth_settings_lenient(value: &Value) -> Result<(), SchemaError> {
-    validate(&LENIENT_SCHEMAS.mcp_auth_settings, value)
 }
 
 /// Build a resource's canonical JSON Schema from its struct via `schemars`,
@@ -1095,38 +1047,19 @@ pub fn apply_model_ref_alternatives(schema: &mut Value) {
     {
         split_semantic_modes(node);
     }
-    // Not a name-or-id pair of one model, but the same shape of rule: the
-    // inline Provider Key is required only when no direct model is named.
-    if let Some(node) = schema
-        .pointer_mut("/definitions/SemanticClassifier")
-        .and_then(Value::as_object_mut)
-    {
-        require_name_or_id(node, "provider_key_id", "model_id");
-    }
 }
 
-/// State what each of a semantic router's two decision modes requires and
-/// refuses. `schemars` renders the struct both modes share, so every
-/// mode-specific field comes out optional; this puts the requirements back
-/// behind an `if classifier` / `else`.
-///
-/// Embedding mode (no `classifier`) keeps exactly the contract it always
-/// had: an embedding model under either spelling, `match`, and `examples`
-/// on every route. The name-or-id clause for the embedding model, which
+/// State what a semantic router requires and refuses. `schemars` renders
+/// the embedding model as optional (it is required only under one of two
+/// spellings), so the requirement is put back here: an embedding model
+/// under either spelling, `match`, and `examples` on every route. The
+/// name-or-id clause for the embedding model, which
 /// [`apply_model_ref_alternatives`] has just added unconditionally, is
-/// moved into that branch.
+/// moved into that clause.
 ///
-/// Classifier mode refuses every embedding-only knob rather than ignoring
-/// it — a knob that is accepted and never read looks configured — and
-/// requires the `description` the decision model reads. No route name is
-/// reserved: the decision model chooses among exactly the configured
-/// routes, and a catch-all is a route the operator configures. An explicit
-/// `null` `embedding_model_id` means "no id", as it does everywhere else,
-/// so it is not refused.
-///
-/// Applied to both validator sets alike: a classifier row carrying an
-/// embedding knob is not a row an older build wrote, so there is nothing
-/// to keep loading.
+/// Applied to both validator sets alike. An explicit `null`
+/// `embedding_model_id` means "no id", as it does everywhere else, so it
+/// is not refused.
 fn split_semantic_modes(node: &mut serde_json::Map<String, Value>) {
     let embedder_clause = json!({
         "anyOf": [
@@ -1141,40 +1074,11 @@ fn split_semantic_modes(node: &mut serde_json::Map<String, Value>) {
         }
     }
     let modes = json!({
-        "if": {"required": ["classifier"], "properties": {"classifier": {"type": "object"}}},
-        "then": {
-            "not": {"anyOf": [
-                {"required": ["embedding_model"]},
-                {"required": ["embedding_model_id"], "properties": {"embedding_model_id": {"type": "string"}}},
-                {"required": ["embedding_timeout_ms"]},
-                {"required": ["on_embedding_failure"]},
-                {"required": ["match"]}
-            ]},
-            "properties": {"routes": {"items": {
-                "required": ["description"],
-                "not": {"anyOf": [
-                    {"required": ["examples"]},
-                    {"required": ["threshold"]}
-                ]}
-            }}},
-            "if": {"properties": {"classifier": {"properties": {
-                "type": {"const": super::ClassifierType::GeminiDecision}
-            }}}},
-            "then": {"properties": {
-                "classifier": {
-                    "required": ["model_id"],
-                    "properties": {"model_id": {"type": "string"}}
-                },
-                "routes": {"minItems": 2, "maxItems": 254}
-            }}
-        },
-        "else": {
-            "allOf": [embedder_clause],
-            "required": ["match"],
-            "properties": {
-                "match": {"type": "object"},
-                "routes": {"items": {"required": ["examples"]}}
-            }
+        "allOf": [embedder_clause],
+        "required": ["match"],
+        "properties": {
+            "match": {"type": "object"},
+            "routes": {"items": {"required": ["examples"]}}
         }
     });
     match node.get_mut("allOf").and_then(Value::as_array_mut) {
@@ -1194,91 +1098,8 @@ pub fn apikey_root_schema(strict: bool) -> Value {
     let mut schema = struct_root_schema::<crate::models::ApiKey>(true);
     if strict {
         super::tags::constrain_tags_property(&mut schema);
-        require_mcp_tool_ref(&mut schema);
-        let access = schema
-            .pointer_mut("/definitions/McpAccess")
-            .expect("api_key schema defines McpAccess");
-        require_property(access, "allow");
-        insert_all_of(access, vec![require_name_form_beside_ids("deny", "array")]);
-        insert_all_of(
-            &mut schema,
-            vec![require_name_form_beside_ids("mcp_rate_limits", "object")],
-        );
     }
     schema
-}
-
-/// The write-path shape of one [`McpToolRef`](crate::models::McpToolRef)
-/// entry: both halves present and non-empty.
-///
-/// It lives here rather than on the type because the runtime loader must
-/// keep DESERIALIZING a malformed entry — a row it cannot deserialize is
-/// skipped whole, and for an `api_key` that means the key stops
-/// authenticating every kind of traffic rather than merely losing MCP
-/// access. The write path still refuses to guess.
-fn require_mcp_tool_ref(schema: &mut Value) {
-    let Some(def) = schema.pointer_mut("/definitions/McpToolRef") else {
-        return;
-    };
-    for field in ["server_id", "tool"] {
-        require_property(def, field);
-        if let Some(property) = def.pointer_mut(&format!("/properties/{field}")) {
-            let property = property
-                .as_object_mut()
-                .expect("McpToolRef property is a JSON object");
-            property.insert("minLength".to_string(), json!(1));
-            // The `#[serde(default)]` the loader needs renders as
-            // `default: ""`, which beside `minLength: 1` is a value this
-            // very schema refuses — a form generator that honours defaults
-            // would pre-fill a field and then fail to save it. The lenient
-            // set keeps the annotation, where it is the truth about what
-            // the loader does with an omitted half.
-            property.remove("default");
-        }
-    }
-}
-
-/// A subschema requiring `<name_field>` whenever the id spelling that
-/// shadows it, `<name_field>_ids` (or `<name_field>_by_id` for a map), is
-/// written as a real value.
-///
-/// The id spelling is invisible to a gateway one release behind the
-/// control plane, and the name spelling is the only thing such a gateway
-/// can read. Left optional, a control plane could write a deny — or a
-/// per-server limit — that simply does not exist on that gateway for the
-/// length of the upgrade window: a restriction failing OPEN, silently.
-/// Requiring the pair keeps the older reading conservative and unchanged,
-/// the same reason `allow` is required outright.
-///
-/// The `type` guard matters: `required` alone would also fire on an
-/// explicit `null`, which means the same as omitting the field.
-fn require_name_form_beside_ids(name_field: &str, id_type: &str) -> Value {
-    let id_field = match id_type {
-        "object" => format!("{name_field}_by_id"),
-        _ => format!("{name_field}_ids"),
-    };
-    json!({
-        "if": {
-            "required": [id_field],
-            "properties": { id_field: { "type": id_type } }
-        },
-        "then": { "required": [name_field] }
-    })
-}
-
-/// Append `subschemas` to a schema node's `allOf`, creating it when absent.
-/// Never overwrites: a producer may inject more than one overlay, and
-/// `close_unknown_fields` deliberately does not descend into them.
-fn insert_all_of(schema: &mut Value, subschemas: Vec<Value>) {
-    let obj = schema
-        .as_object_mut()
-        .expect("schema fragment is a JSON object");
-    match obj.get_mut("allOf").and_then(Value::as_array_mut) {
-        Some(list) => list.extend(subschemas),
-        None => {
-            obj.insert("allOf".to_string(), Value::Array(subschemas));
-        }
-    }
 }
 
 /// Add `name` to a schema object's `required` list, creating the list
@@ -1392,120 +1213,6 @@ pub fn provider_key_root_schema() -> Value {
         .and_then(Value::as_object_mut)
         .expect("resolve_addresses declares its item schema")
         .insert("pattern".to_string(), json!("^[0-9A-Fa-f:.]+$"));
-    schema
-}
-
-/// Canonical JSON Schema for the `mcp_server` resource, derived from the
-/// [`McpServer`](crate::models::McpServer) struct. Uses the nullable `Option`
-/// representation (`true`) so the optional fields (`secret`, `client_id`,
-/// `token_url`, `scopes`, `timeout_ms`) accept an explicit `null` as well as
-/// being absent, matching the resource's wire contract. The `transport` /
-/// `auth_type` closed sets come from the
-/// [`McpTransport`](crate::models::McpTransport) /
-/// [`McpAuthType`](crate::models::McpAuthType) enums. The per-`auth_type`
-/// credential coupling, and the openapi-only `spec`/`api_key_header` fields, are
-/// injected here as an `allOf` of `if`/`then` subschemas (see
-/// [`super::mcp_server::mcp_server_credential_coupling`]) so every configuration
-/// path enforces them.
-///
-/// `strict` additionally forbids a `*` in the label
-/// ([`NAME_PATTERN_STRICT`](super::mcp_server::NAME_PATTERN_STRICT), whose
-/// doc has the mechanism): the name is pasted into the
-/// `<server>__<tool>` glob patterns every name-form MCP grant, deny and
-/// anonymous ceiling is written as, and a `*` in it makes them either
-/// wider than written (`gh*__read` also covers `ghost__read`) or empty
-/// (`gh*__*` carries two `*`, which matches nothing). The read schema is
-/// deliberately left alone: a stored row that already carries a `*` must
-/// keep loading on every gateway, since a read-path tightening drops the
-/// row instead of the character.
-pub fn mcp_server_root_schema(strict: bool) -> Value {
-    let mut schema = struct_root_schema::<crate::models::McpServer>(true);
-    schema
-        .as_object_mut()
-        .expect("mcp server root schema is a JSON object")
-        .insert(
-            "allOf".to_string(),
-            super::mcp_server::mcp_server_credential_coupling(),
-        );
-    if strict {
-        let name = schema
-            .pointer_mut("/properties/name")
-            .and_then(Value::as_object_mut)
-            .expect("mcp server schema declares `name`");
-        name.insert(
-            "pattern".to_string(),
-            json!(super::mcp_server::NAME_PATTERN_STRICT),
-        );
-    }
-    if let Some(Value::Object(defs)) = schema.get_mut("definitions") {
-        title_single_value_enum_variants(
-            defs,
-            "McpAuthType",
-            &[
-                ("none", "No authentication"),
-                ("bearer", "Bearer token"),
-                ("api_key", "API key"),
-                ("oauth2", "OAuth 2.0 client credentials"),
-                ("oauth_delegate", "Delegated OAuth (caller's own token)"),
-                (
-                    "oauth2_token_exchange",
-                    "OAuth 2.0 token exchange on behalf of the caller",
-                ),
-                (
-                    "oauth2_authorization_code",
-                    "OAuth 2.0 authorization code flow, per user",
-                ),
-            ],
-        );
-        title_single_value_enum_variants(
-            defs,
-            "McpTokenExchangeProfile",
-            &[("entra_obo", "Microsoft Entra ID On-Behalf-Of")],
-        );
-        title_single_value_enum_variants(
-            defs,
-            "McpTransport",
-            &[("streamable_http", "Streamable HTTP")],
-        );
-        title_single_value_enum_variants(
-            defs,
-            "McpServerType",
-            &[
-                ("mcp", "Upstream MCP server"),
-                ("openapi", "REST API described by an OpenAPI document"),
-            ],
-        );
-    }
-    schema
-}
-
-/// Canonical JSON Schema for the `a2a_agent` resource, derived from the
-/// [`A2aAgent`](crate::models::A2aAgent) struct.
-pub fn a2a_agent_root_schema() -> Value {
-    let mut schema = struct_root_schema::<crate::models::A2aAgent>(true);
-    schema
-        .as_object_mut()
-        .expect("a2a agent root schema is a JSON object")
-        .insert(
-            "allOf".to_string(),
-            super::a2a_agent::a2a_agent_credential_coupling(),
-        );
-    if let Some(Value::Object(defs)) = schema.get_mut("definitions") {
-        title_single_value_enum_variants(
-            defs,
-            "A2aAuthType",
-            &[
-                ("none", "No authentication"),
-                ("bearer", "Bearer token"),
-                ("api_key", "API key"),
-            ],
-        );
-        title_single_value_enum_variants(
-            defs,
-            "A2aProtocolVersion",
-            &[("1.0", "A2A 1.0"), ("0.3", "A2A 0.3")],
-        );
-    }
     schema
 }
 
@@ -1642,70 +1349,6 @@ pub fn passthrough_route_root_schema() -> Value {
     schema
 }
 
-/// Canonical JSON Schema for the `mcp_auth_settings` resource, derived
-/// from the [`McpAuthSettings`](crate::models::McpAuthSettings) struct.
-/// Both settings it carries (`resource_url` for OAuth discovery,
-/// `anonymous` for credential-less access) are optional, and each is
-/// self-contained — no cross-field coupling to inject.
-/// The singleton-per-environment invariant is enforced by the writers
-/// (cp-api keys the row by the environment id; the resources file
-/// rejects duplicates at load) and, at read time, by the resolvers
-/// failing closed — not by the document schema.
-///
-/// The resource renders its `Option` fields non-nullable, but
-/// `anonymous.server_ids` accepts an explicit `null` on BOTH paths: the
-/// control plane clears the id spelling by writing one, and the read
-/// schema refusing it would drop the whole row — taking the OAuth
-/// discovery surface down along with anonymous access.
-///
-/// `servers` stays required beside it on both paths, which is stricter
-/// than the "write the name form beside the id form" guard the other MCP
-/// id spellings carry: a gateway one release behind the control plane
-/// reads the name form only, and an anonymous ceiling it cannot read at
-/// all is one it does not apply.
-pub fn mcp_auth_settings_root_schema() -> Value {
-    let mut schema = struct_root_schema::<crate::models::McpAuthSettings>(false);
-    // `expect`, not a silent `if let`: a pointer that quietly stops
-    // matching would drop `null` out of the READ schema, and the loader
-    // skips a row it cannot validate — taking the OAuth discovery
-    // surface down with anonymous access, which is the outcome this
-    // patch exists to prevent.
-    schema
-        .pointer_mut("/definitions/McpAnonymousAccess/properties/server_ids")
-        .and_then(Value::as_object_mut)
-        .expect("mcp_auth_settings schema declares `anonymous.server_ids`")
-        .insert("type".to_string(), json!(["array", "null"]));
-    schema
-}
-
-/// Canonical JSON Schema for the `mcp_policy` resource, derived from the
-/// [`McpPolicy`](crate::models::McpPolicy) struct. Uses the nullable `Option`
-/// representation (`true`) so `scope_ref` accepts an explicit `null` as
-/// well as being absent. The closed `scope` set comes from the
-/// [`McpPolicyScope`](crate::models::McpPolicyScope) enum, plus the one
-/// cross-field invariant `schemars` cannot express: a `team`-scoped policy
-/// must name its team in `scope_ref` (otherwise the row could shadow the
-/// environment layer).
-pub fn mcp_policy_root_schema(strict: bool) -> Value {
-    let mut schema = struct_root_schema::<crate::models::McpPolicy>(true);
-    let mut overlays = vec![json!({
-        "if": {
-            "properties": { "scope": { "const": "team" } }
-        },
-        "then": {
-            "required": ["scope_ref"],
-            "properties": { "scope_ref": { "type": "string", "minLength": 1 } }
-        }
-    })];
-    if strict {
-        require_property(&mut schema, "allow");
-        require_mcp_tool_ref(&mut schema);
-        overlays.push(require_name_form_beside_ids("deny", "array"));
-    }
-    insert_all_of(&mut schema, overlays);
-    schema
-}
-
 /// Canonical JSON Schema for the `guardrail` resource, derived from the
 /// [`Guardrail`](crate::models::Guardrail) struct. `schemars` renders the
 /// internally-tagged `GuardrailKind` as a native top-level `oneOf`. Five
@@ -1724,9 +1367,9 @@ pub fn mcp_policy_root_schema(strict: bool) -> Value {
 ///    `hook_point`, … from the flattened parent. Allowed = root fields ∪
 ///    `kind` ∪ that kind's fields: exactly what serde enforced, now on the
 ///    write path only ([`open_unknown_fields`] strips it for the loader).
-/// 2. The tagged sub-enums (`KeywordPattern`/`BedrockAWSCredentials`/
-///    `BedrockLatencyMode`) lose `deny_unknown_fields` in their `oneOf`
-///    branches, so each is re-closed with `additionalProperties: false`.
+/// 2. The tagged sub-enums (`KeywordPattern`) lose `deny_unknown_fields`
+///    in their `oneOf` branches, so each is re-closed with
+///    `additionalProperties: false`.
 /// 3. The stringly-typed moderation fields carry closed sets the hand-written
 ///    schema enforced via `enum`. They stay `String` on the struct (their
 ///    values flow through `aisix-guardrails` as strings; converting them to
@@ -1744,8 +1387,6 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
     if let Some(Value::Object(defs)) = obj.get_mut("definitions") {
         for name in [
             "KeywordPattern",
-            "BedrockAWSCredentials",
-            "BedrockLatencyMode",
         ] {
             if let Some(Value::Array(branches)) =
                 defs.get_mut(name).and_then(|d| d.get_mut("oneOf"))
@@ -1757,28 +1398,6 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
                 }
             }
         }
-        // The AssumeRole options mean nothing without the role. Write path
-        // only: a stored row that carries one anyway still loads, and the
-        // option is simply unused.
-        if strict {
-            if let Some(Value::Array(branches)) = defs
-                .get_mut("BedrockAWSCredentials")
-                .and_then(|d| d.get_mut("oneOf"))
-            {
-                for branch in branches.iter_mut().filter_map(Value::as_object_mut) {
-                    if matches!(branch_kind(branch), Some("static" | "default_chain")) {
-                        branch.insert(
-                            "dependencies".to_string(),
-                            json!({
-                                "external_id": ["role_arn"],
-                                "role_session_name": ["role_arn"]
-                            }),
-                        );
-                    }
-                }
-            }
-        }
-
         set_definition_property_enum(
             defs,
             "PiiDetectorConfig",
@@ -1807,41 +1426,6 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
             "PresidioEntityConfig",
             "action",
             json!(["mask", "block"]),
-        );
-        set_definition_variant_property_description(
-            defs,
-            "BedrockAWSCredentials",
-            "static",
-            "kind",
-            "Credential mode for explicitly configured AWS access keys.",
-        );
-        set_definition_variant_property_description(
-            defs,
-            "BedrockAWSCredentials",
-            "api_key",
-            "kind",
-            "Credential mode for an Amazon Bedrock API key.",
-        );
-        set_definition_variant_property_description(
-            defs,
-            "BedrockAWSCredentials",
-            "default_chain",
-            "kind",
-            "Credential mode that uses the gateway's own AWS environment.",
-        );
-        set_definition_variant_property_description(
-            defs,
-            "BedrockLatencyMode",
-            "serial",
-            "kind",
-            "Latency mode that waits for the Bedrock guardrail response.",
-        );
-        set_definition_variant_property_description(
-            defs,
-            "BedrockLatencyMode",
-            "timed",
-            "kind",
-            "Latency mode that stops waiting after `timeout_ms`.",
         );
         set_definition_variant_property_description(
             defs,
@@ -1885,51 +1469,6 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
                 set_property_description(b, "kind", description);
             }
             match kind.as_str() {
-                "azure_content_safety_text_moderation" => {
-                    set_property_enum(
-                        b,
-                        "output_type",
-                        json!(["FourSeverityLevels", "EightSeverityLevels"]),
-                    );
-                    set_property_enum(
-                        b,
-                        "text_source",
-                        json!(["concatenate_user_content", "concatenate_all_content"]),
-                    );
-                    set_property_enum(
-                        b,
-                        "stream_processing_mode",
-                        json!(["window", "buffer_full"]),
-                    );
-                    set_property_items_enum(
-                        b,
-                        "categories",
-                        json!(["Hate", "Sexual", "SelfHarm", "Violence"]),
-                    );
-                    set_property_items_description(
-                        b,
-                        "categories",
-                        "Azure content category to analyze.",
-                    );
-                    set_property_items_description(
-                        b,
-                        "blocklist_names",
-                        "Azure blocklist name to match against.",
-                    );
-                    set_property_additional_properties_description(
-                        b,
-                        "severity_threshold_by_category",
-                        "Severity threshold for the category key.",
-                    );
-                }
-                "aliyun_text_moderation" => {
-                    set_property_enum(b, "risk_level_threshold", json!(["low", "medium", "high"]));
-                    set_property_enum(
-                        b,
-                        "stream_processing_mode",
-                        json!(["window", "buffer_full"]),
-                    );
-                }
                 "pii" => {
                     set_property_enum(b, "default_action", json!(["mask", "block"]));
                 }
@@ -2131,15 +1670,6 @@ fn set_definition_variant_property_description(
 fn guardrail_kind_description(kind: &str) -> Option<&'static str> {
     match kind {
         "keyword" => Some("Guardrail provider type for literal and regular expression matching."),
-        "bedrock" => Some("Guardrail provider type for Amazon Bedrock Guardrails."),
-        "azure_content_safety" => Some("Guardrail provider type for Azure Prompt Shield."),
-        "azure_content_safety_text_moderation" => {
-            Some("Guardrail provider type for Azure text moderation.")
-        }
-        "aliyun_text_moderation" => Some("Guardrail provider type for Aliyun text moderation."),
-        "aliyun_ai_guardrail" => {
-            Some("Guardrail provider type for Aliyun AI Guardrails policy-driven moderation.")
-        }
         "pii" => {
             Some("Guardrail provider type for in-process sensitive-data detection and redaction.")
         }
@@ -3081,189 +2611,11 @@ mod tests {
         assert!(validate_model(&v).is_err());
     }
 
-    // ---- semantic router, classifier mode ----
-
-    fn jev_router(semantic_extra: Value, route: Value) -> Value {
-        let mut semantic = json!({
-            "classifier": {"type": "jev", "provider_key_id": "pk-ts"},
-            "routes": [route],
-            "default": "d"
-        });
-        for (k, v) in semantic_extra.as_object().unwrap() {
-            semantic[k] = v.clone();
-        }
-        json!({"display_name": "r", "semantic": semantic})
-    }
-
-    fn jev_route() -> Value {
-        json!({"name": "code", "target": "m", "description": "programming questions"})
-    }
-
-    /// Both sets must agree, because a classifier row is never one an
-    /// older build wrote: whatever the write path refuses, the loader
-    /// refuses too.
-    fn assert_rejected_on_both(v: &Value, why: &str) {
-        assert!(validate_model(v).is_err(), "strict accepted {why}: {v}");
-        assert!(
-            validate_model_lenient(v).is_err(),
-            "lenient accepted {why}: {v}"
-        );
-    }
-
+    /// The embedding contract holds on the READ path too: `match`, the
+    /// embedding model and each route's `examples` are required by the
+    /// schema rather than by the type.
     #[test]
-    fn model_semantic_classifier_form_passes_both_sets() {
-        let minimal = jev_router(json!({}), jev_route());
-        validate_model(&minimal).unwrap();
-        validate_model_lenient(&minimal).unwrap();
-        let m: Model = serde_json::from_value(minimal).unwrap();
-        let c = m.semantic.unwrap().classifier.unwrap();
-        assert_eq!(c.model, "jev-latest");
-        assert_eq!(c.min_confidence, 0.5);
-        assert_eq!(c.timeout_ms, 3000);
-        assert_eq!(c.on_failure, crate::models::OnEmbeddingFailure::default());
-
-        let full = json!({"display_name": "r", "semantic": {
-            "classifier": {
-                "type": "jev", "provider_key_id": "pk-ts", "model": "jev-1.13.0",
-                "min_confidence": 0.7, "timeout_ms": 1500,
-                "on_failure": {"target_id": "m-safe"}
-            },
-            "routes": [{"name": "code", "target_id": "m-1", "description": "code"}],
-            "default_id": "m-2",
-            "embedding_model_id": null
-        }});
-        validate_model(&full).unwrap();
-        validate_model_lenient(&full).unwrap();
-        for mode in ["default", "fail"] {
-            let v = jev_router(json!({}), jev_route());
-            let mut v = v;
-            v["semantic"]["classifier"]["on_failure"] = json!(mode);
-            validate_model(&v).unwrap();
-        }
-    }
-
-    #[test]
-    fn model_semantic_classifier_refuses_every_embedding_knob() {
-        for (field, value) in [
-            ("embedding_model", json!("e")),
-            ("embedding_model_id", json!("m-e")),
-            ("embedding_timeout_ms", json!(500)),
-            ("on_embedding_failure", json!("fail")),
-            ("match", json!({"threshold": 0.5})),
-        ] {
-            let v = jev_router(json!({ field: value }), jev_route());
-            assert_rejected_on_both(&v, field);
-        }
-        for (field, value) in [("examples", json!(["x"])), ("threshold", json!(0.5))] {
-            let mut route = jev_route();
-            route[field] = value;
-            assert_rejected_on_both(&jev_router(json!({}), route), field);
-        }
-    }
-
-    /// A classifier names its decision model either as a direct model by
-    /// id, or inline as a Provider Key plus model name; the inline key is
-    /// required only without the id, on both sets, and a row naming
-    /// neither — or only a `null` id — is refused by both.
-    #[test]
-    fn model_semantic_classifier_needs_a_model_id_or_an_inline_key() {
-        for classifier in [
-            json!({"type": "jev", "model_id": "m-jev"}),
-            json!({"type": "jev", "model_id": "m-jev", "provider_key_id": "pk-ts", "model": "jev-1"}),
-            json!({"type": "jev", "provider_key_id": "pk-ts"}),
-        ] {
-            let mut v = jev_router(json!({}), jev_route());
-            v["semantic"]["classifier"] = classifier.clone();
-            validate_model(&v).unwrap_or_else(|e| panic!("strict refused {classifier}: {e:?}"));
-            validate_model_lenient(&v)
-                .unwrap_or_else(|e| panic!("lenient refused {classifier}: {e:?}"));
-        }
-        for classifier in [
-            json!({"type": "jev"}),
-            json!({"type": "jev", "model_id": null}),
-            json!({"type": "jev", "model_id": ""}),
-        ] {
-            let mut v = jev_router(json!({}), jev_route());
-            v["semantic"]["classifier"] = classifier.clone();
-            assert_rejected_on_both(&v, &classifier.to_string());
-        }
-        let mut v = jev_router(json!({}), jev_route());
-        v["semantic"]["classifier"] = json!({"type": "jev", "model_id": "m-jev"});
-        let m: Model = serde_json::from_value(v).unwrap();
-        let c = m.semantic.unwrap().classifier.unwrap();
-        assert_eq!(c.model_id.as_deref(), Some("m-jev"));
-        assert_eq!(c.provider_key_id, "");
-    }
-
-    #[test]
-    fn model_semantic_gemini_decision_requires_a_model_id_and_two_to_254_routes() {
-        let mut router = jev_router(json!({}), jev_route());
-        let classifier = json!({"type": "gemini_decision", "model_id": "m-decision"});
-        router["semantic"]["classifier"] = classifier.clone();
-        assert_rejected_on_both(&router, "Gemini Decision with one route");
-
-        let routes: Vec<_> = (0..255)
-            .map(|n| json!({"name": format!("route-{n}"), "target_id": "m-1", "description": "code"}))
-            .collect();
-        for n in [2, 254] {
-            router["semantic"]["routes"] = json!(routes[..n]);
-            validate_model(&router).unwrap();
-            validate_model_lenient(&router).unwrap();
-        }
-        router["semantic"]["routes"] = json!(routes);
-        assert_rejected_on_both(&router, "Gemini Decision with 255 routes");
-
-        router["semantic"]["routes"] = json!(routes[..2]);
-        for inline in [
-            json!({"type": "gemini_decision", "provider_key_id": "pk"}),
-            json!({"type": "gemini_decision", "provider_key_id": "pk", "model_id": null}),
-        ] {
-            router["semantic"]["classifier"] = inline;
-            assert_rejected_on_both(&router, "Gemini Decision with only an inline key");
-        }
-        router["semantic"]["classifier"] = classifier;
-        let model: Model = serde_json::from_value(router).unwrap();
-        let config = model.semantic.unwrap().classifier.unwrap();
-        assert_eq!(config.r#type, crate::models::ClassifierType::GeminiDecision);
-        assert_eq!(config.model_id.as_deref(), Some("m-decision"));
-    }
-
-    #[test]
-    fn model_semantic_classifier_route_needs_a_description() {
-        let mut route = jev_route();
-        route.as_object_mut().unwrap().remove("description");
-        assert_rejected_on_both(&jev_router(json!({}), route), "a route with no description");
-    }
-
-    #[test]
-    fn model_semantic_classifier_block_is_closed_and_typed() {
-        let bad = [
-            json!({"provider_key_id": "pk"}),
-            json!({"type": "jev"}),
-            json!({"type": "other", "provider_key_id": "pk"}),
-            json!({"type": "jev", "provider_key_id": "pk", "min_confidence": 1.5}),
-            json!({"type": "jev", "provider_key_id": "pk", "timeout_ms": 0}),
-            json!({"type": "jev", "provider_key_id": "pk", "on_failure": "skip"}),
-        ];
-        for classifier in bad {
-            let mut v = jev_router(json!({}), jev_route());
-            v["semantic"]["classifier"] = classifier.clone();
-            assert_rejected_on_both(&v, &classifier.to_string());
-        }
-        // A typo is a write-path error; the loader tolerates it like any
-        // unknown field.
-        let mut v = jev_router(json!({}), jev_route());
-        v["semantic"]["classifier"]["min_confidnce"] = json!(0.9);
-        assert!(validate_model(&v).is_err());
-        validate_model_lenient(&v).unwrap();
-    }
-
-    /// Embedding mode keeps the contract it had before a classifier
-    /// existed, on the READ path too: `match`, the embedding model and
-    /// each route's `examples` used to be required by the type itself, and
-    /// are now required by the schema instead.
-    #[test]
-    fn model_semantic_embedding_mode_requirements_hold_on_both_sets() {
+    fn model_semantic_embedding_requirements_hold_on_both_sets() {
         let base = || {
             json!({"display_name": "x", "semantic": {
                 "embedding_model": "e",
@@ -3288,20 +2640,14 @@ mod tests {
     }
 
     /// The standalone `semantic` file renders every `Option` as nullable,
-    /// so an explicit `null` must not satisfy the mode switch or `match`:
+    /// so an explicit `null` must not satisfy the `match` requirement:
     /// serde reads it as absent.
     #[test]
-    fn semantic_mode_switch_ignores_explicit_nulls() {
+    fn semantic_ignores_explicit_null_match() {
         let mut schema =
             serde_json::to_value(schemars::schema_for!(crate::models::Semantic)).unwrap();
         apply_model_ref_alternatives(&mut schema);
         let validator = jsonschema::options().build(&schema).unwrap();
-        let null_classifier = json!({
-            "classifier": null,
-            "routes": [{"name": "a", "target": "m", "description": "d"}],
-            "default": "d"
-        });
-        assert!(!validator.is_valid(&null_classifier));
         let null_match = json!({
             "embedding_model": "e",
             "routes": [{"name": "a", "target": "m", "examples": ["x"]}],
@@ -3311,17 +2657,6 @@ mod tests {
         assert!(!validator.is_valid(&null_match));
     }
 
-    #[test]
-    fn a_typesafe_provider_key_validates() {
-        let pk = json!({"display_name": "ts", "api_key": "k", "provider": "typesafe"});
-        validate_provider_key(&pk).unwrap();
-        validate_provider_key_lenient(&pk).unwrap();
-        let with_base = json!({
-            "display_name": "ts", "api_key": "k", "provider": "typesafe",
-            "api_base": "https://typesafe.internal"
-        });
-        validate_provider_key(&with_base).unwrap();
-    }
 
     #[test]
     fn model_semantic_threshold_out_of_range_fails() {
@@ -3649,7 +2984,6 @@ mod tests {
             validate_apikey(&json!({
                 "key_hash": hash,
                 "rate_limit": {"rph": 10, "window_type": wt},
-                "mcp_rate_limits": {"github": {"rpm": 1, "window_type": wt}},
             }))
             .unwrap();
             validate_model(&json!({
@@ -3676,271 +3010,6 @@ mod tests {
             "window": "minute", "max_requests": 100, "window_type": "sliding"
         }))
         .is_err());
-    }
-
-    #[test]
-    fn apikey_mcp_access_block_passes() {
-        let v = json!({
-            "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
-            "allowed_models":["gpt-4o"],
-            "mcp_access": {"allow": ["*"]}
-        });
-        validate_apikey(&v).unwrap();
-        let v = json!({
-            "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
-            "allowed_models":["gpt-4o"],
-            "mcp_access": {"allow": ["github__*"], "deny": ["github__delete_repo"]}
-        });
-        validate_apikey(&v).unwrap();
-    }
-
-    #[test]
-    fn apikey_mcp_access_requires_an_explicit_allow_side() {
-        // A block carrying only `deny` would silently grant nothing; the
-        // schema forces the author to say what the key allows.
-        let v = json!({
-            "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
-            "allowed_models":[],
-            "mcp_access": {"deny": ["github__*"]}
-        });
-        assert!(validate_apikey(&v).is_err());
-    }
-
-    #[test]
-    fn apikey_mcp_access_rejects_the_removed_mode_field() {
-        // Write path: `mode` is gone from the authored shape and stays
-        // rejected. Read path: a document a pre-0.10.0 control plane wrote
-        // still carries the retired selector, and the lenient validator
-        // must keep accepting it — the api_key row authenticates every
-        // kind of traffic, so it must never be skipped over a dead key.
-        let v = json!({
-            "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
-            "allowed_models":[],
-            "mcp_access": {"mode": "inherit", "allow": ["*"]}
-        });
-        assert!(validate_apikey(&v).is_err());
-        validate_apikey_lenient(&v).unwrap();
-        validate_apikey_lenient(&json!({
-            "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
-            "allowed_models":[],
-            "mcp_access": {"mode": "deny", "allow": ["github__*"], "deny": ["x__y"]}
-        }))
-        .unwrap();
-    }
-
-    #[test]
-    fn apikey_rejects_the_removed_allowed_tools_field() {
-        let v = json!({
-            "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
-            "allowed_models":[],
-            "allowed_tools": ["github__*"]
-        });
-        assert!(validate_apikey(&v).is_err());
-    }
-
-    #[test]
-    fn mcp_policy_env_and_team_forms_pass() {
-        validate_mcp_policy(&json!({
-            "scope": "env",
-            "allow": ["github__*"],
-            "deny": ["github__delete_repo"]
-        }))
-        .unwrap();
-        validate_mcp_policy(&json!({
-            "scope": "team",
-            "scope_ref": "team-uuid-1",
-            "allow": ["*"],
-            "enabled": true
-        }))
-        .unwrap();
-    }
-
-    #[test]
-    fn mcp_policy_team_scope_requires_scope_ref() {
-        // A team row without its team id could shadow the environment
-        // layer; the cross-field guard rejects it at the schema gate.
-        assert!(validate_mcp_policy(&json!({"scope": "team", "allow": ["*"]})).is_err());
-        assert!(
-            validate_mcp_policy(&json!({"scope": "team", "scope_ref": null, "allow": ["*"]}))
-                .is_err()
-        );
-        // The environment layer carries no scope_ref.
-        validate_mcp_policy(&json!({"scope": "env", "allow": []})).unwrap();
-    }
-
-    #[test]
-    fn the_lenient_schema_still_loads_a_pre_layer_row() {
-        // Documents projected before the layered shape carry a `mode`
-        // and no `allow`. The strict write path rejects them, but the
-        // runtime loader must still accept them: a rejected `api_key`
-        // row is skipped entirely, so the key would stop authenticating
-        // for ALL traffic rather than merely losing MCP access.
-        let key = json!({
-            "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
-            "allowed_models":[],
-            "allowed_tools":["github__*"],
-            "mcp_access": {"mode": "inherit"}
-        });
-        validate_apikey_lenient(&key).unwrap();
-        assert!(validate_apikey(&key).is_err());
-
-        let policy = json!({"scope": "env", "mode": "all"});
-        validate_mcp_policy_lenient(&policy).unwrap();
-        assert!(validate_mcp_policy(&policy).is_err());
-    }
-
-    #[test]
-    fn mcp_id_form_sides_are_accepted_on_both_paths() {
-        let hash = "9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20";
-        let entry = json!({"server_id": "s-1", "tool": "create_issue"});
-
-        for ids in [json!([entry.clone()]), json!([]), json!(null)] {
-            let policy = json!({
-                "scope": "env", "allow": ["*"], "deny": [],
-                "allow_ids": ids, "deny_ids": ids,
-            });
-            validate_mcp_policy(&policy).unwrap();
-            validate_mcp_policy_lenient(&policy).unwrap();
-
-            let key = json!({
-                "key_hash": hash,
-                "mcp_access": {"allow": ["*"], "deny": [], "allow_ids": ids, "deny_ids": ids},
-                "mcp_rate_limits": {},
-                "mcp_rate_limits_by_id": {"s-1": {"rpm": 1}},
-            });
-            validate_apikey(&key).unwrap();
-            validate_apikey_lenient(&key).unwrap();
-        }
-
-        // Both spellings may be written together; the runtime lets the ids
-        // decide.
-        validate_mcp_policy(&json!({
-            "scope": "env",
-            "allow": ["github__create_issue"],
-            "allow_ids": [entry],
-        }))
-        .unwrap();
-    }
-
-    #[test]
-    fn mcp_id_form_entries_must_name_a_server_and_a_tool_on_the_write_path() {
-        let bad = [
-            json!({"tool": "create_issue"}),
-            json!({"server_id": "s-1"}),
-            json!({"server_id": "", "tool": "create_issue"}),
-            json!({"server_id": "s-1", "tool": ""}),
-            json!({"server_id": "s-1", "tool": "x", "rogue": 1}),
-            json!("s-1__create_issue"),
-        ];
-        for entry in bad {
-            assert!(
-                validate_mcp_policy(&json!({
-                    "scope": "env", "allow": ["*"], "allow_ids": [entry.clone()]
-                }))
-                .is_err(),
-                "allow_ids entry {entry} must be rejected on the write path"
-            );
-        }
-    }
-
-    #[test]
-    fn a_half_written_mcp_tool_ref_still_loads_leniently() {
-        // Pins the split, and requiredness is exactly what has to be
-        // pinned on BOTH sets: the loader deserializes what it validates,
-        // and a row it cannot deserialize is skipped whole — for an
-        // `api_key` that means the key stops authenticating every kind of
-        // traffic, not just losing MCP access. So one malformed entry in
-        // one `allow_ids` array must degrade to an entry matching nothing,
-        // never to a dead key.
-        let hash = "9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20";
-        for entry in [
-            json!({"tool": "create_issue"}),
-            json!({"server_id": "s-1"}),
-            json!({"server_id": "", "tool": ""}),
-        ] {
-            let key = json!({
-                "key_hash": hash,
-                "mcp_access": {"allow": [], "allow_ids": [entry.clone()]},
-            });
-            validate_apikey_lenient(&key).unwrap();
-            assert!(validate_apikey(&key).is_err());
-            // And it really deserializes — validating leniently is only
-            // half of what the loader does with the row.
-            let parsed: crate::models::ApiKey = serde_json::from_value(key).unwrap();
-            let refs = parsed.mcp_access.unwrap().allow_ids.unwrap();
-            assert_eq!(refs.len(), 1);
-        }
-    }
-
-    #[test]
-    fn the_write_path_requires_the_name_form_beside_every_id_form() {
-        // The id spelling is invisible to a gateway one release behind the
-        // control plane, and the name spelling is the only thing such a
-        // gateway can read. Writing a deny — or a per-server limit — in
-        // the id spelling ALONE would leave that restriction simply absent
-        // there for the length of the upgrade window: a restriction
-        // failing open, silently. `allow` is required outright for the
-        // same reason.
-        let hash = "9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20";
-        let entry = json!({"server_id": "s-1", "tool": "delete_repo"});
-
-        // allow: required outright, so the id spelling alone is refused.
-        assert!(validate_mcp_policy(&json!({
-            "scope": "env", "allow_ids": [entry],
-        }))
-        .is_err());
-
-        // deny, on a policy and on a key's own layer.
-        let policy = json!({"scope": "env", "allow": ["*"], "deny_ids": [entry]});
-        assert!(validate_mcp_policy(&policy).is_err());
-        validate_mcp_policy(&json!({
-            "scope": "env", "allow": ["*"], "deny": ["github__delete_repo"],
-            "deny_ids": [entry],
-        }))
-        .unwrap();
-
-        let key_only_ids =
-            json!({"key_hash": hash, "mcp_access": {"allow": ["*"], "deny_ids": [entry]}});
-        assert!(validate_apikey(&key_only_ids).is_err());
-
-        // Per-server limits.
-        let limits_only_ids =
-            json!({"key_hash": hash, "mcp_rate_limits_by_id": {"s-1": {"rpm": 1}}});
-        assert!(validate_apikey(&limits_only_ids).is_err());
-        validate_apikey(&json!({
-            "key_hash": hash,
-            "mcp_rate_limits": {"github": {"rpm": 1}},
-            "mcp_rate_limits_by_id": {"s-1": {"rpm": 1}},
-        }))
-        .unwrap();
-
-        // An explicit `null` means the same as omitted, so it demands
-        // nothing — only a real value does.
-        validate_mcp_policy(&json!({"scope": "env", "allow": ["*"], "deny_ids": null})).unwrap();
-        validate_apikey(&json!({"key_hash": hash, "mcp_rate_limits_by_id": null})).unwrap();
-
-        // The loader takes every one of these rows regardless: the guard
-        // is a write contract, never a reason to drop a stored row.
-        validate_mcp_policy_lenient(&policy).unwrap();
-        validate_apikey_lenient(&key_only_ids).unwrap();
-        validate_apikey_lenient(&limits_only_ids).unwrap();
-    }
-
-    #[test]
-    fn mcp_policy_requires_an_explicit_allow_side() {
-        assert!(validate_mcp_policy(&json!({"scope": "env"})).is_err());
-        assert!(validate_mcp_policy(&json!({"scope": "env", "deny": ["github__*"]})).is_err());
-    }
-
-    #[test]
-    fn mcp_policy_rejects_unknown_fields_and_values() {
-        assert!(validate_mcp_policy(&json!({"scope": "org", "allow": ["*"]})).is_err());
-        assert!(validate_mcp_policy(&json!({"scope": "env", "allow": ["*"], "rogue": 1})).is_err());
-        // `mode` is gone; a payload still carrying it is a write from a
-        // control plane that has not caught up.
-        assert!(
-            validate_mcp_policy(&json!({"scope": "env", "mode": "all", "allow": ["*"]})).is_err()
-        );
     }
 
     #[test]
@@ -4261,218 +3330,6 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    #[test]
-    fn guardrail_bedrock_serial_passes() {
-        let v = json!({
-            "name": "block-pii",
-            "kind": "bedrock",
-            "guardrail_id": "abcdefgh1234",
-            "guardrail_version": "DRAFT",
-            "region": "us-east-1",
-            "aws_credentials": {
-                "kind": "static",
-                "access_key_id": "AKIAEXAMPLE",
-                "secret_access_key": "PLAINTEXT"
-            },
-            "latency_mode": { "kind": "serial" }
-        });
-        validate_guardrail(&v).unwrap();
-    }
-
-    #[test]
-    fn guardrail_bedrock_timed_with_valid_timeout_passes() {
-        let v = json!({
-            "name": "block-pii",
-            "kind": "bedrock",
-            "guardrail_id": "id",
-            "guardrail_version": "1",
-            "region": "us-east-1",
-            "aws_credentials": {
-                "kind": "static",
-                "access_key_id": "AKIA",
-                "secret_access_key": "S"
-            },
-            "latency_mode": { "kind": "timed", "timeout_ms": 500 }
-        });
-        validate_guardrail(&v).unwrap();
-    }
-
-    #[test]
-    fn guardrail_bedrock_timeout_below_min_rejected() {
-        let v = json!({
-            "name": "g",
-            "kind": "bedrock",
-            "guardrail_id": "id",
-            "guardrail_version": "1",
-            "region": "us-east-1",
-            "aws_credentials": { "kind": "static", "access_key_id": "AKIA" },
-            "latency_mode": { "kind": "timed", "timeout_ms": 50 }
-        });
-        assert!(validate_guardrail(&v).is_err());
-    }
-
-    #[test]
-    fn guardrail_bedrock_unknown_credential_kind_rejected() {
-        let v = json!({
-            "name": "g",
-            "kind": "bedrock",
-            "guardrail_id": "id",
-            "guardrail_version": "1",
-            "region": "us-east-1",
-            "aws_credentials": { "kind": "role_arn", "access_key_id": "AKIA" },
-            "latency_mode": { "kind": "serial" }
-        });
-        assert!(validate_guardrail(&v).is_err());
-    }
-
-    /// The AssumeRole options require `role_arn` on the write path only:
-    /// a stored row carrying one without the role still loads, so the
-    /// guardrail keeps enforcing.
-    #[test]
-    fn guardrail_bedrock_role_options_need_role_arn_only_on_write() {
-        let v = json!({
-            "name": "g",
-            "kind": "bedrock",
-            "guardrail_id": "id",
-            "guardrail_version": "1",
-            "region": "us-east-1",
-            "aws_credentials": {
-                "kind": "static", "access_key_id": "a", "secret_access_key": "s",
-                "external_id": "x"
-            },
-            "latency_mode": { "kind": "serial" }
-        });
-        assert!(validate_guardrail(&v).is_err());
-        validate_guardrail_lenient(&v).expect("a stored row still loads");
-        let mut with_role = v.clone();
-        with_role["aws_credentials"]["role_arn"] = json!("arn:aws:iam::1:role/r");
-        validate_guardrail(&with_role).expect("role_arn satisfies the dependency");
-    }
-
-    #[test]
-    fn guardrail_azure_content_safety_passes() {
-        // Regression for #437: the loader JSON schema must accept the
-        // azure_content_safety kind, not just the Rust struct. timeout_ms
-        // omitted here — it's optional (defaults to 5000 on the struct).
-        let v = json!({
-            "name": "prompt-shield",
-            "kind": "azure_content_safety",
-            "hook_point": "input",
-            "endpoint": "https://my-resource.cognitiveservices.azure.com",
-            "api_key": "plaintext-key"
-        });
-        validate_guardrail(&v).unwrap();
-    }
-
-    #[test]
-    fn guardrail_azure_content_safety_with_timeout_passes() {
-        let v = json!({
-            "name": "prompt-shield",
-            "kind": "azure_content_safety",
-            "endpoint": "https://r.cognitiveservices.azure.com",
-            "api_key": "k",
-            "timeout_ms": 3000
-        });
-        validate_guardrail(&v).unwrap();
-    }
-
-    #[test]
-    fn guardrail_azure_content_safety_missing_api_key_rejected() {
-        let v = json!({
-            "name": "g",
-            "kind": "azure_content_safety",
-            "endpoint": "https://r.cognitiveservices.azure.com"
-        });
-        assert!(validate_guardrail(&v).is_err());
-    }
-
-    #[test]
-    fn guardrail_azure_content_safety_max_timeout_passes() {
-        // Guards the exact regression class of #437: the loader schema
-        // must accept everything AzureContentSafetyConfig's timeout_ms
-        // (u32) accepts, INCLUDING u32::MAX. A future edit that tightens
-        // the schema below u32::MAX would make the loader stricter than
-        // the struct and silently drop valid rows — this test fails loud.
-        let v = json!({
-            "name": "g",
-            "kind": "azure_content_safety",
-            "endpoint": "https://r.cognitiveservices.azure.com",
-            "api_key": "k",
-            "timeout_ms": 4_294_967_295u64
-        });
-        validate_guardrail(&v).unwrap();
-    }
-
-    #[test]
-    fn guardrail_azure_content_safety_timeout_overflow_rejected() {
-        // u32::MAX + 1 — beyond what the struct can deserialize. The
-        // schema must reject it at the gate so the loader skips the row
-        // cleanly instead of surfacing an opaque serde error downstream.
-        let v = json!({
-            "name": "g",
-            "kind": "azure_content_safety",
-            "endpoint": "https://r.cognitiveservices.azure.com",
-            "api_key": "k",
-            "timeout_ms": 4_294_967_296u64
-        });
-        assert!(validate_guardrail(&v).is_err());
-    }
-
-    #[test]
-    fn guardrail_aliyun_text_moderation_passes() {
-        // Minimal row: region + access keys. Optional fields (endpoint,
-        // threshold, streaming params) omitted — the struct applies defaults.
-        let v = json!({
-            "name": "aliyun-guard",
-            "kind": "aliyun_text_moderation",
-            "hook_point": "both",
-            "region": "cn-shanghai",
-            "access_key_id": "LTAI_EXAMPLE",
-            "access_key_secret": "plaintext-secret"
-        });
-        validate_guardrail(&v).unwrap();
-    }
-
-    #[test]
-    fn guardrail_aliyun_text_moderation_with_optional_fields_passes() {
-        let v = json!({
-            "name": "aliyun-guard",
-            "kind": "aliyun_text_moderation",
-            "region": "cn-beijing",
-            "endpoint": "http://127.0.0.1:8080",
-            "access_key_id": "id",
-            "access_key_secret": "secret",
-            "risk_level_threshold": "medium",
-            "timeout_ms": 3000,
-            "stream_processing_mode": "buffer_full"
-        });
-        validate_guardrail(&v).unwrap();
-    }
-
-    #[test]
-    fn guardrail_aliyun_text_moderation_missing_secret_rejected() {
-        let v = json!({
-            "name": "g",
-            "kind": "aliyun_text_moderation",
-            "region": "cn-shanghai",
-            "access_key_id": "id"
-        });
-        assert!(validate_guardrail(&v).is_err());
-    }
-
-    #[test]
-    fn guardrail_aliyun_text_moderation_bad_threshold_rejected() {
-        let v = json!({
-            "name": "g",
-            "kind": "aliyun_text_moderation",
-            "region": "cn-shanghai",
-            "access_key_id": "id",
-            "access_key_secret": "s",
-            "risk_level_threshold": "none"
-        });
-        assert!(validate_guardrail(&v).is_err());
-    }
-
     // ---- kind=semantic: a threshold has no portable default -------------
 
     fn semantic_row(extra: Value) -> Value {
@@ -4612,34 +3469,6 @@ mod tests {
         let cases = [
             json!({
                 "name": "g",
-                "kind": "azure_content_safety_text_moderation",
-                "endpoint": "https://example.cognitiveservices.azure.com",
-                "api_key": "key",
-                "output_type": "TwoSeverityLevels"
-            }),
-            json!({
-                "name": "g",
-                "kind": "azure_content_safety_text_moderation",
-                "endpoint": "https://example.cognitiveservices.azure.com",
-                "api_key": "key",
-                "categories": ["Hate", "Spam"]
-            }),
-            json!({
-                "name": "g",
-                "kind": "azure_content_safety_text_moderation",
-                "endpoint": "https://example.cognitiveservices.azure.com",
-                "api_key": "key",
-                "text_source": "assistant_only"
-            }),
-            json!({
-                "name": "g",
-                "kind": "azure_content_safety_text_moderation",
-                "endpoint": "https://example.cognitiveservices.azure.com",
-                "api_key": "key",
-                "stream_processing_mode": "chunked"
-            }),
-            json!({
-                "name": "g",
                 "kind": "pii",
                 "detectors": [{ "type": "email", "action": "redact" }]
             }),
@@ -4703,21 +3532,6 @@ mod tests {
                 "patterns": [],
                 "enforcement_mode": "audit",
                 "direction": "sideways"
-            }),
-            json!({
-                "name": "g",
-                "kind": "azure_content_safety_text_moderation",
-                "endpoint": "https://example.cognitiveservices.azure.com",
-                "api_key": "key",
-                "on_buffer_exceeded": "drop"
-            }),
-            json!({
-                "name": "g",
-                "kind": "aliyun_text_moderation",
-                "region": "cn-shanghai",
-                "access_key_id": "id",
-                "access_key_secret": "s",
-                "on_buffer_exceeded": "drop"
             }),
             json!({
                 "name": "g",
@@ -5247,7 +4061,7 @@ mod tests {
                 { "dimension": "team", "operator": "in", "value": ["t-1"] },
                 { "logic": "or", "children": [
                     { "dimension": "model_name", "operator": "~~", "value": "^gpt-4\\.1" },
-                    { "dimension": "provider", "operator": "==", "value": "anthropic" }
+                    { "dimension": "provider", "operator": "==", "value": "openai" }
                 ]}
             ],
             "group_by": ["team"],
@@ -5380,10 +4194,9 @@ mod tests {
         validate_provider_key(&v).unwrap();
     }
 
-    /// AISIX-Cloud#1388 / the two-protocol upstream: one credential, an
-    /// OpenAI-compatible path and an Anthropic-compatible one on the same
-    /// host. Both entry shapes have to validate — with a `base` override
-    /// and without one (the bare declaration that a surface exists).
+    /// The one declared surface: both entry shapes have to validate —
+    /// with a `base` override and without one (the bare declaration that
+    /// a surface exists).
     #[test]
     fn provider_key_with_apis_entries_passes() {
         let v = json!({
@@ -5393,8 +4206,18 @@ mod tests {
             "provider": "deepseek",
             "adapter": "openai",
             "apis": {
-                "responses": {},
-                "messages": {"base": "https://api.deepseek.com/anthropic"}
+                "responses": {}
+            }
+        });
+        validate_provider_key(&v).unwrap();
+        let v = json!({
+            "display_name": "deepseek-prod",
+            "api_key": "sk-x",
+            "api_base": "https://api.deepseek.com/v1",
+            "provider": "deepseek",
+            "adapter": "openai",
+            "apis": {
+                "responses": {"base": "https://api.deepseek.com/v1"}
             }
         });
         validate_provider_key(&v).unwrap();
@@ -5411,14 +4234,6 @@ mod tests {
         validate_provider_key(&v).unwrap();
     }
 
-    #[test]
-    fn provider_key_accepts_gemini_at_the_default_or_an_explicit_base() {
-        for entry in [json!({}), json!({"base": "https://native.example/v1beta"})] {
-            let row = json!({"display_name":"dual", "api_key":"k", "apis":{"gemini":entry}});
-            validate_provider_key(&row).unwrap();
-            validate_provider_key_lenient(&row).unwrap();
-        }
-    }
 
     /// The surface key set is closed on the write path, so a typo (or a
     /// surface this release does not serve) fails loudly rather than
@@ -5596,10 +4411,10 @@ mod tests {
 
     // ---- retired field names (#1375) ----
     //
-    // provider_key `secret` (now `api_key`) and `display_name` on
-    // mcp_server, a2a_agent and passthrough_route (now `name`) are refused
-    // by both the write contract and the read schema: a document carrying
-    // only the old name is missing a required field.
+    // provider_key `secret` (now `api_key`) and passthrough_route
+    // `display_name` (now `name`) are refused by both the write contract
+    // and the read schema: a document carrying only the old name is
+    // missing a required field.
 
     #[test]
     fn retired_field_names_are_refused_on_both_paths() {
@@ -5612,27 +4427,13 @@ mod tests {
             })
         };
         type V = fn(&Value) -> Result<(), SchemaError>;
-        let cases: [(&str, V, V, Value, Value); 4] = [
+        let cases: [(&str, V, V, Value, Value); 2] = [
             (
                 "provider_key",
                 validate_provider_key,
                 validate_provider_key_lenient,
                 json!({"display_name": "x", "api_key": "sk-x"}),
                 json!({"display_name": "x", "secret": "sk-x"}),
-            ),
-            (
-                "mcp_server",
-                validate_mcp_server,
-                validate_mcp_server_lenient,
-                json!({"name": "github", "url": "https://x/mcp"}),
-                json!({"display_name": "github", "url": "https://x/mcp"}),
-            ),
-            (
-                "a2a_agent",
-                validate_a2a_agent,
-                validate_a2a_agent_lenient,
-                json!({"name": "invoice", "url": "https://x/a2a"}),
-                json!({"display_name": "invoice", "url": "https://x/a2a"}),
             ),
             (
                 "passthrough_route",
@@ -5662,170 +4463,20 @@ mod tests {
     }
 
     #[test]
-    fn an_mcp_server_name_may_not_carry_a_star_on_the_write_path() {
-        // A name is pasted into the `<server>__*` glob patterns every
-        // name-form MCP grant, deny and anonymous ceiling is written as,
-        // so `gh*` would reach `ghost`'s tools as well as its own.
-        for bad in ["gh*", "*", "a*b", "*gh"] {
-            assert!(
-                validate_mcp_server(&json!({"name": bad, "url": "https://x/mcp"})).is_err(),
-                "{bad} must be refused on the write path"
-            );
-        }
-        // The shapes the pattern already refused, and one it never
-        // did — the tightening must not have moved either.
-        for bad in ["gh__ub", "gh_"] {
-            assert!(
-                validate_mcp_server(&json!({"name": bad, "url": "https://x/mcp"})).is_err(),
-                "{bad} must stay refused"
-            );
-        }
-        validate_mcp_server(&json!({"name": "gh_ub", "url": "https://x/mcp"})).unwrap();
-    }
-
-    #[test]
-    fn a_stored_mcp_server_name_with_a_star_still_loads() {
-        // Pins the split, and the split is the whole point: the loader
-        // SKIPS a row it cannot validate, so closing the read pattern
-        // would delete an already-registered server rather than fix its
-        // name — and with it every grant, limit and anonymous entry that
-        // names it. Rejected by the write path, accepted by the loader,
-        // and it really deserializes.
-        let doc = json!({"name": "gh*", "url": "https://x/mcp"});
-        assert!(validate_mcp_server(&doc).is_err());
-        validate_mcp_server_lenient(&doc).unwrap();
-        let parsed: crate::models::McpServer = serde_json::from_value(doc).unwrap();
-        assert_eq!(parsed.name, "gh*");
-
-        // The `__` and trailing-`_` shapes are refused on BOTH paths, as
-        // before: those names cannot be split back into server + tool at
-        // all, so serving the row is worse than skipping it.
-        for bad in ["gh__ub", "gh_"] {
-            let doc = json!({"name": bad, "url": "https://x/mcp"});
-            assert!(validate_mcp_server(&doc).is_err(), "{bad}");
-            assert!(validate_mcp_server_lenient(&doc).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
-    fn schema_error_for_missing_name_does_not_echo_the_document() {
+    fn schema_error_for_a_missing_required_field_does_not_echo_the_document() {
         // A missing required field fails at the document root, and an
         // unmasked root failure message can interpolate the entire failing
         // instance — which for these resources can carry a live upstream
-        // credential. `validate` masks instance values, so a name-less
-        // document's error must not echo its `secret`.
-        let err = validate_mcp_server(&json!({
-            "url": "https://x/mcp",
-            "auth_type": "bearer",
-            "secret": "tok-sensitive"
+        // credential. `validate` masks instance values, so a document with
+        // no `display_name` must not echo its `api_key`.
+        let err = validate_provider_key(&json!({
+            "api_key": "tok-sensitive"
         }))
-        .expect_err("name-less document must fail");
+        .expect_err("a document missing a required field must fail");
         assert!(
             !err.to_string().contains("tok-sensitive"),
             "validation error must not echo credential values; got: {err}"
         );
-    }
-
-    // ---- mcp_server schema tests (#666 timeout_ms guard) ----
-
-    #[test]
-    fn mcp_server_minimal_passes() {
-        // `timeout_ms` is optional; omitting it must validate.
-        let v = json!({
-            "name": "github",
-            "url": "https://api.example.com/mcp"
-        });
-        validate_mcp_server(&v).unwrap();
-    }
-
-    #[test]
-    fn mcp_server_accepts_positive_timeout_ms() {
-        let v = json!({
-            "name": "github",
-            "url": "https://api.example.com/mcp",
-            "timeout_ms": 1
-        });
-        validate_mcp_server(&v).unwrap();
-    }
-
-    #[test]
-    fn mcp_server_accepts_api_key_auth() {
-        let v = json!({
-            "name": "github",
-            "url": "https://api.example.com/mcp",
-            "auth_type": "api_key",
-            "secret": "k-123"
-        });
-        validate_mcp_server(&v).unwrap();
-    }
-
-    #[test]
-    fn mcp_server_accepts_oauth2_auth_with_client_fields() {
-        let v = json!({
-            "name": "github",
-            "url": "https://api.example.com/mcp",
-            "auth_type": "oauth2",
-            "secret": "client-secret",
-            "client_id": "cid",
-            "token_url": "https://auth.example.com/oauth/token",
-            "scopes": ["read", "write"]
-        });
-        validate_mcp_server(&v).unwrap();
-    }
-
-    #[test]
-    fn mcp_server_rejects_unknown_auth_type_and_bad_scopes_shape() {
-        // The `auth_type` set is closed: near-misses like `oauth` must fail.
-        let v = json!({
-            "name": "x",
-            "url": "https://x/mcp",
-            "auth_type": "oauth"
-        });
-        assert!(validate_mcp_server(&v).is_err());
-
-        // `scopes` is an array of strings, not a single space-joined string.
-        let v = json!({
-            "name": "x",
-            "url": "https://x/mcp",
-            "auth_type": "oauth2",
-            "secret": "s",
-            "client_id": "cid",
-            "token_url": "https://auth/token",
-            "scopes": "read write"
-        });
-        assert!(validate_mcp_server(&v).is_err());
-    }
-
-    #[test]
-    fn mcp_server_schema_enforces_credential_coupling() {
-        // This assertion is the inverse of what it used to be, deliberately.
-        // The coupling (oauth2 ⇒ client_id + secret + token_url) used to be
-        // left to write paths, on the reasoning that an incomplete row should
-        // still load and degrade at runtime. That reasoning depended on a write
-        // path existing to catch it; with resource writes removed from this
-        // gateway, leaving the schema permissive means nothing checks the
-        // coupling at all on the declarative and etcd paths.
-        //
-        // Rejecting at load is also the more diagnosable of the two failures: a
-        // rejected row is named in `GET /status/config`'s `rejected` array,
-        // whereas a loaded-but-degraded server silently serves no tools.
-        let v = json!({
-            "name": "x",
-            "url": "https://x/mcp",
-            "auth_type": "oauth2"
-        });
-        assert!(validate_mcp_server(&v).is_err());
-
-        // The complete set still validates.
-        let v = json!({
-            "name": "x",
-            "url": "https://x/mcp",
-            "auth_type": "oauth2",
-            "secret": "cs",
-            "client_id": "cid",
-            "token_url": "https://auth/token"
-        });
-        validate_mcp_server(&v).unwrap();
     }
 
     // ---- strict-write / lenient-read split (issue #871) ----
@@ -5918,16 +4569,6 @@ mod tests {
     /// enforcing, an exporter that stopped exporting.
     #[test]
     fn formerly_closed_nested_objects_load_on_read_and_are_reported() {
-        let bedrock = |credentials: Value, latency: Value| {
-            json!({
-                "name": "b", "kind": "bedrock",
-                "guardrail_id": "gr-1", "guardrail_version": "1", "region": "us-east-1",
-                "aws_credentials": credentials,
-                "latency_mode": latency,
-            })
-        };
-        let serial = json!({"kind": "serial"});
-        let credentials = json!({"kind": "static", "access_key_id": "a", "secret_access_key": "b"});
         let cases: Vec<(&str, Value, &str)> = vec![
             (
                 "guardrail",
@@ -5961,33 +4602,6 @@ mod tests {
                     "patterns": [{"kind": "literal", "value": "x", "future_knob": 1}]
                 }),
                 "patterns.0.future_knob",
-            ),
-            (
-                "guardrail",
-                bedrock(
-                    json!({
-                        "kind": "static", "access_key_id": "a", "secret_access_key": "b",
-                        "future_knob": 1
-                    }),
-                    serial.clone(),
-                ),
-                "aws_credentials.future_knob",
-            ),
-            (
-                "guardrail",
-                bedrock(
-                    credentials.clone(),
-                    json!({"kind": "serial", "future_knob": 1}),
-                ),
-                "latency_mode.future_knob",
-            ),
-            (
-                "guardrail",
-                bedrock(
-                    credentials,
-                    json!({"kind": "timed", "timeout_ms": 200, "future_knob": 1}),
-                ),
-                "latency_mode.future_knob",
             ),
             (
                 // Not a nested object at all: the guardrail ROOT, where the
@@ -6087,31 +4701,20 @@ mod tests {
         // exactly a SIBLING branch's field — under `oneOf`, a second
         // matching branch would fail the document just as hard as the
         // closure used to.
-        let sibling_field = json!({
-            "name": "b", "kind": "bedrock",
-            "guardrail_id": "gr-1", "guardrail_version": "1", "region": "us-east-1",
-            "aws_credentials": {"kind": "static", "access_key_id": "a", "secret_access_key": "b"},
-            // `timeout_ms` belongs to the `timed` branch; `serial` no longer
-            // rejects it, and must still be the only branch that matches.
-            "latency_mode": {"kind": "serial", "timeout_ms": 200}
+        let unknown_nested = json!({
+            "name": "k", "kind": "keyword",
+            "patterns": [{"kind": "literal", "value": "x", "future_knob": 1}]
         });
-        validate_guardrail_lenient(&sibling_field).expect("exactly one branch still matches");
-        assert!(validate_guardrail(&sibling_field).is_err());
+        validate_guardrail_lenient(&unknown_nested).expect("the union still resolves");
+        assert!(validate_guardrail(&unknown_nested).is_err());
         let parsed: crate::models::Guardrail =
-            serde_json::from_value(sibling_field.clone()).expect("row deserializes");
+            serde_json::from_value(unknown_nested.clone()).expect("row deserializes");
         match &parsed.config {
-            crate::models::GuardrailKind::Bedrock(cfg) => assert!(
-                matches!(cfg.latency_mode, crate::models::BedrockLatencyMode::Serial),
-                "the `kind` const, not the closure, picks the branch"
-            ),
+            crate::models::GuardrailKind::Keyword(cfg) => assert_eq!(cfg.patterns.len(), 1),
             other => panic!("wrong kind: {}", other.kind_str()),
         }
-        // A sibling branch declares `timeout_ms`, so the report stays quiet:
-        // it is a malformed document, not a field from a newer build, and
-        // the strict path above is what says so.
-        assert!(unknown_field_paths("guardrail", &sibling_field).is_empty());
 
-        // Same at the top level: a `keyword` guardrail carrying a `pii`
+        // And at the top level: a `keyword` guardrail carrying a `pii`
         // field still resolves to `keyword`, because every other branch
         // pins its own `kind`. Cross-kind leakage is a malformed document,
         // not a newer build's field, so the write path rejects it and the
@@ -6308,19 +4911,6 @@ mod tests {
         });
         validate_model(&ok).unwrap();
         validate_model_lenient(&ok).unwrap();
-    }
-
-    #[test]
-    fn mcp_server_rejects_zero_timeout_ms() {
-        // A zero deadline times out every upstream op instantly and silently
-        // drops the server from `tools/list`; reject it at the schema layer
-        // (enforced on both the Admin write-path and the etcd loader).
-        let v = json!({
-            "name": "github",
-            "url": "https://api.example.com/mcp",
-            "timeout_ms": 0
-        });
-        assert!(validate_mcp_server(&v).is_err());
     }
 
     #[test]
@@ -6576,11 +5166,6 @@ mod tests {
         // Independent of the enum's declaration order, which is what a
         // positional list gets wrong.
         let expected_kinds = [
-            "aliyun_ai_guardrail",
-            "aliyun_text_moderation",
-            "azure_content_safety",
-            "azure_content_safety_text_moderation",
-            "bedrock",
             "custom",
             "keyword",
             "lakera",

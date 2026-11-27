@@ -27,8 +27,8 @@ pub struct AuthenticatedKey {
     pub jwt: Option<Arc<JwtIdentity>>,
     /// `true` when the principal came from an entry's anonymous
     /// configuration instead of a credential the caller presented —
-    /// the MCP anonymous entries (AISIX-Cloud#1313) and passthrough
-    /// routes in `auth_mode: anonymous`.
+    /// anonymous entries (AISIX-Cloud#1313) and passthrough routes in
+    /// `auth_mode: anonymous`.
     ///
     /// `entry` names the principal either way; this says whether the
     /// caller PROVED it, which `entry` alone cannot tell once a key
@@ -73,8 +73,9 @@ pub struct JwtIdentity {
     /// when the subject was bound to the key directly via `jwt_subject`.
     pub claim_mapping: Option<String>,
     /// The bearer token itself, exactly as the trust provider verified it —
-    /// what an `oauth2_token_exchange` MCP server exchanges on the caller's
-    /// behalf. Never printed. `None` for a session token: the gateway's own
+    /// what an `oauth2_token_exchange` upstream exchanges on the caller's
+    /// behalf, on a passthrough route configured that way. Never printed.
+    /// `None` for a session token: the gateway's own
     /// credential, which means nothing to anyone else and never leaves here.
     pub(crate) token: Option<Arc<str>>,
 }
@@ -320,7 +321,6 @@ pub(crate) fn emit_denial_access_log(parts: &Parts, started: std::time::Instant,
         routing_fallback_count: None,
         error_kind: Some(error_kind),
         error: Some(&error),
-        mcp: None,
         cache: None,
         request_body_bytes: None,
         response_body_bytes: None,
@@ -402,11 +402,11 @@ pub(crate) async fn authenticate_token(
     // Hand the principal to the request's attribution cell, so a caller
     // that hangs up still files an ATTRIBUTABLE usage row
     // (AISIX-Cloud#1571). Here rather than in the extractor above because
-    // three surfaces authenticate without it — a passthrough route's own
-    // `auth_mode`, `/v1/realtime`'s WebSocket subprotocol, and `/mcp` —
-    // and two of them build no `ClientContext` either. The two places that
-    // mint an ANONYMOUS principal instead of verifying a credential note it
-    // themselves (`mcp::resolve_caller`, `passthrough_route::authenticate`).
+    // some surfaces authenticate without it — a passthrough route's
+    // own `auth_mode`, `/v1/realtime`'s WebSocket subprotocol — and they
+    // build no `ClientContext` either. The place that mints an ANONYMOUS
+    // principal instead of verifying a credential notes it itself
+    // (`passthrough_route::authenticate`).
     crate::attribution::note_authenticated(&authed);
     Ok(authed)
 }
@@ -444,7 +444,7 @@ async fn authenticate_token_inner(
     // Lifecycle enforcement (#933): a known key that is disabled or
     // past its expiry deadline must be rejected here, at the single
     // auth choke point, so every proxy surface (chat, messages,
-    // responses, embeddings, audio, passthrough, MCP, …) inherits
+    // responses, embeddings, audio, passthrough, …) inherits
     // the same 401 without per-handler checks.
     if entry.value.disabled {
         return Err(deny_key(
@@ -518,8 +518,8 @@ fn deny_key(
 
 /// Dedicated header for the caller's gateway credential. When present it
 /// is the ONLY header read for gateway authentication, which leaves
-/// `Authorization` free to carry a credential meant for an upstream (an MCP
-/// server's own OAuth token, for instance). Its `x-aisix-` prefix keeps it
+/// `Authorization` free to carry a credential meant for an upstream (an
+/// upstream's own OAuth token, for instance). Its `x-aisix-` prefix keeps it
 /// off every upstream request (`aisix_core::header_forward_blocked`).
 pub(crate) const GATEWAY_KEY_HEADER: &str =
     aisix_core::forwarded_headers::GATEWAY_CREDENTIAL_HEADER;
@@ -612,13 +612,6 @@ fn raw_credential(
 
 fn extract_bearer(parts: &Parts) -> Result<String, ProxyError> {
     header_credential(&parts.headers)
-        .or_else(|| {
-            crate::gemini::path(parts.uri.path())?;
-            parts
-                .headers
-                .get("x-goog-api-key")
-                .map(|raw| raw_credential(raw, "x-goog-api-key"))
-        })
         .unwrap_or(Err(ProxyError::MissingAuth(AUTHORIZATION_LABEL)))
 }
 

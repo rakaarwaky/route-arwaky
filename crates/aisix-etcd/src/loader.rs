@@ -24,14 +24,14 @@
 //! rest."
 
 use aisix_core::models::{
-    validate_a2a_agent_lenient, validate_apikey_lenient, validate_cache_policy_lenient,
+    validate_apikey_lenient, validate_cache_policy_lenient,
     validate_claim_mapping_lenient, validate_guardrail_attachment_lenient,
-    validate_guardrail_lenient, validate_mcp_auth_settings_lenient, validate_mcp_policy_lenient,
-    validate_mcp_server_lenient, validate_model_lenient, validate_observability_exporter_lenient,
+    validate_guardrail_lenient,
+    validate_model_lenient, validate_observability_exporter_lenient,
     validate_oidc_provider_lenient, validate_passthrough_route_lenient,
-    validate_provider_key_lenient, validate_rate_limit_policy_lenient, A2aAgent, ApiKey,
-    CachePolicy, ClaimMapping, Guardrail, GuardrailAttachment, McpAuthSettings, McpPolicy,
-    McpServer, Model, ObservabilityExporter, OidcProvider, PassthroughRoute, ProviderKey,
+    validate_provider_key_lenient, validate_rate_limit_policy_lenient, ApiKey,
+    CachePolicy, ClaimMapping, Guardrail, GuardrailAttachment,
+    Model, ObservabilityExporter, OidcProvider, PassthroughRoute, ProviderKey,
     RateLimitPolicy, SchemaError,
 };
 use aisix_core::models::{
@@ -409,33 +409,6 @@ pub fn build_snapshot(prefixes: &PrefixSet, entries: &[RawEntry]) -> (AisixSnaps
                     snapshot.rate_limit_policies.insert(entry);
                 }
             }
-            "mcp_servers" => {
-                // An OpenAPI document that yields no tool would register a
-                // server serving nothing — rejected like a schema failure.
-                if let Some(entry) = validate_and_parse_with_semantics::<McpServer>(
-                    &raw.key,
-                    raw.revision,
-                    parsed,
-                    &value,
-                    validate_mcp_server_lenient,
-                    |s| s.validate_semantics(),
-                    &mut stats,
-                ) {
-                    snapshot.mcp_servers.insert(entry);
-                }
-            }
-            "mcp_policies" => {
-                if let Some(entry) = validate_and_parse::<McpPolicy>(
-                    &raw.key,
-                    raw.revision,
-                    parsed,
-                    &value,
-                    validate_mcp_policy_lenient,
-                    &mut stats,
-                ) {
-                    snapshot.mcp_policies.insert(entry);
-                }
-            }
             "passthrough_routes" => {
                 if let Some(entry) = validate_and_parse::<PassthroughRoute>(
                     &raw.key,
@@ -446,18 +419,6 @@ pub fn build_snapshot(prefixes: &PrefixSet, entries: &[RawEntry]) -> (AisixSnaps
                     &mut stats,
                 ) {
                     snapshot.passthrough_routes.insert(entry);
-                }
-            }
-            "a2a_agents" => {
-                if let Some(entry) = validate_and_parse::<A2aAgent>(
-                    &raw.key,
-                    raw.revision,
-                    parsed,
-                    &value,
-                    validate_a2a_agent_lenient,
-                    &mut stats,
-                ) {
-                    snapshot.a2a_agents.insert(entry);
                 }
             }
             "oidc_providers" => {
@@ -490,18 +451,6 @@ pub fn build_snapshot(prefixes: &PrefixSet, entries: &[RawEntry]) -> (AisixSnaps
                     &mut stats,
                 ) {
                     snapshot.claim_mappings.insert(entry);
-                }
-            }
-            "mcp_auth_settings" => {
-                if let Some(entry) = validate_and_parse::<McpAuthSettings>(
-                    &raw.key,
-                    raw.revision,
-                    parsed,
-                    &value,
-                    validate_mcp_auth_settings_lenient,
-                    &mut stats,
-                ) {
-                    snapshot.mcp_auth_settings.insert(entry);
                 }
             }
             "teams" => {
@@ -1305,39 +1254,6 @@ mod tests {
     }
 
     #[test]
-    fn api_key_retired_mcp_access_mode_selector_is_an_unknown_field() {
-        // `mcp_access.mode` is no longer consumed by the typed struct, so a
-        // document a pre-0.10.0 control plane wrote takes the ordinary
-        // unknown-field path: the api_key row still LOADS — a skipped row
-        // would stop the key authenticating every kind of traffic, not just
-        // MCP — with its own half read and the retired selector reported
-        // through the partial-compat channel.
-        let entries = vec![raw(
-            "/aisix/api_keys/k-tombstone",
-            br#"{
-                "key_hash": "1460db1b6902f8b1fc2a40d9381a24d0fd22c3bc1b2c6f999c521da73776fbe0",
-                "allowed_models": ["m"],
-                "mcp_access": {"mode": "deny", "allow": ["github__*"], "deny": ["x__y"]}
-            }"#,
-            1,
-        )];
-        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
-        assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
-        assert_eq!(
-            stats.partially_compatible,
-            vec![PartialCompatEntry {
-                kind: "api_keys".into(),
-                field: "mcp_access.mode".into(),
-                count: 1,
-            }]
-        );
-        let entry = snap.apikeys.get_by_id("k-tombstone").unwrap();
-        let access = entry.value.mcp_access.as_ref().unwrap();
-        assert_eq!(access.allow, vec!["github__*"]);
-        assert_eq!(access.deny, vec!["x__y"]);
-    }
-
-    #[test]
     fn nested_unknown_field_reports_dotted_path() {
         let entries = vec![raw(
             "/aisix/api_keys/k-nested",
@@ -1519,10 +1435,10 @@ mod tests {
     // ---- retired field names (#1375) ----
     //
     // provider_key `secret` (now `api_key`) and `display_name` on
-    // mcp_server, a2a_agent and passthrough_route (now `name`) are no
-    // longer read: a document carrying only the old name is missing a
-    // required field and is rejected whole, while its canonical twin in
-    // the same batch still loads.
+    // passthrough_route (now `name`) are no longer read: a document
+    // carrying only the old name is missing a required field and is
+    // rejected whole, while its canonical twin in the same batch still
+    // loads.
 
     #[test]
     fn documents_under_retired_field_names_are_rejected() {
@@ -1547,45 +1463,23 @@ mod tests {
                 2,
             ),
             raw(
-                "/aisix/mcp_servers/mcp-former",
-                br#"{"display_name":"gh-former","url":"https://x/mcp"}"#,
-                3,
-            ),
-            raw(
-                "/aisix/mcp_servers/mcp-canonical",
-                br#"{"name":"gh-canonical","url":"https://x/mcp"}"#,
-                4,
-            ),
-            raw(
-                "/aisix/a2a_agents/a2a-former",
-                br#"{"display_name":"agent-former","url":"https://x/a2a"}"#,
-                5,
-            ),
-            raw(
-                "/aisix/a2a_agents/a2a-canonical",
-                br#"{"name":"agent-canonical","url":"https://x/a2a"}"#,
-                6,
-            ),
-            raw(
                 "/aisix/passthrough_routes/pr-former",
                 route("display_name").as_bytes(),
-                7,
+                3,
             ),
             raw(
                 "/aisix/passthrough_routes/pr-canonical",
                 route("name").as_bytes(),
-                8,
+                4,
             ),
         ];
         let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
-        assert_eq!(stats.accepted, 4, "rejections: {:?}", stats.rejections);
+        assert_eq!(stats.accepted, 2, "rejections: {:?}", stats.rejections);
         let mut rejected: Vec<&str> = stats.rejections.iter().map(|r| r.key.as_str()).collect();
         rejected.sort_unstable();
         assert_eq!(
             rejected,
             [
-                "/aisix/a2a_agents/a2a-former",
-                "/aisix/mcp_servers/mcp-former",
                 "/aisix/passthrough_routes/pr-former",
                 "/aisix/provider_keys/pk-former",
             ]
@@ -1595,8 +1489,6 @@ mod tests {
             .iter()
             .all(|r| r.kind == RejectionKind::SchemaFailed));
         assert!(snap.provider_keys.get_by_id("pk-canonical").is_some());
-        assert!(snap.mcp_servers.get_by_name("gh-canonical").is_some());
-        assert!(snap.a2a_agents.get_by_name("agent-canonical").is_some());
         assert!(snap.passthrough_routes.get_by_id("pr-canonical").is_some());
     }
 
@@ -1702,79 +1594,6 @@ mod tests {
         assert_eq!(rej.key, "/aisix/rate_limit_policies/rlp-bad");
         assert_eq!(rej.kind, RejectionKind::SchemaFailed);
         assert!(rej.error.contains("does not compile"), "{}", rej.error);
-    }
-
-    #[test]
-    fn an_openapi_mcp_server_serving_no_tools_is_rejected_and_collisions_still_load() {
-        // AISIX-Cloud#1272: an OpenAPI document the gateway turns into zero
-        // tools, and a header name no HTTP request can carry, are rejected
-        // like a schema failure. Colliding operationIds are not: the runtime
-        // suffixes them and every tool stays callable.
-        let server = |name: &str, extra: &str| {
-            format!(
-                r#"{{"name":"{name}","type":"openapi","url":"https://api.test",
-                    "auth_type":"api_key","secret":"s"{extra}}}"#
-            )
-        };
-        let entries = vec![
-            raw(
-                "/aisix/mcp_servers/no-paths",
-                server("no-paths", r#","spec":{"openapi":"3.0.0"}"#).as_bytes(),
-                1,
-            ),
-            raw(
-                "/aisix/mcp_servers/multipart-only",
-                server(
-                    "multipart-only",
-                    r#","spec":{"openapi":"3.0.0","paths":{"/upload":{"post":{
-                        "operationId":"up",
-                        "requestBody":{"content":{"multipart/form-data":{}}}}}}}"#,
-                )
-                .as_bytes(),
-                2,
-            ),
-            raw(
-                "/aisix/mcp_servers/bad-header",
-                server(
-                    "bad-header",
-                    r#","api_key_header":"X Key","spec":{"paths":{"/a":{"get":{}}}}"#,
-                )
-                .as_bytes(),
-                3,
-            ),
-            raw(
-                "/aisix/mcp_servers/collisions",
-                server(
-                    "collisions",
-                    r#","spec":{"paths":{
-                        "/a":{"get":{"operationId":"foo/list"}},
-                        "/b":{"get":{"operationId":"foo.list"}}}}"#,
-                )
-                .as_bytes(),
-                4,
-            ),
-        ];
-        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
-        assert_eq!(stats.accepted, 1, "{:?}", stats.rejections);
-        assert_eq!(stats.schema_rejected, 3);
-        assert!(snap.mcp_servers.get_by_id("collisions").is_some());
-        assert_eq!(snap.mcp_servers.len(), 1);
-
-        let reason = |key: &str| {
-            stats
-                .rejections
-                .iter()
-                .find(|r| r.key == key)
-                .map(|r| (r.kind, r.error.as_str()))
-                .unwrap_or_else(|| panic!("{key} not rejected: {:?}", stats.rejections))
-        };
-        let (kind, err) = reason("/aisix/mcp_servers/no-paths");
-        assert_eq!(kind, RejectionKind::SchemaFailed);
-        assert!(err.contains("no `paths` object"), "{err}");
-        let (_, err) = reason("/aisix/mcp_servers/multipart-only");
-        assert!(err.contains("no operations that can become tools"), "{err}");
-        assert!(err.contains("POST /upload"), "{err}");
-        reason("/aisix/mcp_servers/bad-header");
     }
 
     #[test]

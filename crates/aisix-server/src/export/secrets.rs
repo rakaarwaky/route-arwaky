@@ -2,7 +2,7 @@
 //!
 //! Stored resource documents hold live upstream credentials in the
 //! clear — a provider key's `api_key` and per-key request overrides, an
-//! MCP / A2A server's `secret`, a guardrail's moderation-service
+//! upstream route's credential, a guardrail's moderation-service
 //! `api_key` / `access_key_secret` / `secret_access_key`, an OTLP
 //! exporter's auth `headers`. The default export must never write any of
 //! these verbatim: each is replaced with an `${ENV_VAR}` placeholder the

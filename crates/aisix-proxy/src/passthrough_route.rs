@@ -53,7 +53,7 @@
 //!
 //! - [`entry`] — the proxy router's **fallback** handler. Path-prefix
 //!   routes match here, after every typed route has had its chance, so a
-//!   route can never shadow `/v1/*`, `/mcp`, or `/a2a`. A no-match request
+//!   route can never shadow `/v1/*`. A no-match request
 //!   keeps the pre-existing plain 404, `/passthrough/*` included — that
 //!   namespace is claimed by explicit routes like any other.
 //! - [`host_dispatch`] — a **pre-routing** middleware (after URL rewriting in
@@ -178,10 +178,7 @@ pub async fn host_dispatch(
 ) -> Response {
     let snapshot = state.snapshot.load();
     let path = req.uri().path();
-    let matched = has_host_match(&snapshot, inbound_host(&req).as_deref())
-        || (req.method() == axum::http::Method::POST
-            && crate::gemini::path(path).is_some()
-            && match_route(&snapshot, None, path).is_some());
+    let matched = has_host_match(&snapshot, inbound_host(&req).as_deref());
     drop(snapshot);
     if matched {
         use tower::ServiceExt;
@@ -644,7 +641,6 @@ async fn dispatch(
     let guardrail_ctx = aisix_guardrails::RequestContext {
         passthrough_route_id: route_id,
         model_id: "",
-        mcp_server_id: "",
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
@@ -870,7 +866,7 @@ async fn dispatch(
     // so a relayed copy is a request-framing bug waiting for the first
     // body this route rewrites.
     //
-    // The exact-name rule is per ROUTE here. `/v1/*` and MCP read the
+    // The exact-name rule is per ROUTE here. `/v1/*` reads the
     // caller's credential out of `authorization` or `x-api-key`, both on
     // the shared list, but a route names its own slots: under `auth_mode:
     // header_key` the gateway credential arrives in `auth_header_name`,
@@ -2958,8 +2954,8 @@ fn append_responses_item_strings(
     ];
     // Opaque handles and ciphertext are never scan text, matching the typed
     // `/v1/responses` scan: `call_id` / `approval_request_id` on every item,
-    // the `id` of a tool call, tool result, item reference, MCP approval
-    // request or reasoning item, and a reasoning item's `encrypted_content`.
+    // the `id` of a tool call, tool result, item reference, approval request
+    // or reasoning item, and a reasoning item's `encrypted_content`.
     let kind = raw_top_level_unique_type(item_body).ok().flatten();
     let kind = kind.as_deref().unwrap_or_default();
     let mut excluded = text_keys.to_vec();
@@ -2968,7 +2964,7 @@ fn append_responses_item_strings(
         || kind.ends_with("_call_output")
         || matches!(
             kind,
-            "item_reference" | "mcp_approval_request" | "reasoning"
+            "item_reference" | "reasoning"
         )
     {
         excluded.push("id");
@@ -3345,7 +3341,7 @@ fn responses_direct_stream_event(kind: &str) -> Option<ResponsesDirectStreamEven
             fields: &["refusal"],
             content_index: true,
         }),
-        "response.function_call_arguments.delta" | "response.mcp_call_arguments.delta" => {
+        "response.function_call_arguments.delta" => {
             Some(ResponsesDirectStreamEvent {
                 fields: &["delta"],
                 content_index: false,
@@ -3353,10 +3349,6 @@ fn responses_direct_stream_event(kind: &str) -> Option<ResponsesDirectStreamEven
         }
         "response.function_call_arguments.done" => Some(ResponsesDirectStreamEvent {
             fields: &["name", "arguments"],
-            content_index: false,
-        }),
-        "response.mcp_call_arguments.done" => Some(ResponsesDirectStreamEvent {
-            fields: &["arguments"],
             content_index: false,
         }),
         "response.custom_tool_call_input.delta" => Some(ResponsesDirectStreamEvent {
@@ -3440,7 +3432,7 @@ fn append_responses_output_item_strings(out: &mut String, item: &RawJson<'_>) ->
                 append_responses_visible_content_strings(out, &content)?;
             }
         }
-        Some("function_call" | "mcp_call") => {
+        Some("function_call") => {
             for key in ["name", "arguments"] {
                 append_raw_top_level_strings(out, item_body, key)?;
             }
@@ -3781,7 +3773,7 @@ fn buffered_usage(
     }
     let stats = match wire {
         Metering::Chat => return v.get("usage").and_then(openai_chat_usage),
-        Metering::Anthropic => crate::messages::anthropic_usage_stats(v),
+        Metering::Anthropic => None,
         Metering::Completions => crate::completions::completion_usage_stats(v),
         Metering::Responses => crate::responses::response_usage_stats(v),
         Metering::Embeddings => crate::embeddings::embedding_usage_stats(v),
@@ -5883,10 +5875,11 @@ fn frame_parts_and_tier(
             labelled = agent_token_usage(&v);
         }
         let report = match metering {
-            Metering::Chat | Metering::Anthropic => {
-                match crate::messages::anthropic_stream_usage_stats(&v) {
-                    Some(stats) => Some(PassthroughUsage::from_stats(&stats)),
-                    None => v.get("usage").and_then(openai_chat_usage),
+            Metering::Chat => {
+                if v.get("usage").is_some() {
+                    v.get("usage").and_then(openai_chat_usage).map(PassthroughUsage::from_stats)
+                } else {
+                    None
                 }
             }
             Metering::Completions => crate::completions::completion_usage_stats(&v)
@@ -5958,9 +5951,16 @@ fn guardrail_error_frame(
     unavailable: Option<&str>,
 ) -> Bytes {
     if anthropic {
-        return Bytes::from(crate::messages::guardrail_block_frame(
-            guardrail_name,
-            unavailable,
+        return Bytes::from(format!(
+            "event: error\ndata: {}\n\n",
+            serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": crate::error::anthropic_guardrail_code(unavailable),
+                    "message": crate::error::guardrail_block_message("response", guardrail_name, unavailable),
+                }
+            })
         ));
     }
     Bytes::from(format!(
@@ -7327,8 +7327,8 @@ impl RouteTelemetry {
             upstream_ttft_ms: self.upstream_ttft_ms,
             // Streaming reports the caller's wait to the FIRST relayed
             // frame, per the field's contract — a relay is a delivery
-            // mechanism for a response, not the response itself, so it is
-            // not the `/a2a` exception. Absent when a stream delivered
+            // mechanism for a response, not the response itself. Absent
+            // when a stream delivered
             // nothing. The buffered path has no first frame: there the
             // caller waited for the whole response to be written.
             downstream_latency_ms: if self.streaming {
@@ -7514,7 +7514,6 @@ fn emit_access_log(
         routing_fallback_count: None,
         error_kind,
         error: error.filter(|e| !e.is_empty()),
-        mcp: None,
         cache: None,
         request_body_bytes: None,
         response_body_bytes: None,
@@ -8140,19 +8139,19 @@ mod tests {
 
         // A preserve_host route narrowed by a prefix relays the WHOLE path:
         // the prefix is a match condition on an upstream that owns its own
-        // path space, not a gateway mount point. GitHub Copilot's CLI needs
-        // this — its MCP server answers on /mcp/readonly of the same host it
-        // serves chat from, and a stripped "/readonly" 404s.
+        // path space, not a gateway mount point. An upstream that answers on
+        // /tools/readonly of the same host it serves chat from needs this —
+        // a stripped "/readonly" 404s.
         mk(
             "r-mirror",
             serde_json::json!({
-                "name":"mirror","hosts":["m.example"],"path_prefix":"/mcp",
+                "name":"mirror","hosts":["m.example"],"path_prefix":"/tools",
                 "preserve_host":true,"credential_mode":"forward_client"
             }),
         );
-        let m = match_route(&snap, Some("m.example"), "/mcp/readonly").unwrap();
+        let m = match_route(&snap, Some("m.example"), "/tools/readonly").unwrap();
         assert_eq!(m.entry.value.name, "mirror");
-        assert_eq!(m.remainder, "/mcp/readonly");
+        assert_eq!(m.remainder, "/tools/readonly");
         assert!(
             !m.prefix_matched,
             "a mirrored path is never version-deduped"
@@ -8900,8 +8899,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
                     "summary": [{"type": "summary_text", "text": "SUMMARYSECRET"}],
                     "content": [{"type": "reasoning_text", "text": "REASONINGSECRET"}]
                 },
-                {"type": "function_call_output", "call_id": "c1", "output": "TOOLRESULTSECRET"},
-                {"type": "mcp_approval_response", "approve": true, "reason": "APPROVALSECRET"}
+                {"type": "function_call_output", "call_id": "c1", "output": "TOOLRESULTSECRET"}
             ]
         })
         .to_string();
@@ -8910,13 +8908,12 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
         assert!(scanned.contains("VISIBLE"), "got {scanned:?}");
         assert!(scanned.contains("REASONINGSECRET"), "got {scanned:?}");
         assert!(scanned.contains("SUMMARYSECRET"), "got {scanned:?}");
-        // The tool-result and approval slots too. These matter precisely
-        // because the items beside them yield text: the raw-body fallback
+        // The tool-result slot too. It matters precisely
+        // because the items beside it yield text: the raw-body fallback
         // fires only on a WHOLLY empty extraction, so a mixed body would
-        // otherwise carry them past the scan while `/v1/responses` blocks
+        // otherwise carry it past the scan while `/v1/responses` blocks
         // the same envelope.
         assert!(scanned.contains("TOOLRESULTSECRET"), "got {scanned:?}");
-        assert!(scanned.contains("APPROVALSECRET"), "got {scanned:?}");
 
         let response = serde_json::json!({
             "output": [
@@ -8970,14 +8967,11 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
                 {"type": "function_call", "id": "fc_ITEMID", "call_id": "call_RESPID",
                  "name": "lookup", "arguments": "{\"q\":\"RESPARGS\"}"},
                 {"type": "function_call_output", "id": "fco_OUTID", "call_id": "call_RESPID",
+                 "approval_request_id": "resp_APPROVALID",
                  "output": "RESPRESULT"},
                 {"type": "custom_tool_call", "id": "ctc_CUSTOMID", "call_id": "call_CUSTOMCALLID",
                  "name": "apply_patch", "input": "CUSTOMINPUT"},
                 {"type": "item_reference", "id": "fc_REFID"},
-                {"type": "mcp_approval_request", "id": "mcpr_APPROVALID", "server_label": "srv",
-                 "name": "mcp_tool", "arguments": "{}"},
-                {"type": "mcp_approval_response", "approval_request_id": "mcpr_APPROVALID",
-                 "approve": true, "reason": "APPROVEREASON"},
                 {"type": "reasoning", "id": "rs_REASONID", "encrypted_content": "CIPHERTEXT",
                  "summary": [{"type": "summary_text", "text": "REASONSUMMARY"}]}
             ]
@@ -9568,12 +9562,11 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
 
     #[test]
     fn responses_output_guardrail_keeps_generated_media_opaque() {
-        let buffered = br#"{"output":[{"type":"image_generation_call","result":"BUFFERED_MEDIA_SENTINEL"},{"type":"message","content":[{"type":"output_text","text":"VISIBLE_TEXT_SENTINEL"}]},{"type":"function_call","name":"lookup","arguments":"{\"query\":\"TOOL_ARGUMENT_SENTINEL\"}"},{"type":"mcp_call","name":"mcp","arguments":"MCP_ARGUMENT_SENTINEL"},{"type":"custom_tool_call","name":"custom","input":"CUSTOM_INPUT_SENTINEL"}]}"#;
+        let buffered = br#"{"output":[{"type":"image_generation_call","result":"BUFFERED_MEDIA_SENTINEL"},{"type":"message","content":[{"type":"output_text","text":"VISIBLE_TEXT_SENTINEL"}]},{"type":"function_call","name":"lookup","arguments":"{\"query\":\"TOOL_ARGUMENT_SENTINEL\"}"},{"type":"custom_tool_call","name":"custom","input":"CUSTOM_INPUT_SENTINEL"}]}"#;
         let scanned = response_guardrail_text(PassthroughProtocol::OpenaiResponses, buffered);
         for expected in [
             "VISIBLE_TEXT_SENTINEL",
             "TOOL_ARGUMENT_SENTINEL",
-            "MCP_ARGUMENT_SENTINEL",
             "CUSTOM_INPUT_SENTINEL",
         ] {
             assert!(scanned.contains(expected), "{scanned:?}");
@@ -10483,7 +10476,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
                 br#"{"prompt":"def f(","suffix":"return"}"#,
                 PassthroughProtocol::OpenaiCompletions,
             ),
-            // MCP JSON-RPC relays as raw.
+            // A JSON-RPC envelope relays as raw.
             (
                 br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
                 PassthroughProtocol::Raw,

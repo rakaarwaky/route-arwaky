@@ -459,9 +459,7 @@ describe("an upstream's failure reads the same on every route that sends its own
     });
   const refusedHandshake = async (model: string) => (await refusal(model)).requestId;
 
-  const DECISION_QUESTIONS = [{ type: "predicate", name: "q", instructions: "i" }];
   const ROUTES: [string, string, (model: string) => RequestInit, "openai" | "cohere"][] = [
-    ["decisions", "/v1/decisions", (model) => json({ model, input: "hi", questions: DECISION_QUESTIONS }), "openai"],
     ["rerank", "/v1/rerank", (model) => json({ model, query: "q", documents: ["a"] }), "openai"],
     ["cohere rerank", "/v1/rerank", (model) => json({ model, query: "q", documents: ["a"] }), "cohere"],
     ["speech", "/v1/audio/speech", (model) => json({ model, input: "hi", voice: "alloy" }), "openai"],
@@ -697,16 +695,6 @@ describe("an upstream's failure reads the same on every route that sends its own
     });
   });
 
-  test("azure 4xx on messages keeps the upstream's text under its status-mapped type", async () => {
-    if (!etcdReachable) return;
-    const got = await send(
-      "/v1/messages",
-      json({ model: "azure-no-deployment", messages: [{ role: "user", content: "hi" }], max_tokens: 5 }),
-    );
-    expect(got.status).toBe(404);
-    expect(got.body.error).toEqual({ type: "not_found_error", message: AZURE_NO_DEPLOYMENT_TEXT });
-  });
-
   test("a top-level message is read out of the body too", async () => {
     if (!etcdReachable) return;
     const got = await send("/v1/rerank", json({ model: "cohere-top-level", query: "q", documents: ["a"] }));
@@ -724,15 +712,11 @@ describe("an upstream's failure reads the same on every route that sends its own
       ["completions", "/v1/completions", "openai", { prompt: "hi" }],
       ["embeddings", "/v1/embeddings", "openai", { input: "hi" }],
       ["image generations", "/v1/images/generations", "openai", { prompt: "hi" }],
-      ["messages", "/v1/messages", "openai", { messages, max_tokens: 5 }],
-      ["native messages", "/v1/messages", "anthropic", { messages, max_tokens: 5 }],
-      ["count_tokens", "/v1/messages/count_tokens", "anthropic", { messages }],
       ["bridged responses", "/v1/responses", "anthropic", { input: "hi" }],
       ["native responses", "/v1/responses", "openai", { input: "hi" }],
       ["rerank", "/v1/rerank", "openai", { query: "q", documents: ["a"] }],
       ["speech", "/v1/audio/speech", "openai", { input: "hi", voice: "alloy" }],
       ["videos", "/v1/videos", "openai", { prompt: "hi" }],
-      ["decisions", "/v1/decisions", "openai", { input: "hi", questions: DECISION_QUESTIONS }],
     ] as const)("%s reads its text", async (_what, path, provider, payload) => {
       if (!etcdReachable) return;
       const got = await send(path, json({ model: `${provider}-${shape}`, ...payload }));
@@ -741,23 +725,6 @@ describe("an upstream's failure reads the same on every route that sends its own
         `upstream returned HTTP 400: ${TEXT} other shape`,
       );
     });
-  });
-
-  test("decisions: a body past the error-body cap answers what chat answers", async () => {
-    if (!etcdReachable) return;
-    const chat = await send(
-      "/v1/chat/completions",
-      json({ model: "openai-past-the-cap", messages }),
-    );
-    const got = await send(
-      "/v1/decisions",
-      json({ model: "openai-past-the-cap", input: "hi", questions: DECISION_QUESTIONS }),
-    );
-    expect(got.status).toBe(chat.status);
-    expect(got.body).toEqual(chat.body);
-    expect(await rowMessage(got.requestId, "the capped row")).toBe(
-      await rowMessage(chat.requestId, "chat's capped row"),
-    );
   });
 
   describe("videos", () => {

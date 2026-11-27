@@ -14,28 +14,6 @@
         }
       ]
     },
-    "AutoPromptCaching": {
-      "additionalProperties": false,
-      "description": "Automatic prompt-cache breakpoint injection for a Claude model — on the Anthropic API, on Amazon Bedrock, or on Vertex AI. When enabled, the gateway adds cache-control markers to chat completions and responses requests that carry none of their own, so callers get provider-side prompt-cache discounts without changing their requests. Requests that already set their own cache-control markers are forwarded unchanged. Other models ignore it.",
-      "properties": {
-        "enabled": {
-          "description": "Whether automatic prompt-cache injection is active for this model.",
-          "type": "boolean"
-        },
-        "ttl": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/CacheTtl"
-            }
-          ],
-          "description": "Cache lifetime for injected breakpoints: `5m` (default when omitted) or `1h`. A `1h` cache write costs 2x the base input rate versus 1.25x for `5m`, so it pays off only when the cached prefix is reused across a longer session. Some Claude models on Amazon Bedrock accept only the 5-minute cache, and Bedrock rejects a request to such a model that asks for `1h`."
-        }
-      },
-      "required": [
-        "enabled"
-      ],
-      "type": "object"
-    },
     "BackgroundModelCheck": {
       "additionalProperties": false,
       "properties": {
@@ -92,33 +70,6 @@
         "timeout_seconds"
       ],
       "type": "object"
-    },
-    "CacheTtl": {
-      "description": "Cache lifetime for gateway-injected prompt-cache breakpoints.",
-      "enum": [
-        "5m",
-        "1h"
-      ],
-      "type": "string"
-    },
-    "ClassifierType": {
-      "description": "Hosted decision model a semantic router can use in place of embeddings.",
-      "oneOf": [
-        {
-          "description": "TypeSafe's jev decision model.",
-          "enum": [
-            "jev"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "Gemini Decision via the Gemini Developer API.",
-          "enum": [
-            "gemini_decision"
-          ],
-          "type": "string"
-        }
-      ]
     },
     "CooldownConfig": {
       "additionalProperties": false,
@@ -791,74 +742,15 @@
           ]
         },
         {
-          "else": {
-            "allOf": [
-              {
-                "anyOf": [
-                  {
-                    "properties": {
-                      "embedding_model": {
-                        "type": "string"
-                      }
-                    },
-                    "required": [
-                      "embedding_model"
-                    ]
-                  },
-                  {
-                    "properties": {
-                      "embedding_model_id": {
-                        "type": "string"
-                      }
-                    },
-                    "required": [
-                      "embedding_model_id"
-                    ]
-                  }
-                ]
-              }
-            ],
-            "properties": {
-              "match": {
-                "type": "object"
-              },
-              "routes": {
-                "items": {
-                  "required": [
-                    "examples"
-                  ]
-                }
-              }
-            },
-            "required": [
-              "match"
-            ]
-          },
-          "if": {
-            "properties": {
-              "classifier": {
-                "type": "object"
-              }
-            },
-            "required": [
-              "classifier"
-            ]
-          },
-          "then": {
-            "if": {
-              "properties": {
-                "classifier": {
-                  "properties": {
-                    "type": {
-                      "const": "gemini_decision"
-                    }
-                  }
-                }
-              }
-            },
-            "not": {
+          "allOf": [
+            {
               "anyOf": [
                 {
+                  "properties": {
+                    "embedding_model": {
+                      "type": "string"
+                    }
+                  },
                   "required": [
                     "embedding_model"
                   ]
@@ -872,85 +764,36 @@
                   "required": [
                     "embedding_model_id"
                   ]
-                },
-                {
-                  "required": [
-                    "embedding_timeout_ms"
-                  ]
-                },
-                {
-                  "required": [
-                    "on_embedding_failure"
-                  ]
-                },
-                {
-                  "required": [
-                    "match"
-                  ]
                 }
               ]
+            }
+          ],
+          "properties": {
+            "match": {
+              "type": "object"
             },
-            "properties": {
-              "routes": {
-                "items": {
-                  "not": {
-                    "anyOf": [
-                      {
-                        "required": [
-                          "examples"
-                        ]
-                      },
-                      {
-                        "required": [
-                          "threshold"
-                        ]
-                      }
-                    ]
-                  },
-                  "required": [
-                    "description"
-                  ]
-                }
-              }
-            },
-            "then": {
-              "properties": {
-                "classifier": {
-                  "properties": {
-                    "model_id": {
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "model_id"
-                  ]
-                },
-                "routes": {
-                  "maxItems": 254,
-                  "minItems": 2
-                }
+            "routes": {
+              "items": {
+                "required": [
+                  "examples"
+                ]
               }
             }
-          }
+          },
+          "required": [
+            "match"
+          ]
         }
       ],
       "description": "Semantic-routing config: pick a target by request meaning.",
       "properties": {
-        "classifier": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/SemanticClassifier"
-            }
-          ],
-          "description": "Route selection by a hosted decision model instead of embeddings. When set, `embedding_model`, `embedding_model_id`, `embedding_timeout_ms`, `on_embedding_failure` and `match` are not accepted, every route needs a `description` and takes no `examples` or `threshold`. When omitted, routes are matched by embedding similarity."
-        },
         "default": {
-          "description": "Alias of the direct model or model group used when no route meets its embedding similarity threshold or classifier confidence falls below `min_confidence`. The router can also use this target when the selected route's target is unavailable. Read only when `default_id` is absent.",
+          "description": "Alias of the direct model or model group used when no route meets its embedding similarity threshold. The router can also use this target when the selected route's target is unavailable. Read only when `default_id` is absent.",
           "minLength": 1,
           "type": "string"
         },
         "default_id": {
-          "description": "Resource id of the direct model or model group used when no route meets its embedding similarity threshold or classifier confidence falls below `min_confidence`. The router can also use this target when the selected route's target is unavailable. Present, it is authoritative and `default` is ignored, so renaming that model keeps this router pointing at it with no edit to this document.",
+          "description": "Resource id of the direct model or model group used when no route meets its embedding similarity threshold. The router can also use this target when the selected route's target is unavailable. Present, it is authoritative and `default` is ignored, so renaming that model keeps this router pointing at it with no edit to this document.",
           "minLength": 1,
           "type": [
             "string",
@@ -958,7 +801,7 @@
           ]
         },
         "embedding_model": {
-          "description": "Alias of an `embedding`-modality Model used to embed the request and, lazily on the first request that needs them, the route examples. Read only when `embedding_model_id` is absent. Required, under this name or as `embedding_model_id`, when there is no `classifier`.",
+          "description": "Alias of an `embedding`-modality Model used to embed the request and, lazily on the first request that needs them, the route examples. Read only when `embedding_model_id` is absent.",
           "minLength": 1,
           "type": "string"
         },
@@ -982,7 +825,7 @@
               "$ref": "#/definitions/SemanticMatch"
             }
           ],
-          "description": "Shared matching parameters (metric, aggregation, default threshold). Required when there is no `classifier`."
+          "description": "Shared matching parameters (metric, aggregation, default threshold)."
         },
         "on_embedding_failure": {
           "allOf": [
@@ -993,7 +836,7 @@
           "description": "Behavior when the embedding call fails or times out. Defaults to routing to `default`."
         },
         "routes": {
-          "description": "Routes evaluated for each request. At least one is required. `gemini_decision` requires 2 to 254 routes.",
+          "description": "Routes evaluated for each request. At least one is required.",
           "items": {
             "$ref": "#/definitions/SemanticRoute"
           },
@@ -1006,97 +849,11 @@
               "$ref": "#/definitions/SemanticSessionAffinity"
             }
           ],
-          "description": "Session affinity, for either decision mode. When omitted, every request is classified."
+          "description": "Session affinity. When omitted, every request is scored."
         }
       },
       "required": [
         "routes"
-      ],
-      "type": "object"
-    },
-    "SemanticClassifier": {
-      "additionalProperties": false,
-      "allOf": [
-        {
-          "anyOf": [
-            {
-              "properties": {
-                "provider_key_id": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "provider_key_id"
-              ]
-            },
-            {
-              "properties": {
-                "model_id": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "model_id"
-              ]
-            }
-          ]
-        }
-      ],
-      "description": "Route selection by a hosted decision model. For each request the newest user text (reminder blocks removed) is sent to the model together with every route's `name` and `description`, and the model picks one route. A request goes to the picked route's target, or to the router's `default` when the model's confidence in its pick is below `min_confidence`. To catch requests that fit none of the routes, configure a route for them.",
-      "properties": {
-        "min_confidence": {
-          "default": 0.5,
-          "description": "Lowest confidence at which the picked route is used. A decision below it sends the request to `default`.",
-          "format": "double",
-          "maximum": 1.0,
-          "minimum": 0.0,
-          "type": "number"
-        },
-        "model": {
-          "default": "jev-latest",
-          "description": "Inline decision model name for `jev`, read only when `model_id` is absent.",
-          "minLength": 1,
-          "type": "string"
-        },
-        "model_id": {
-          "description": "Resource ID of the direct classifier model. `jev` uses a `typesafe` Provider Key. `gemini_decision` requires this ID and a `google` model with `model_name: gemini-decision-1`, a non-wildcard alias, and a `google` Provider Key. Decision calls use the referenced model and its Provider Key's API key, `api_base`, body overrides, and headers. When the reference cannot be resolved, the router applies `on_failure`.",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "on_failure": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/OnEmbeddingFailure"
-            }
-          ],
-          "description": "Behavior when the decision call fails, times out, or returns an answer that names no route. Same values as `on_embedding_failure`."
-        },
-        "provider_key_id": {
-          "description": "Inline Provider Key for `jev`, required when `model_id` is absent. Its `provider` must be `typesafe`. The model uses its API key as a bearer token and its `api_base` when configured.",
-          "minLength": 1,
-          "type": "string"
-        },
-        "timeout_ms": {
-          "default": 3000,
-          "description": "Deadline for the decision call, in milliseconds.",
-          "format": "uint64",
-          "minimum": 1.0,
-          "type": "integer"
-        },
-        "type": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/ClassifierType"
-            }
-          ],
-          "description": "Decision model family, `jev` or `gemini_decision`."
-        }
-      },
-      "required": [
-        "type"
       ],
       "type": "object"
     },
@@ -1163,15 +920,15 @@
           ]
         }
       ],
-      "description": "A named route and its target model or model group. Embedding routers match requests against the route's `examples`. A configured `classifier` uses the route's `description` to choose among routes.",
+      "description": "A named route and its target model or model group. Matching is on the route's `examples`.",
       "properties": {
         "description": {
-          "description": "What requests this route handles. With a `classifier`, this is the text the decision model reads to pick the route, and it is required. Without one, it is documentation only: routes are matched on `examples`.",
+          "description": "What requests this route handles. Documentation only: routes are matched on `examples`.",
           "minLength": 1,
           "type": "string"
         },
         "examples": {
-          "description": "Example utterances that define this route. AISIX caches their vectors lazily. A cold route request passes its prompt and every distinct uncached example text as one logical embedding batch. Providers without batch support may issue multiple upstream calls (Bedrock Titan does). Required, with at least one example, when the router has no `classifier`; not accepted when it has one.",
+          "description": "Example utterances that define this route. AISIX caches their vectors lazily. A cold route request passes its prompt and every distinct uncached example text as one logical embedding batch. Providers without batch support may issue multiple upstream calls. Required, with at least one example.",
           "items": {
             "minLength": 1,
             "type": "string"
@@ -1198,7 +955,7 @@
           ]
         },
         "threshold": {
-          "description": "Per-route similarity threshold. A request matches this route only when its aggregated score is `>=` this value. When omitted, the router-level threshold applies. Not accepted with a `classifier`.",
+          "description": "Per-route similarity threshold. A request matches this route only when its aggregated score is `>=` this value. When omitted, the router-level threshold applies.",
           "format": "float",
           "maximum": 1.0,
           "minimum": 0.0,
@@ -1300,9 +1057,7 @@
             ]
           },
           {
-            "required": [
-              "auto_prompt_caching"
-            ]
+            "required": []
           },
           {
             "required": [
@@ -1416,9 +1171,7 @@
             ]
           },
           {
-            "required": [
-              "auto_prompt_caching"
-            ]
+            "required": []
           },
           {
             "required": [
@@ -1485,9 +1238,7 @@
             ]
           },
           {
-            "required": [
-              "auto_prompt_caching"
-            ]
+            "required": []
           },
           {
             "required": [
@@ -1519,14 +1270,6 @@
         "type": "string"
       },
       "type": "array"
-    },
-    "auto_prompt_caching": {
-      "allOf": [
-        {
-          "$ref": "#/definitions/AutoPromptCaching"
-        }
-      ],
-      "description": "Automatic prompt-cache breakpoint injection for Claude models on the Anthropic API, Amazon Bedrock and Vertex AI. Omit to leave injection off."
     },
     "background_model_check": {
       "allOf": [
@@ -1565,7 +1308,7 @@
           "null"
         ]
       },
-      "description": "Direct-model-only mapping from a client-requested reasoning effort to the value sent upstream. After resolving the final target the gateway looks the requested effort up once — the exact entry first, then the `*` entry — and never looks the result up again. A requested value that matches neither is sent unchanged.\n\nThree entries are reserved. The empty-string key matches a request that sets no effort at all, meaning the effort field is absent, `null`, or empty, and its value is added to the outbound request. The `*` key matches any other present value that has no entry of its own, and never matches a request that sets no effort. A `null` value removes the effort field from the outbound request so the provider's own default applies; mapping `*` to `null` therefore strips the effort from every request whose value has no entry of its own. The empty-string key may not be mapped to `null`, because a request that sets no effort has nothing to remove, and no entry may be mapped to an empty value.\n\nOn the Anthropic messages and token-counting endpoints only `output_config.effort` is read and rewritten. A `thinking` block is not an effort setting for this mapping, so a request that carries `thinking` but no `output_config.effort` sets no effort and the empty-string entry applies to it. When such a request is dispatched to a provider that does not accept the Anthropic protocol, the upstream reasoning effort is derived from the mapped `output_config.effort` when one is present and from `thinking` otherwise, except that an entry that removed the effort sends no effort at all. A request that sets `thinking.type: disabled` is never given an effort by this mapping: on the Anthropic protocol no entry writes a tier to it, though an entry that removes the effort still removes it, and on any other protocol it always sends the `none` effort.\n\nClaude families that reject `output_config.effort` (Haiku 4.5, Sonnet 4.5 and earlier) are the exception on those two endpoints when the model speaks the Anthropic protocol: an effort the empty-string entry would add to a request that sets none becomes `thinking: {type: enabled, budget_tokens}` instead (minimal and low 1024, medium 2048, high 4096, xhigh 8192, max 16384). The budget stays below the request's `max_tokens`, a request on the messages endpoint without `max_tokens` is sent the budget plus 4096, and a `max_tokens` of 1024 or less gets no thinking. A request that already carries a `thinking` block is sent as written, so the empty-string entry has no effect on it for these families, and a value with no budget is not sent at all.",
+      "description": "Direct-model-only mapping from a client-requested reasoning effort to the value sent upstream. After resolving the final target the gateway looks the requested effort up once — the exact entry first, then the `*` entry — and never looks the result up again. A requested value that matches neither is sent unchanged.\n\nThree entries are reserved. The empty-string key matches a request that sets no effort at all, meaning the effort field is absent, `null`, or empty, and its value is added to the outbound request. The `*` key matches any other present value that has no entry of its own, and never matches a request that sets no effort. A `null` value removes the effort field from the outbound request so the provider's own default applies; mapping `*` to `null` therefore strips the effort from every request whose value has no entry of its own. The empty-string key may not be mapped to `null`, because a request that sets no effort has nothing to remove, and no entry may be mapped to an empty value.",
       "properties": {
         "": {
           "description": "The entry for a request that sets no reasoning effort. Its value is sent upstream in place of the missing one, and may not be `null` — a request that sets no effort has no field to remove.",
@@ -1642,7 +1385,7 @@
           "$ref": "#/definitions/Semantic"
         }
       ],
-      "description": "Semantic-routing configuration. With `classifier`, a hosted decision model uses each route's `description` to pick a route. When `classifier` is omitted, the gateway compares the request embedding with route `examples` and picks the best match that meets its similarity threshold. The router can fall back to its default target when the selected route's target is unavailable."
+      "description": "Semantic-routing configuration. The gateway compares the request embedding with route `examples` and picks the best match that meets its similarity threshold. The router can fall back to its default target when the selected route's target is unavailable."
     },
     "stream_timeout": {
       "description": "Maximum gap in milliseconds between upstream streaming chunks. `0` or absent falls back to the group's `stream_timeout`, then to the model's (or group's) `timeout`, then to the deployment-wide `upstream.stream_timeout_ms` / `timeout_ms` defaults.",

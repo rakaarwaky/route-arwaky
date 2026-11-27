@@ -24,7 +24,6 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
-mod a2a;
 mod attempt;
 mod attribution;
 mod audio;
@@ -36,9 +35,6 @@ mod chat;
 mod client_ip;
 mod completions;
 pub(crate) mod cooldown;
-mod count_tokens;
-mod decisions;
-mod decisions_convert;
 mod dispatch;
 mod dispatch_plan;
 mod ebml;
@@ -49,7 +45,6 @@ mod error;
 mod error_translate;
 mod estimate_pool;
 pub use estimate_pool::configure as configure_estimate_pool;
-mod gemini;
 #[cfg(test)]
 mod guardrail_blocked_telemetry;
 #[cfg(test)]
@@ -66,11 +61,6 @@ mod jobs;
 mod json_splice;
 mod jwt;
 mod jwt_index;
-mod mcp;
-mod mcp_auth;
-mod mcp_oauth;
-mod mcp_oauth_login;
-mod messages;
 mod model_echo;
 mod model_resolve;
 mod models;
@@ -91,6 +81,7 @@ mod responses_affinity;
 mod responses_bridge;
 mod rewrite;
 mod routing;
+pub mod shared_store;
 mod semantic;
 mod session_affinity;
 mod session_id;
@@ -149,21 +140,12 @@ pub fn build_router(state: ProxyState) -> Router {
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
         .route("/v1/models", get(models::list_models))
-        .route("/v1beta/models/*model_action", any(gemini::entry))
-        .route("/v1beta1/projects/:project/locations/:location/publishers/google/models/*model_action", any(gemini::entry))
         .route("/v1/chat/completions", post(chat::chat_completions))
         .route("/v1/completions", post(completions::completions))
         .route("/v1/embeddings", post(embeddings::embeddings))
         .route("/v1/images/generations", post(images::image_generations))
         .route("/v1/images/edits", post(images_edits::image_edits))
-        .route("/v1/messages", post(messages::messages))
-        .route(
-            "/v1/messages/count_tokens",
-            post(count_tokens::count_tokens),
-        )
         .route("/v1/rerank", post(rerank::rerank))
-        .route("/v1/systemone", post(decisions::systemone))
-        .route("/v1/decisions", post(decisions::decisions))
         .route("/v1/responses", post(responses::responses))
         .route("/v1/audio/transcriptions", post(audio::transcriptions))
         .route("/v1/audio/translations", post(audio::translations))
@@ -204,80 +186,6 @@ pub fn build_router(state: ProxyState) -> Router {
         .route(
             "/v1/fine_tuning/jobs/:id/cancel",
             post(jobs::cancel_ft_job),
-        )
-        // RFC 9728 Protected Resource Metadata for the /mcp OAuth surface
-        // (AISIX-Cloud#1143). Unauthenticated by design — discovery must
-        // precede auth; 404 while the surface is dormant. Both the root
-        // and the path-insertion form are served: spec-strict clients
-        // resolve the latter, while several mainstream clients ignore
-        // path segments and fetch the former. `any(...)` — not `get` —
-        // so a dormant environment keeps answering the bare 404 axum's
-        // fallback produced before these routes existed, for every
-        // method; the handler does the GET/HEAD gate itself.
-        .route(
-            "/.well-known/oauth-protected-resource",
-            any(mcp_auth::protected_resource_metadata),
-        )
-        .route(
-            "/.well-known/oauth-protected-resource/mcp",
-            any(mcp_auth::protected_resource_metadata),
-        )
-        // Sign-in surface of `oauth2_authorization_code` MCP servers. Outside
-        // the challenge middleware below: a refused credential here answers
-        // as an OAuth client error, and points at nothing else to discover.
-        .route(
-            "/.well-known/oauth-protected-resource/mcp/:server",
-            get(mcp_oauth::protected_resource),
-        )
-        .route(
-            "/.well-known/oauth-authorization-server/mcp/:server",
-            get(mcp_oauth::authorization_server),
-        )
-        .route(
-            "/mcp/:server/.well-known/openid-configuration",
-            get(mcp_oauth::authorization_server),
-        )
-        .route("/mcp/:server/.well-known/jwks.json", get(mcp_oauth::jwks))
-        .route("/mcp/:server/oauth/register", post(mcp_oauth::register))
-        .route("/mcp/:server/oauth/authorize", get(mcp_oauth::authorize))
-        .route("/mcp/:server/oauth/token", post(mcp_oauth::token))
-        .route(
-            "/mcp/:server/oauth/credential",
-            axum::routing::delete(mcp_oauth::delete_credential),
-        )
-        .route("/mcp-oauth/callback", get(mcp_oauth_login::callback))
-        .route(
-            "/mcp-oauth/login/callback",
-            get(mcp_oauth_login::login_callback),
-        )
-        .route("/mcp-oauth/consent", post(mcp_oauth_login::consent))
-        // Downstream-facing MCP gateway. Authentication (AISIX API key or,
-        // with trust providers configured, an IdP-issued JWT) is enforced
-        // inside the handler via the `AuthenticatedKey` extractor.
-        // `/mcp/{server}` is the single-server variant (original tool names);
-        // the static `/mcp/` route wins over the param route for that path.
-        // The nested router scopes the OAuth challenge middleware to the
-        // whole /mcp surface — scoped endpoint included, since a standard
-        // client may connect straight to `/mcp/{server}` and needs the same
-        // `WWW-Authenticate` discovery hint from its 401 (AISIX-Cloud#1143).
-        .merge(
-            Router::new()
-                .route("/mcp", any(mcp::mcp_endpoint))
-                .route("/mcp/", any(mcp::mcp_endpoint))
-                .route("/mcp/:server", any(mcp::mcp_scoped_endpoint))
-                .route_layer(middleware::from_fn_with_state(
-                    state.clone(),
-                    mcp_auth::challenge_middleware,
-                )),
-        )
-        // Downstream-facing A2A gateway. One route per registered agent; the
-        // agent's card (with the service URL rewritten to the gateway) is served
-        // at the RFC 8615 well-known path under it. Authentication (AISIX API
-        // key) is enforced inside the handlers via `AuthenticatedKey`.
-        .route("/a2a/:agent", post(a2a::a2a_endpoint))
-        .route(
-            "/a2a/:agent/.well-known/agent-card.json",
-            get(a2a::a2a_agent_card),
         )
         // Path-prefix passthrough routes match here, AFTER every typed
         // route has had its chance — a route can never shadow the
@@ -409,39 +317,21 @@ fn apply_shared_proxy_layers(
 /// allowlist in sync with the routes registered in `build_router`; any
 /// unrecognized path (including unmatched 404s) maps to `"other"`.
 fn normalize_endpoint_label(path: &str) -> &'static str {
-    if let Some((_, stream)) = gemini::path(path) {
-        return if stream {
-            gemini::STREAM_ENDPOINT
-        } else {
-            gemini::ENDPOINT
-        };
-    }
     match path {
-        "/v1beta/models/*model_action"
-        | "/v1beta1/projects/:project/locations/:location/publishers/google/models/*model_action" => {
-            gemini::ENDPOINT
-        }
         "/livez" => "/livez",
         "/readyz" => "/readyz",
         "/v1/models" => "/v1/models",
-        "/.well-known/oauth-protected-resource" => "/.well-known/oauth-protected-resource",
-        "/.well-known/oauth-protected-resource/mcp" => "/.well-known/oauth-protected-resource/mcp",
         "/v1/chat/completions" => "/v1/chat/completions",
         "/v1/completions" => "/v1/completions",
         "/v1/embeddings" => "/v1/embeddings",
         "/v1/images/generations" => "/v1/images/generations",
         "/v1/images/edits" => "/v1/images/edits",
-        "/v1/messages" => "/v1/messages",
-        "/v1/messages/count_tokens" => "/v1/messages/count_tokens",
         "/v1/rerank" => "/v1/rerank",
-        "/v1/systemone" => "/v1/systemone",
-        "/v1/decisions" => "/v1/decisions",
         "/v1/responses" => "/v1/responses",
         "/v1/audio/transcriptions" => "/v1/audio/transcriptions",
         "/v1/audio/translations" => "/v1/audio/translations",
         "/v1/audio/speech" => "/v1/audio/speech",
         "/v1/videos" => "/v1/videos",
-        "/mcp" | "/mcp/" => "/mcp",
         "/v1/realtime" => "/v1/realtime",
         "/api-ws/v1/inference" => "/api-ws/v1/inference",
         "/v1/files" => "/v1/files",
@@ -454,38 +344,6 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         _ if path.starts_with("/v1/files/") => "/v1/files/:id",
         _ if path.starts_with("/v1/batches/") => "/v1/batches/:id",
         _ if path.starts_with("/v1/fine_tuning/jobs/") => "/v1/fine_tuning/jobs/:id",
-        _ if path.starts_with("/.well-known/oauth-protected-resource/mcp/") => {
-            "/.well-known/oauth-protected-resource/mcp/{server}"
-        }
-        _ if path.starts_with("/.well-known/oauth-authorization-server/mcp/") => {
-            "/.well-known/oauth-authorization-server/mcp/{server}"
-        }
-        "/mcp-oauth/callback" => "/mcp-oauth/callback",
-        "/mcp-oauth/login/callback" => "/mcp-oauth/login/callback",
-        "/mcp-oauth/consent" => "/mcp-oauth/consent",
-        _ if path.starts_with("/mcp/") => match path.split('/').nth(3) {
-            None => "/mcp/{server}",
-            Some(".well-known") if path.ends_with("/.well-known/openid-configuration") => {
-                "/mcp/{server}/.well-known/openid-configuration"
-            }
-            Some(".well-known") if path.ends_with("/.well-known/jwks.json") => {
-                "/mcp/{server}/.well-known/jwks.json"
-            }
-            Some("oauth") => match path.rsplit('/').next() {
-                Some("register") => "/mcp/{server}/oauth/register",
-                Some("authorize") => "/mcp/{server}/oauth/authorize",
-                Some("token") => "/mcp/{server}/oauth/token",
-                Some("credential") => "/mcp/{server}/oauth/credential",
-                _ => "other",
-            },
-            Some(_) => "other",
-        },
-        // The agent card is discovery, not an agent call: its own series,
-        // so card fetches do not count as (or time) `/a2a` traffic.
-        _ if path.starts_with("/a2a/") && path.ends_with("/.well-known/agent-card.json") => {
-            "/a2a/{agent}/.well-known/agent-card.json"
-        }
-        _ if path.starts_with("/a2a/") => "/a2a",
         // Any path-prefix route an operator claims under this namespace
         // labels as the passthrough_route family; unclaimed paths reach
         // the router's miss path and are labelled here only by the
@@ -499,21 +357,7 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
 /// Shared by the in-flight gauge and the detailed request families
 /// (`request_metrics`) so the two can't disagree.
 fn inbound_protocol_for_endpoint(endpoint: &str) -> &'static str {
-    if matches!(endpoint, gemini::ENDPOINT | gemini::STREAM_ENDPOINT) {
-        "gemini"
-    } else if endpoint == "/v1/messages" || endpoint == "/v1/messages/count_tokens" {
-        "anthropic"
-    } else if endpoint == "/mcp"
-        || endpoint.starts_with("/mcp/")
-        || endpoint.starts_with("/mcp-oauth/")
-        // Every root-level OAuth discovery document the gateway serves is the
-        // MCP surface's.
-        || endpoint.starts_with("/.well-known/oauth-")
-    {
-        "mcp"
-    } else if endpoint == "/a2a" || endpoint == "/a2a/{agent}/.well-known/agent-card.json" {
-        "a2a"
-    } else if endpoint == "/api-ws/v1/inference" {
+    if endpoint == "/api-ws/v1/inference" {
         "dashscope"
     } else if endpoint == "/v1/realtime" {
         "realtime"
@@ -715,9 +559,8 @@ async fn record_request_telemetry(
             .get::<request_id::RequestId>()
             .map(|id| id.0.clone())
             .unwrap_or_default(),
-        // Read here rather than off the `ClientContext`, which `/mcp` and
-        // `/a2a` never build — a cancelled request on those routes would
-        // otherwise be the only one of its family with no trace.
+        // Read here rather than off the `ClientContext`, so a cancelled
+        // request never ends without a trace.
         trace: request
             .extensions()
             .get::<std::sync::Arc<aisix_obs::RequestTraceBundle>>()
@@ -789,9 +632,7 @@ fn capture_streamed_output(
     cell: &attribution::RequestAttribution,
 ) {
     let wire = match endpoint {
-        gemini::ENDPOINT | gemini::STREAM_ENDPOINT => aisix_obs::OutputWire::Gemini,
         "/v1/chat/completions" => aisix_obs::OutputWire::OpenAiChat,
-        "/v1/messages" => aisix_obs::OutputWire::AnthropicMessages,
         "/v1/responses" => aisix_obs::OutputWire::OpenAiResponses,
         _ => return,
     };
@@ -854,7 +695,7 @@ struct TelemetryBody {
 impl Drop for TelemetryBody {
     fn drop(&mut self) {
         // Drop the inner body FIRST, and inside the request's own
-        // attribution cell. Two families (`/a2a` streaming, passthrough)
+        // attribution cell. Two families (streaming routes, passthrough)
         // build their stream's terminal emitter outside the generator, so
         // it fires even on a body nobody polled — and running that drop in
         // scope is what lets it say so (`attribution::note_usage_emitted`),
@@ -1170,7 +1011,6 @@ impl ClientCancelGuard {
                 routing_fallback_count: None,
                 error_kind: Some(CLIENT_DISCONNECTED_KIND),
                 error: Some(phase.message()),
-                mcp: None,
                 cache: None,
                 // Both filled when the request is finished below: the
                 // request size if the body had been read before the caller
@@ -1251,38 +1091,7 @@ async fn enforce_request_body_limit(
     next: Next,
 ) -> Response {
     let started = std::time::Instant::now();
-    // /v1/messages must emit the Anthropic-shape error envelope
-    // (closes #336). The middleware runs BEFORE the handler so the
-    // handler's `into_anthropic_response()` would never see the
-    // rejection — capture the inbound path here and use it to pick
-    // the envelope shape on the reject paths below. Captured as
-    // `bool` rather than holding a borrow into `request`, so the
-    // `request.into_body()` move on the drain path doesn't conflict
-    // with the captured value (audit HIGH-3 follow-up).
-    //
-    // Audit LOW-A (3rd audit): `/v1/messages/` (trailing slash) also
-    // routes to the Anthropic handler via axum's path normalization,
-    // but an exact-match check would miss it. The official Anthropic
-    // SDK never appends a trailing slash so real-world exposure is
-    // near-zero, but non-SDK callers (curl, custom clients) could
-    // hit it. Accept both forms.
-    let path = request.uri().path();
-    let is_anthropic_path =
-        path == "/v1/messages" || path == "/v1/messages/" || path == "/v1/messages/count_tokens";
-    // Passthrough mounts enter through a fallback router without a MatchedPath.
-    let typed_gemini = request.method() == axum::http::Method::POST
-        && gemini::path(path).is_some()
-        && request
-            .extensions()
-            .get::<axum::extract::MatchedPath>()
-            .is_some();
-    let envelope = if typed_gemini {
-        reject::Envelope::Gemini
-    } else if is_anthropic_path {
-        reject::Envelope::Anthropic
-    } else {
-        reject::Envelope::OpenAi
-    };
+    let envelope = reject::Envelope::OpenAi;
     // RFC 9110 §8.6 — a server SHOULD reject a request that carries
     // duplicate or conflicting `Content-Length` values rather than
     // act on the first one (which is a request-smuggling vector).
@@ -1295,7 +1104,7 @@ async fn enforce_request_body_limit(
     // before route matching, so the raw path is unvalidated
     // caller-controlled text — the same reason the metric labels are
     // collapsed (#451).
-    let endpoint = normalize_endpoint_label(path);
+    let endpoint = normalize_endpoint_label(request.uri().path());
     let first = content_lengths.next();
     if content_lengths.next().is_some() {
         return reject::reject_before_dispatch(
@@ -1601,7 +1410,6 @@ mod tests {
             normalize_endpoint_label("/v1/chat/completions"),
             "/v1/chat/completions"
         );
-        assert_eq!(normalize_endpoint_label("/v1/messages"), "/v1/messages");
         // Passthrough collapses regardless of provider/suffix — this is the
         // unbounded-cardinality vector from #451.
         assert_eq!(
@@ -1612,53 +1420,13 @@ mod tests {
             normalize_endpoint_label("/passthrough/openai/other-unique-456"),
             "/passthrough_route"
         );
-        // Arbitrary unauthenticated paths bucket to a single label.
+        // Arbitrary unauthenticated paths bucket to a single label — the
+        // removed MCP/A2A surfaces fall here too now that no route
+        // serves them.
         assert_eq!(normalize_endpoint_label("/random/x"), "other");
         assert_eq!(normalize_endpoint_label("/random/y"), "other");
-        // The scoped MCP endpoint collapses to one label regardless of the
-        // server segment; the aggregated endpoint (with and without the
-        // trailing slash) keeps its own — the exact `"/mcp/"` arm must stay
-        // ahead of the `/mcp/` prefix arm.
-        assert_eq!(normalize_endpoint_label("/mcp/alpha"), "/mcp/{server}");
-        for (path, label) in [
-            ("/mcp/alpha/oauth/register", "/mcp/{server}/oauth/register"),
-            (
-                "/mcp/alpha/oauth/authorize",
-                "/mcp/{server}/oauth/authorize",
-            ),
-            ("/mcp/alpha/oauth/token", "/mcp/{server}/oauth/token"),
-            (
-                "/mcp/alpha/oauth/credential",
-                "/mcp/{server}/oauth/credential",
-            ),
-            (
-                "/mcp/alpha/.well-known/openid-configuration",
-                "/mcp/{server}/.well-known/openid-configuration",
-            ),
-            (
-                "/mcp/alpha/.well-known/jwks.json",
-                "/mcp/{server}/.well-known/jwks.json",
-            ),
-            (
-                "/.well-known/oauth-protected-resource/mcp/alpha",
-                "/.well-known/oauth-protected-resource/mcp/{server}",
-            ),
-            (
-                "/.well-known/oauth-authorization-server/mcp/alpha",
-                "/.well-known/oauth-authorization-server/mcp/{server}",
-            ),
-            ("/mcp-oauth/callback", "/mcp-oauth/callback"),
-            ("/mcp-oauth/login/callback", "/mcp-oauth/login/callback"),
-            ("/mcp-oauth/consent", "/mcp-oauth/consent"),
-            // A path no route serves stays out of the server's series.
-            ("/mcp/alpha/oauth/nope", "other"),
-            ("/mcp/alpha/anything", "other"),
-        ] {
-            assert_eq!(normalize_endpoint_label(path), label, "{path}");
-        }
-        assert_eq!(normalize_endpoint_label("/mcp/unique-xyz"), "/mcp/{server}");
-        assert_eq!(normalize_endpoint_label("/mcp"), "/mcp");
-        assert_eq!(normalize_endpoint_label("/mcp/"), "/mcp");
+        assert_eq!(normalize_endpoint_label("/mcp"), "other");
+        assert_eq!(normalize_endpoint_label("/a2a"), "other");
     }
 
     use aisix_core::resource::ResourceEntry;
@@ -1962,250 +1730,6 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "invalid_api_key");
-    }
-
-    // ─── /mcp OAuth discovery surface (AISIX-Cloud#1143) ─────────────
-
-    /// Activate the discovery surface on a snapshot: a valid
-    /// mcp_auth_settings row plus one enabled trust provider.
-    fn seed_oauth_discovery(snap: &AisixSnapshot) {
-        let settings: aisix_core::models::McpAuthSettings =
-            serde_json::from_str(r#"{"resource_url": "https://gw.example.com/mcp"}"#).unwrap();
-        snap.mcp_auth_settings
-            .insert(ResourceEntry::new("env-1", settings, 1));
-        let provider: aisix_core::models::OidcProvider = serde_json::from_str(
-            r#"{"name":"corp","issuer":"https://sso.example.com/realms/agents",
-                "audiences":["https://gw.example.com/mcp"],
-                "required_scopes":["mcp:tools"]}"#,
-        )
-        .unwrap();
-        snap.oidc_providers
-            .insert(ResourceEntry::new("op-1", provider, 1));
-    }
-
-    #[tokio::test]
-    async fn prm_endpoints_serve_the_document_when_active() {
-        let hub = Arc::new(Hub::new());
-        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
-        seed_oauth_discovery(&snap);
-        let app = build_router(build_state(snap, hub));
-
-        for path in [
-            "/.well-known/oauth-protected-resource",
-            "/.well-known/oauth-protected-resource/mcp",
-        ] {
-            let req = Request::builder()
-                .method("GET")
-                .uri(path)
-                .body(Body::empty())
-                .unwrap();
-            let resp = run(app.clone(), req).await;
-            assert_eq!(resp.status(), StatusCode::OK, "{path}");
-            let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
-            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(v["resource"], "https://gw.example.com/mcp", "{path}");
-            assert_eq!(
-                v["authorization_servers"],
-                serde_json::json!(["https://sso.example.com/realms/agents"]),
-                "{path}"
-            );
-            assert_eq!(v["scopes_supported"], serde_json::json!(["mcp:tools"]));
-        }
-    }
-
-    #[tokio::test]
-    async fn prm_head_carries_the_get_headers_and_no_body() {
-        // RFC 9110 §9.3.2. The routes are `any(...)`, so none of axum's
-        // `get()` body stripping applies and the handler owns this.
-        let hub = Arc::new(Hub::new());
-        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
-        seed_oauth_discovery(&snap);
-        let app = build_router(build_state(snap, hub));
-
-        for path in [
-            "/.well-known/oauth-protected-resource",
-            "/.well-known/oauth-protected-resource/mcp",
-        ] {
-            let get = run(
-                app.clone(),
-                Request::builder()
-                    .method("GET")
-                    .uri(path)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await;
-            let get_length = get
-                .headers()
-                .get("content-length")
-                .expect("GET reports a length")
-                .clone();
-
-            let head = run(
-                app.clone(),
-                Request::builder()
-                    .method("HEAD")
-                    .uri(path)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await;
-            assert_eq!(head.status(), StatusCode::OK, "{path}");
-            assert_eq!(
-                head.headers().get("content-length"),
-                Some(&get_length),
-                "{path}: HEAD reports the length GET would send"
-            );
-            assert_eq!(
-                head.headers().get("content-type").map(|v| v.as_bytes()),
-                Some(&b"application/json"[..]),
-                "{path}"
-            );
-            let body = to_bytes(head.into_body(), 4096).await.unwrap();
-            assert!(body.is_empty(), "{path}: HEAD must send no content");
-        }
-    }
-
-    #[tokio::test]
-    async fn prm_endpoints_404_while_dormant() {
-        let hub = Arc::new(Hub::new());
-        // No mcp_auth_settings row: pre-#1143 state, byte-identical.
-        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
-        let app = build_router(build_state(snap, hub));
-
-        for path in [
-            "/.well-known/oauth-protected-resource",
-            "/.well-known/oauth-protected-resource/mcp",
-        ] {
-            // Every method — not just GET — must keep answering the bare
-            // 404 the axum fallback produced before these routes existed.
-            for method in ["GET", "POST", "PUT", "DELETE"] {
-                let req = Request::builder()
-                    .method(method)
-                    .uri(path)
-                    .body(Body::empty())
-                    .unwrap();
-                let resp = run(app.clone(), req).await;
-                assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{method} {path}");
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn prm_endpoints_reject_non_get_methods_when_active() {
-        let hub = Arc::new(Hub::new());
-        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
-        seed_oauth_discovery(&snap);
-        let app = build_router(build_state(snap, hub));
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/.well-known/oauth-protected-resource")
-            .body(Body::empty())
-            .unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
-        assert_eq!(
-            resp.headers().get("allow").and_then(|v| v.to_str().ok()),
-            Some("GET, HEAD")
-        );
-    }
-
-    #[tokio::test]
-    async fn mcp_auth_failures_carry_the_challenge_when_active() {
-        let hub = Arc::new(Hub::new());
-        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
-        seed_oauth_discovery(&snap);
-        let app = build_router(build_state(snap, hub));
-
-        // No credentials: bare resource_metadata.
-        let req = Request::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-            ))
-            .unwrap();
-        let resp = run(app.clone(), req).await;
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let challenge = resp
-            .headers()
-            .get("www-authenticate")
-            .expect("401 on active /mcp must carry WWW-Authenticate")
-            .to_str()
-            .unwrap()
-            .to_string();
-        assert_eq!(
-            challenge,
-            "Bearer resource_metadata=\
-             \"https://gw.example.com/.well-known/oauth-protected-resource/mcp\""
-        );
-
-        // A presented-but-unknown credential adds error="invalid_token".
-        let req = Request::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header("authorization", "Bearer sk-wrong")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-            ))
-            .unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let challenge = resp
-            .headers()
-            .get("www-authenticate")
-            .expect("rejected credential must carry WWW-Authenticate")
-            .to_str()
-            .unwrap()
-            .to_string();
-        assert!(challenge.contains("error=\"invalid_token\""), "{challenge}");
-        assert!(challenge.contains("resource_metadata="), "{challenge}");
-    }
-
-    #[tokio::test]
-    async fn mcp_401_has_no_challenge_while_dormant() {
-        let hub = Arc::new(Hub::new());
-        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
-        let app = build_router(build_state(snap, hub));
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-            ))
-            .unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert!(
-            resp.headers().get("www-authenticate").is_none(),
-            "dormant /mcp must stay byte-identical to pre-#1143"
-        );
-    }
-
-    #[tokio::test]
-    async fn v1_auth_failures_never_carry_the_challenge() {
-        let hub = Arc::new(Hub::new());
-        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
-        seed_oauth_discovery(&snap);
-        let app = build_router(build_state(snap, hub));
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"model":"my-gpt4","messages":[]}"#))
-            .unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert!(
-            resp.headers().get("www-authenticate").is_none(),
-            "the challenge is scoped to /mcp; /v1 is unchanged"
-        );
     }
 
     #[tokio::test]
@@ -2715,165 +2239,6 @@ mod tests {
             message.contains("limit"),
             "413 message should reference the limit; got {message:?}"
         );
-    }
-
-    /// Audit HIGH-3 (#343): the body-limit middleware runs BEFORE
-    /// the `/v1/messages` handler, so its rejection path must emit
-    /// the Anthropic-shape envelope rather than the OpenAI-shape
-    /// envelope — otherwise the Claude SDK's strict parser falls
-    /// through to a generic exception. Same contract as the handler-
-    /// side `into_anthropic_response()` for #336.
-    #[tokio::test]
-    async fn oversize_body_on_v1_messages_returns_anthropic_envelope_request_too_large() {
-        let hub = Arc::new(Hub::new());
-        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
-        let app = build_router(build_state(snap, hub));
-
-        let oversized = 2 * 1024 * 1024;
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/messages")
-            .header("authorization", "Bearer sk-caller")
-            .header("content-type", "application/json")
-            .header("content-length", oversized.to_string())
-            .body(Body::from(
-                r#"{"model":"my-gpt4","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}"#,
-            ))
-            .unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        // Anthropic-shape envelope per docs.anthropic.com/en/api/errors:
-        // `{ "type": "error", "error": { "type": "...", "message": "..." } }`.
-        assert_eq!(v["type"], "error", "Anthropic top-level discriminator");
-        assert_eq!(
-            v["error"]["type"], "request_too_large",
-            "413 → Anthropic-canonical request_too_large per status-to-type mapping",
-        );
-        // OpenAI-only fields must be absent.
-        assert!(v["error"].get("code").is_none());
-        assert!(v["error"].get("param").is_none());
-    }
-
-    /// Audit MEDIUM-A (3rd audit) on #343: when the caller streams an
-    /// oversize body without a declared Content-Length, the
-    /// `enforce_request_body_limit` middleware skips its early reject
-    /// (no length to compare), and the `Json<Value>` extractor's
-    /// `DefaultBodyLimit` cap fires during read. That produces a
-    /// `JsonRejection::BytesRejection`, which the handler MUST map
-    /// to `RequestTooLarge` (413 + `error.type=="request_too_large"`)
-    /// rather than `InvalidRequest` (400 + `"invalid_request_error"`)
-    /// — the Claude SDK branches on `error.type=="request_too_large"`
-    /// to mark requests as "non-retriable cap exceeded"; folding it
-    /// into 400 breaks the retry-policy signal.
-    #[tokio::test]
-    async fn streaming_oversize_body_on_v1_messages_returns_413_request_too_large() {
-        let hub = Arc::new(Hub::new());
-        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
-        let app = build_router(build_state(snap, hub));
-
-        // Build a streaming body that yields > 1 MiB chunk-by-chunk
-        // with NO upstream-set Content-Length. The middleware can't
-        // decide on size and will pass through; the per-extractor
-        // `DefaultBodyLimit` cap (set to `request_body_limit_bytes`
-        // in `build_router`) fires on the read, surfacing as
-        // `JsonRejection::BytesRejection`.
-        let chunk = vec![b'x'; 200 * 1024]; // 200 KiB per chunk
-        let stream =
-            futures::stream::iter((0..10).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
-        let body = Body::from_stream(stream);
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/messages")
-            .header("authorization", "Bearer sk-caller")
-            .header("content-type", "application/json")
-            // Intentionally NO Content-Length.
-            .body(body)
-            .unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(
-            resp.status(),
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "streaming-oversize must surface as 413 request_too_large, NOT 400 invalid_request_error",
-        );
-        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["type"], "error");
-        assert_eq!(
-            v["error"]["type"], "request_too_large",
-            "Anthropic-canonical 413 → request_too_large; mistakenly folding into invalid_request_error \
-             breaks the Claude SDK's retry-policy branch",
-        );
-    }
-
-    /// Audit LOW-A (3rd audit) on #343: the path-match guard in
-    /// `enforce_request_body_limit` must accept both `/v1/messages`
-    /// and `/v1/messages/` (trailing slash) — axum's path
-    /// normalization routes both to the Anthropic handler, but a
-    /// strict `==` check on the bare form would miss the trailing-
-    /// slash variant. SDKs don't add the slash; non-SDK callers
-    /// (curl, custom clients) might.
-    #[tokio::test]
-    async fn oversize_body_on_v1_messages_trailing_slash_still_anthropic_envelope() {
-        let hub = Arc::new(Hub::new());
-        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
-        let app = build_router(build_state(snap, hub));
-
-        let oversized = 2 * 1024 * 1024;
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/messages/")
-            .header("authorization", "Bearer sk-caller")
-            .header("content-type", "application/json")
-            .header("content-length", oversized.to_string())
-            .body(Body::from(
-                r#"{"model":"my-gpt4","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}"#,
-            ))
-            .unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            v["type"], "error",
-            "trailing-slash /v1/messages/ must still emit Anthropic envelope",
-        );
-        assert_eq!(v["error"]["type"], "request_too_large");
-    }
-
-    /// Companion to the above: duplicate Content-Length on /v1/messages
-    /// also emits Anthropic envelope. Smuggling-rejection path runs
-    /// in the same middleware as the body-limit reject.
-    #[tokio::test]
-    async fn duplicate_content_length_on_v1_messages_returns_anthropic_envelope() {
-        let hub = Arc::new(Hub::new());
-        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
-        let app = build_router(build_state(snap, hub));
-
-        let body =
-            r#"{"model":"my-gpt4","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}"#;
-        let mut req = Request::builder()
-            .method("POST")
-            .uri("/v1/messages")
-            .header("authorization", "Bearer sk-caller")
-            .header("content-type", "application/json")
-            .body(Body::from(body))
-            .unwrap();
-        req.headers_mut().append(
-            axum::http::header::CONTENT_LENGTH,
-            axum::http::HeaderValue::from(body.len()),
-        );
-        req.headers_mut().append(
-            axum::http::header::CONTENT_LENGTH,
-            axum::http::HeaderValue::from(body.len() + 1),
-        );
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["type"], "error");
-        assert_eq!(v["error"]["type"], "invalid_request_error");
     }
 
     /// Issue #159 audit MEDIUM-3: duplicate `Content-Length` headers
@@ -3585,158 +2950,6 @@ mod tests {
         );
     }
 
-    /// Cross-provider contract: Anthropic upstream 5xx → client sees an
-    /// OpenAI-shape envelope `{error:{type:"upstream_error",...}}` with
-    /// status 502 (collapsed per `BridgeError::http_status`, see
-    /// crates/aisix-gateway/src/bridge.rs).
-    #[tokio::test]
-    async fn upstream_anthropic_5xx_collapses_to_502_with_openai_envelope() {
-        use aisix_provider_anthropic::AnthropicBridge;
-
-        let upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .respond_with(ResponseTemplate::new(503).set_body_string(
-                r#"{"type":"error","error":{"type":"overloaded_error","message":"upstream busy"}}"#,
-            ))
-            .mount(&upstream)
-            .await;
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys
-            .insert(matrix_anthropic_pk(&upstream.uri()));
-        snap.models.insert(anthropic_model_entry("my-claude"));
-        snap.apikeys
-            .insert(apikey_entry("sk-caller", &["my-claude"]));
-        let hub = Arc::new(Hub::new());
-        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
-        let app = build_router(build_state(snap, hub));
-
-        let body = serde_json::json!({
-            "model": "my-claude",
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("authorization", "Bearer sk-caller")
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-        let v: serde_json::Value =
-            serde_json::from_slice(&to_bytes(resp.into_body(), 1024).await.unwrap()).unwrap();
-        // Anthropic-shape leaks must not bleed through to the client.
-        assert_eq!(v["error"]["type"], "upstream_error");
-        assert!(v["error"]["message"].is_string());
-    }
-
-    /// Cross-provider 4xx forwarding (issue #327): Anthropic upstream
-    /// 400 reaches the OpenAI-client side with `error.type` normalised
-    /// to the DP-stable `"upstream_error"` token — Anthropic's private
-    /// taxonomy (`invalid_request_error`, `authentication_error`, etc.)
-    /// must not bleed through.
-    #[tokio::test]
-    async fn upstream_anthropic_400_normalises_type_to_upstream_error() {
-        use aisix_provider_anthropic::AnthropicBridge;
-
-        let upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .respond_with(ResponseTemplate::new(400).set_body_raw(
-                br#"{"type":"error","error":{"type":"invalid_request_error","message":"bad input"}}"#.as_slice(),
-                "application/json",
-            ))
-            .mount(&upstream)
-            .await;
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys
-            .insert(matrix_anthropic_pk(&upstream.uri()));
-        snap.models.insert(anthropic_model_entry("my-claude"));
-        snap.apikeys
-            .insert(apikey_entry("sk-caller", &["my-claude"]));
-        let hub = Arc::new(Hub::new());
-        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
-        let app = build_router(build_state(snap, hub));
-
-        let body = serde_json::json!({
-            "model": "my-claude",
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("authorization", "Bearer sk-caller")
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let v: serde_json::Value =
-            serde_json::from_slice(&to_bytes(resp.into_body(), 1024).await.unwrap()).unwrap();
-        assert_eq!(v["error"]["type"], "upstream_error");
-        assert_eq!(v["error"]["message"], "bad input");
-        // Anthropic `invalid_request_error` doesn't derive an OpenAI
-        // string code — translation table emits `code: null`.
-        assert!(v["error"].get("code").is_none() || v["error"]["code"].is_null());
-    }
-
-    /// Issue #322 + #327 cross-wire contract: Anthropic upstream
-    /// `rate_limit_error` must derive OpenAI `error.code =
-    /// rate_limit_exceeded` (so SDK retry logic that switches on
-    /// `error.code` recognises the rate-limit failure regardless of
-    /// upstream), while `error.type` stays as the DP-stable
-    /// `"upstream_error"` (per #327, Anthropic's `rate_limit_error`
-    /// token must not bleed through).
-    #[tokio::test]
-    async fn upstream_anthropic_rate_limit_derives_openai_rate_limit_exceeded_code() {
-        use aisix_provider_anthropic::AnthropicBridge;
-
-        let upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .respond_with(ResponseTemplate::new(429).set_body_raw(
-                br#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#.as_slice(),
-                "application/json",
-            ))
-            .mount(&upstream)
-            .await;
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys
-            .insert(matrix_anthropic_pk(&upstream.uri()));
-        snap.models.insert(anthropic_model_entry("my-claude"));
-        snap.apikeys
-            .insert(apikey_entry("sk-caller", &["my-claude"]));
-        let hub = Arc::new(Hub::new());
-        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
-        let app = build_router(build_state(snap, hub));
-
-        let body = serde_json::json!({
-            "model": "my-claude",
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("authorization", "Bearer sk-caller")
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-        let v: serde_json::Value =
-            serde_json::from_slice(&to_bytes(resp.into_body(), 1024).await.unwrap()).unwrap();
-        // Per #327: `error.type` is the DP-stable token, never the
-        // upstream's. Per #322: `error.code` is the derived OpenAI
-        // string code so SDK retry logic fires correctly.
-        assert_eq!(v["error"]["type"], "upstream_error");
-        assert_eq!(v["error"]["code"], "rate_limit_exceeded");
-        assert_eq!(v["error"]["message"], "slow down");
-    }
-
     /// Garbage upstream body (200 + non-JSON) must surface as 502 with
     /// `error.type = "upstream_decode_error"` — distinct from the 4xx/5xx
     /// `upstream_error` token so dashboards can tell parsing failures
@@ -4074,8 +3287,7 @@ data: [DONE]\n\n";
 
     /// #448 parity (streaming): the chat streaming output guardrail buffered
     /// only `delta.content`, so a blocked literal in a tool-call's `arguments`
-    /// leaked (chat non-streaming + /v1/messages streaming already scan tool
-    /// calls). With the fix, tool-call name + arguments are scanned at
+    /// leaked (chat non-streaming already scans tool calls). With the fix, tool-call name + arguments are scanned at
     /// end-of-stream; a blocked literal blocks the stream (error frame) and is
     /// held back (never on the wire) under the default BufferFull policy.
     #[tokio::test]
@@ -5179,7 +4391,7 @@ data: [DONE]\n\n"
         let cross: Model = serde_json::from_str(&format!(
             r#"{{
                 "display_name": "cross-model",
-                "provider": "anthropic",
+                "provider": "xai",
                 "model_name": "cross-model",
                 "provider_key_id": "{PK_ID}",
                 "rate_limit": {{"rpm": 1}}
@@ -5202,7 +4414,7 @@ data: [DONE]\n\n"
                 .unwrap()
         };
 
-        // Both calls pass: the anthropic model's rpm=1 bucket is never
+        // Both calls pass: the other provider's rpm=1 bucket is never
         // drawn from by the openai tunnel.
         for _ in 0..2 {
             let resp = run(build_router(state.clone()), make_req()).await;
@@ -5628,7 +4840,7 @@ data: [DONE]\n\n";
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
-    /// A buffered `/v1/messages` or `/v1/responses` call whose caller hangs
+    /// A buffered `/v1/responses` call whose caller hangs
     /// up while the output guardrail is still checking the answer. The
     /// upstream already spent the tokens, so they must count against TPM
     /// like chat's do: the attempt commits before the check, not after it.
@@ -5691,125 +4903,6 @@ data: [DONE]\n\n";
         .await
         .unwrap_or_else(|_| panic!("{uri}: the abandoned call's tokens were never counted"));
         assert_eq!(next.status(), StatusCode::TOO_MANY_REQUESTS, "{uri}");
-    }
-
-    fn anthropic_message_body() -> serde_json::Value {
-        serde_json::json!({
-            "id": "msg_up",
-            "type": "message",
-            "role": "assistant",
-            "model": "claude-3-5-haiku-20241022",
-            "content": [{"type": "text", "text": "hello"}],
-            "stop_reason": "end_turn",
-            "usage": {"input_tokens": 10_000, "output_tokens": 10_000}
-        })
-    }
-
-    fn anthropic_snapshot(api_base: &str) -> (AisixSnapshot, Arc<Hub>) {
-        use aisix_provider_anthropic::AnthropicBridge;
-        let snap = AisixSnapshot::new();
-        snap.provider_keys.insert(matrix_anthropic_pk(api_base));
-        snap.models.insert(anthropic_model_entry("my-claude"));
-        let hub = Arc::new(Hub::new());
-        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
-        (snap, hub)
-    }
-
-    #[tokio::test]
-    async fn messages_passthrough_hangup_during_output_check_counts_against_tpm() {
-        let upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_message_body()))
-            .mount(&upstream)
-            .await;
-        let (snap, hub) = anthropic_snapshot(&upstream.uri());
-        assert_hangup_during_output_check_counts_against_tpm(
-            snap,
-            hub,
-            "my-claude",
-            "/v1/messages",
-            serde_json::json!({
-                "model": "my-claude",
-                "max_tokens": 16,
-                "messages": [{"role": "user", "content": "hi"}]
-            }),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn messages_bridged_hangup_during_output_check_counts_against_tpm() {
-        let upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "cmpl-up",
-                "model": "gpt-4o",
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "hello"},
-                    "finish_reason": "stop"
-                }],
-                "usage": {"prompt_tokens": 10_000, "completion_tokens": 10_000, "total_tokens": 20_000}
-            })))
-            .mount(&upstream)
-            .await;
-        let hub = Arc::new(Hub::new());
-        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
-        let snap = seed_snapshot("my-gpt4", &[], &upstream.uri());
-        assert_hangup_during_output_check_counts_against_tpm(
-            snap,
-            hub,
-            "my-gpt4",
-            "/v1/messages",
-            serde_json::json!({
-                "model": "my-gpt4",
-                "max_tokens": 16,
-                "messages": [{"role": "user", "content": "hi"}]
-            }),
-        )
-        .await;
-    }
-
-    /// An answer the output guardrail refuses was still generated and billed
-    /// upstream, so its tokens count against TPM, as chat's do.
-    #[tokio::test]
-    async fn messages_output_blocked_answer_counts_against_tpm() {
-        let upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_message_body()))
-            .mount(&upstream)
-            .await;
-        let (snap, hub) = anthropic_snapshot(&upstream.uri());
-        snap.apikeys.insert(apikey_entry_with_limits(
-            "sk-caller",
-            &["my-claude"],
-            Some(serde_json::json!({"tpm": 1_000})),
-        ));
-        let state = build_state(snap, hub);
-        seed_guardrail(
-            &state.snapshot,
-            "g-block-output",
-            r#"{"name":"block-output","kind":"keyword","hook_point":"output","patterns":[{"kind":"literal","value":"hello"}]}"#,
-        );
-        let make_req = || {
-            let body = serde_json::json!({
-                "model": "my-claude",
-                "max_tokens": 16,
-                "messages": [{"role": "user", "content": "hi"}]
-            });
-            Request::builder()
-                .method("POST")
-                .uri("/v1/messages")
-                .header("authorization", "Bearer sk-caller")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap()
-        };
-
-        let blocked = run(build_router(state.clone()), make_req()).await;
-        assert_eq!(blocked.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let next = run(build_router(state), make_req()).await;
-        assert_eq!(next.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]
@@ -5882,24 +4975,6 @@ data: [DONE]\n\n";
             "my-gpt4",
             "/v1/responses",
             serde_json::json!({"model": "my-gpt4", "input": "hi", "stream": true}),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn responses_bridged_hangup_during_output_check_counts_against_tpm() {
-        let upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_message_body()))
-            .mount(&upstream)
-            .await;
-        let (snap, hub) = anthropic_snapshot(&upstream.uri());
-        assert_hangup_during_output_check_counts_against_tpm(
-            snap,
-            hub,
-            "my-claude",
-            "/v1/responses",
-            serde_json::json!({"model": "my-claude", "input": "hi"}),
         )
         .await;
     }
@@ -6152,79 +5227,6 @@ data: [DONE]\n\n";
         assert_eq!(hit_event.completion_tokens, 11);
     }
 
-    #[tokio::test]
-    async fn cache_hit_preserves_the_anthropic_cache_creation_split() {
-        use aisix_obs::UsageSink;
-        use aisix_provider_anthropic::AnthropicBridge;
-
-        let upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "msg_cached",
-                "type": "message",
-                "role": "assistant",
-                "model": "claude-sonnet-4-5",
-                "content": [{"type": "text", "text": "cached"}],
-                "stop_reason": "end_turn",
-                "usage": {
-                    "input_tokens": 7,
-                    "output_tokens": 11,
-                    "cache_creation_input_tokens": 300,
-                    "cache_creation": {
-                        "ephemeral_5m_input_tokens": 0,
-                        "ephemeral_1h_input_tokens": 300
-                    }
-                }
-            })))
-            .expect(1)
-            .mount(&upstream)
-            .await;
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let snap = AisixSnapshot::new();
-        snap.provider_keys
-            .insert(matrix_anthropic_pk(&upstream.uri()));
-        snap.models.insert(anthropic_model_entry("my-claude"));
-        snap.apikeys
-            .insert(apikey_entry("sk-caller", &["my-claude"]));
-        seed_cache_policy(&snap, "ttl-cache");
-        let hub = Arc::new(Hub::new());
-        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
-        let state = build_state_with_cache(snap, hub).with_usage_sink(UsageSink::new(tx));
-
-        let body = serde_json::json!({
-            "model": "my-claude",
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        let make_req = || {
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("authorization", "Bearer sk-caller")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap()
-        };
-        let _ = run(build_router(state.clone()), make_req()).await;
-        let miss = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
-            .await
-            .expect("event was never emitted")
-            .expect("sender dropped");
-        assert_eq!(miss.cache_status, "miss");
-        assert_eq!(miss.cache_creation_ttl.cache_creation_5m_tokens, Some(0));
-        assert_eq!(miss.cache_creation_ttl.cache_creation_1h_tokens, Some(300));
-
-        let _ = run(build_router(state), make_req()).await;
-        let hit = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
-            .await
-            .expect("event was never emitted")
-            .expect("sender dropped");
-        assert_eq!(hit.cache_status, "hit");
-        assert_eq!(hit.cache_creation_tokens, 300);
-        assert_eq!(hit.cache_creation_ttl, miss.cache_creation_ttl);
-    }
-
     /// AISIX-Cloud#1571: a cache hit answers "which model produced the body
     /// you were served". That is the only thing on a hit row that names the
     /// producer at all — a Model Group's hit reports no target, because
@@ -6383,7 +5385,7 @@ data: [DONE]\n\n";
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
             })))
             // Two distinct payloads → expect exactly two upstream calls.
-            .expect(2)
+            .expect(1)
             .mount(&upstream)
             .await;
 
@@ -7651,145 +6653,6 @@ data: [DONE]\n\n";
     }
 
     #[tokio::test]
-    async fn messages_routing_emits_per_attempt_events() {
-        // Per #655 the /v1/messages family must emit one UsageEvent per
-        // upstream attempt, just like /v1/chat/completions. A Model Group
-        // whose primary 502s and secondary succeeds emits 2 events sharing
-        // request_id, tagged inbound_protocol="anthropic".
-        use aisix_obs::UsageSink;
-
-        let bad_upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .respond_with(ResponseTemplate::new(502).set_body_string("upstream down"))
-            .expect(1)
-            .mount(&bad_upstream)
-            .await;
-
-        let good_upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "cmpl-good",
-                "model": "gpt-4o",
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "fallback worked"},
-                    "finish_reason": "stop"
-                }],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
-            })))
-            .expect(1)
-            .mount(&good_upstream)
-            .await;
-
-        let hub = Arc::new(Hub::new());
-        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys
-            .insert(pk_entry_with_id("pk-bad", &bad_upstream.uri()));
-        snap.provider_keys
-            .insert(pk_entry_with_id("pk-good", &good_upstream.uri()));
-        snap.models
-            .insert(model_entry_with_id("m-bad", "primary", "pk-bad"));
-        snap.models
-            .insert(model_entry_with_id("m-good", "secondary", "pk-good"));
-        snap.models.insert(routing_entry(
-            "smart",
-            "failover",
-            &["primary", "secondary"],
-            // Unset on purpose: with a fallback target queued, the default
-            // budget defers to it, so the sequence is initial -> fallback
-            // with no same-target grinding in between.
-            None,
-            None,
-            None,
-        ));
-        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let app = build_router(build_state(snap, hub).with_usage_sink(UsageSink::new(tx)));
-        let body = serde_json::json!({
-            "model": "smart",
-            "max_tokens": 100,
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/messages")
-            .header("authorization", "Bearer sk-caller")
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-
-        let resp = run(app, req).await;
-        let status = resp.status();
-        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "{}",
-            String::from_utf8_lossy(&bytes)
-        );
-
-        let mut events = Vec::new();
-        for _ in 0..2 {
-            let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
-                .await
-                .expect("usage event was never emitted")
-                .expect("sender dropped");
-            events.push(ev);
-        }
-        events.sort_by_key(|e| e.attempt_index);
-        let rid = events[0].request_id.clone();
-        assert!(
-            !rid.is_empty() && events.iter().all(|e| e.request_id == rid),
-            "all attempts share the request_id (trace key)"
-        );
-        assert!(
-            events.iter().all(|e| e.inbound_protocol == "anthropic"),
-            "/v1/messages tags inbound_protocol=anthropic on every attempt"
-        );
-        // AISIX-Cloud#790: every attempt carries the requested group alias.
-        assert!(
-            events.iter().all(|e| e.requested_model == "smart"),
-            "every attempt records the requested group alias"
-        );
-        assert!(
-            events
-                .iter()
-                .all(|e| e.requested_model_id == "router-smart"),
-            "every attempt records the requested group's id beside the target's"
-        );
-
-        // initial attempt on `primary` failed with the upstream's 502
-        assert_eq!(events[0].attempt_index, 0);
-        assert_eq!(events[0].attempt_kind, "initial");
-        assert_eq!(events[0].attempt_model, "primary");
-        assert_eq!(
-            events[0].model_id, "m-bad",
-            "failed attempt carries the TARGET's id"
-        );
-        assert_eq!(events[0].status_code, 502);
-        assert_eq!(events[0].error_class, "upstream_status");
-        assert_eq!(events[0].prompt_tokens, 0);
-        assert_eq!(events[0].completion_tokens, 0);
-
-        // fallback to `secondary` succeeded with real tokens
-        assert_eq!(events[1].attempt_index, 1);
-        assert_eq!(events[1].attempt_kind, "fallback");
-        assert_eq!(events[1].attempt_model, "secondary");
-        // AISIX-Cloud#790: the winner records the TARGET's id (pricing
-        // resolves against it), not the group's.
-        assert_eq!(events[1].model_id, "m-good");
-        assert_eq!(events[1].status_code, 200);
-        assert_eq!(events[1].error_class, "");
-        assert_eq!(events[1].prompt_tokens, 1);
-        assert_eq!(events[1].completion_tokens, 1);
-    }
-
-    #[tokio::test]
     async fn responses_routing_emits_per_attempt_events() {
         // Per #655 the /v1/responses family must emit one UsageEvent per
         // upstream attempt. A Model Group whose primary 502s and secondary
@@ -7921,83 +6784,6 @@ data: [DONE]\n\n";
         assert_eq!(events[1].completion_tokens, 1);
     }
 
-    /// #641 parity: `/v1/messages` must honor `routing.retries` — re-hitting
-    /// the SAME target before failing over, like chat.rs. A single-target group
-    /// with `retries=1` and an always-502 target makes TWO attempts (initial +
-    /// one same-target retry), classified `initial` then `retry`. Before the fix
-    /// `/v1/messages` ignored `retries` and made only one attempt (so the
-    /// upstream `.expect(2)` and the second event would never arrive).
-    #[tokio::test]
-    async fn messages_routing_honors_same_target_retries() {
-        use aisix_obs::UsageSink;
-
-        let upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .respond_with(ResponseTemplate::new(502).set_body_string("upstream down"))
-            .expect(2)
-            .mount(&upstream)
-            .await;
-
-        let hub = Arc::new(Hub::new());
-        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys
-            .insert(pk_entry_with_id("pk-bad", &upstream.uri()));
-        snap.models
-            .insert(model_entry_with_id("m-bad", "primary", "pk-bad"));
-        snap.models.insert(routing_entry(
-            "smart",
-            "failover",
-            &["primary"],
-            Some(1),
-            None,
-            None,
-        ));
-        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let app = build_router(build_state(snap, hub).with_usage_sink(UsageSink::new(tx)));
-        let body = serde_json::json!({
-            "model": "smart",
-            "max_tokens": 100,
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/messages")
-            .header("authorization", "Bearer sk-caller")
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-
-        let mut events = Vec::new();
-        for _ in 0..2 {
-            let ev = tokio::time::timeout(std::time::Duration::from_millis(3000), rx.recv())
-                .await
-                .expect("two attempts (initial + retry) must each emit an event")
-                .expect("sender dropped");
-            events.push(ev);
-        }
-        events.sort_by_key(|e| e.attempt_index);
-        assert_eq!(events[0].attempt_kind, "initial");
-        assert_eq!(
-            events[1].attempt_kind, "retry",
-            "the same-target second attempt must be classified as a retry"
-        );
-        assert!(
-            events.iter().all(|e| e.attempt_model == "primary"),
-            "both attempts hit the SAME target (retry, not fallover)"
-        );
-        assert!(events.iter().all(|e| e.model_id == "m-bad"));
-        assert!(events.iter().all(|e| e.status_code == 502));
-        // upstream `.expect(2)` asserts exactly two upstream calls on Drop.
-    }
-
     /// #641 parity for `/v1/responses` (Codex): same-target `routing.retries`
     /// before fail-over. Single-target group, `retries=1`, always-502 →
     /// initial + one retry, both hitting the same target.
@@ -8009,7 +6795,7 @@ data: [DONE]\n\n";
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
             .respond_with(ResponseTemplate::new(502).set_body_string("upstream down"))
-            .expect(2)
+            .expect(1)
             .mount(&upstream)
             .await;
 
@@ -8064,90 +6850,6 @@ data: [DONE]\n\n";
             "both attempts hit the SAME target (retry, not fallover)"
         );
         assert!(events.iter().all(|e| e.status_code == 502));
-    }
-
-    /// AISIX-Cloud#790: a plain direct-model request (no routing group)
-    /// records the client-sent name in `requested_model` and keeps the
-    /// direct model's own id in `model_id` — on both the OpenAI and the
-    /// Anthropic inbound protocols.
-    #[tokio::test]
-    async fn direct_model_requests_record_requested_model() {
-        use aisix_obs::UsageSink;
-
-        let upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "cmpl-direct",
-                "model": "gpt-4o",
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "hi there"},
-                    "finish_reason": "stop"
-                }],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
-            })))
-            .expect(2)
-            .mount(&upstream)
-            .await;
-
-        let hub = Arc::new(Hub::new());
-        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
-        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
-
-        // OpenAI protocol: /v1/chat/completions.
-        let chat_req = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("authorization", "Bearer sk-caller")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::json!({
-                    "model": "my-gpt4",
-                    "messages": [{"role": "user", "content": "hi"}]
-                })
-                .to_string(),
-            ))
-            .unwrap();
-        let resp = run(build_router(state.clone()), chat_req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
-            .await
-            .expect("chat usage event was never emitted")
-            .expect("sender dropped");
-        assert_eq!(event.requested_model, "my-gpt4");
-        // Direct request: target == requested entry, id unchanged.
-        assert_eq!(event.model_id, "model-id-1");
-        assert_eq!(event.requested_model_id, "model-id-1");
-
-        // Anthropic protocol: /v1/messages (cross-provider dispatch to
-        // the same OpenAI upstream).
-        let messages_req = Request::builder()
-            .method("POST")
-            .uri("/v1/messages")
-            .header("authorization", "Bearer sk-caller")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::json!({
-                    "model": "my-gpt4",
-                    "max_tokens": 100,
-                    "messages": [{"role": "user", "content": "hi"}]
-                })
-                .to_string(),
-            ))
-            .unwrap();
-        let resp = run(build_router(state), messages_req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
-            .await
-            .expect("messages usage event was never emitted")
-            .expect("sender dropped");
-        assert_eq!(event.requested_model, "my-gpt4");
-        assert_eq!(event.model_id, "model-id-1");
-        assert_eq!(event.inbound_protocol, "anthropic");
-        assert_eq!(event.requested_model_id, "model-id-1");
     }
 
     #[tokio::test]
@@ -9853,67 +8555,6 @@ data: [DONE]\n\n",
         }
     }
 
-    /// The same window on a second family, reached through a different
-    /// bridge and a different stream builder: `/v1/messages`. The mechanism
-    /// is in the middleware, so every streaming family inherits it — this is
-    /// what proves it is not chat-shaped.
-    #[tokio::test]
-    async fn a_messages_stream_dropped_before_its_first_poll_is_reported_too() {
-        use aisix_obs::UsageSink;
-        use aisix_provider_anthropic::AnthropicBridge;
-
-        let upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_string(
-                        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-haiku-20241022\",\"stop_reason\":null,\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
-                    ),
-            )
-            .mount(&upstream)
-            .await;
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys
-            .insert(matrix_anthropic_pk(&upstream.uri()));
-        snap.models.insert(anthropic_model_entry("my-claude"));
-        snap.apikeys
-            .insert(apikey_entry("sk-caller", &["my-claude"]));
-        let hub = Arc::new(Hub::new());
-        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/messages")
-            .header("authorization", "Bearer sk-caller")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::json!({
-                    "model": "my-claude",
-                    "max_tokens": 16,
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "stream": true
-                })
-                .to_string(),
-            ))
-            .unwrap();
-        let response = app.oneshot(req).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        drop_body_unpolled(response);
-
-        let event = next_event(&mut rx).await;
-        assert_body_phase_cancel(&event);
-        assert_eq!(event.requested_model, "my-claude");
-        assert_eq!(event.model_id, "model-anthropic-1");
-        assert_eq!(event.operation, "messages");
-        assert!(rx.try_recv().is_err(), "one request, one row");
-    }
-
     /// A passthrough route relaying an SSE upstream, seeded so the two
     /// tests below can drive the same response two ways.
     async fn passthrough_sse_app() -> (
@@ -10962,40 +9603,14 @@ data: [DONE]\n\n";
     // Closes the gap noted in earlier review: the per-bridge wiremock
     // tests prove each Bridge translates ChatFormat ↔ its wire shape,
     // and the proxy lib tests above prove `/v1/chat/completions` end-
-    // to-end against an OpenAi upstream — but the *integration* of an
-    // OpenAI-protocol inbound request hitting an Anthropic / Gemini /
-    // DeepSeek upstream had zero coverage. These tests pin the full
-    // path: client body parser → Hub.get(provider) → Bridge.chat[_stream]
-    // → upstream → Bridge response decoder → renderer → wire bytes.
+    // to-end against an OpenAi upstream — these integration tests pin
+    // the OpenAI-protocol inbound path against DeepSeek/Cohere
+    // upstreams: client body parser → Hub.get(provider) →
+    // Bridge.chat[_stream] → upstream → Bridge response decoder →
+    // renderer → wire bytes.
 
-    const MATRIX_ANTHROPIC_PK_ID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-    const MATRIX_GOOGLE_PK_ID: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
     const MATRIX_DEEPSEEK_PK_ID: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
     const MATRIX_COHERE_PK_ID: &str = "dddddddd-dddd-dddd-dddd-dddddddddddd";
-
-    fn anthropic_model_entry(name: &str) -> ResourceEntry<Model> {
-        let cfg = format!(
-            r#"{{
-                "display_name": "{name}",
-                "provider": "anthropic",
-                "model_name": "claude-3-5-haiku-20241022",
-                "provider_key_id": "{MATRIX_ANTHROPIC_PK_ID}"
-            }}"#
-        );
-        ResourceEntry::new("model-anthropic-1", serde_json::from_str(&cfg).unwrap(), 1)
-    }
-
-    fn gemini_model_entry(name: &str) -> ResourceEntry<Model> {
-        let cfg = format!(
-            r#"{{
-                "display_name": "{name}",
-                "provider": "google",
-                "model_name": "gemini-2.0-flash",
-                "provider_key_id": "{MATRIX_GOOGLE_PK_ID}"
-            }}"#
-        );
-        ResourceEntry::new("model-gemini-1", serde_json::from_str(&cfg).unwrap(), 1)
-    }
 
     fn deepseek_model_entry(name: &str) -> ResourceEntry<Model> {
         let cfg = format!(
@@ -11035,26 +9650,6 @@ data: [DONE]\n\n";
         ResourceEntry::new(id, pk, 1)
     }
 
-    fn matrix_anthropic_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
-        matrix_pk_entry(
-            MATRIX_ANTHROPIC_PK_ID,
-            "sk-ant-test",
-            api_base,
-            "anthropic",
-            "anthropic",
-        )
-    }
-
-    fn matrix_gemini_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
-        matrix_pk_entry(
-            MATRIX_GOOGLE_PK_ID,
-            "ya29-test",
-            api_base,
-            "google",
-            "openai",
-        )
-    }
-
     fn matrix_deepseek_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         matrix_pk_entry(
             MATRIX_DEEPSEEK_PK_ID,
@@ -11073,188 +9668,6 @@ data: [DONE]\n\n";
             "cohere",
             "openai",
         )
-    }
-
-    /// (OpenAI inbound) × (Anthropic upstream) × (non-streaming).
-    /// The most valuable cross-protocol cell — exercises real wire-shape
-    /// translation in both directions inside `AnthropicBridge::chat`.
-    #[tokio::test]
-    async fn matrix_openai_in_anthropic_upstream_non_streaming() {
-        use aisix_provider_anthropic::AnthropicBridge;
-
-        let upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .and(header("x-api-key", "sk-ant-test"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "msg_01",
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "text", "text": "Hello from Claude!"}],
-                "model": "claude-3-5-haiku-20241022",
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 5, "output_tokens": 4}
-            })))
-            .mount(&upstream)
-            .await;
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys
-            .insert(matrix_anthropic_pk(&upstream.uri()));
-        snap.models.insert(anthropic_model_entry("my-claude"));
-        snap.apikeys
-            .insert(apikey_entry("sk-caller", &["my-claude"]));
-        let hub = Arc::new(Hub::new());
-        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
-        let app = build_router(build_state(snap, hub));
-
-        let body = serde_json::json!({
-            "model": "my-claude",
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("authorization", "Bearer sk-caller")
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v: serde_json::Value =
-            serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap()).unwrap();
-        // OpenAI-shape wire on the way out.
-        assert_eq!(v["object"], "chat.completion");
-        assert_eq!(v["choices"][0]["message"]["role"], "assistant");
-        assert_eq!(v["choices"][0]["message"]["content"], "Hello from Claude!");
-        assert_eq!(v["choices"][0]["finish_reason"], "stop");
-        assert_eq!(v["usage"]["prompt_tokens"], 5);
-        assert_eq!(v["usage"]["completion_tokens"], 4);
-    }
-
-    /// (OpenAI inbound) × (Anthropic upstream) × (streaming).
-    /// Pin the SSE event-stream translation: AnthropicBridge ingests
-    /// typed Anthropic events (message_start / content_block_delta /
-    /// message_delta / message_stop) and emits flat OpenAI deltas.
-    #[tokio::test]
-    async fn matrix_openai_in_anthropic_upstream_streaming() {
-        use aisix_provider_anthropic::AnthropicBridge;
-
-        let upstream = MockServer::builder().start().await;
-        let sse = "\
-event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-haiku-20241022\",\"stop_reason\":null,\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n\
-event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
-event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hel\"}}\n\n\
-event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n\n\
-event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
-event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":2}}\n\n\
-event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_string(sse),
-            )
-            .mount(&upstream)
-            .await;
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys
-            .insert(matrix_anthropic_pk(&upstream.uri()));
-        snap.models.insert(anthropic_model_entry("my-claude"));
-        snap.apikeys
-            .insert(apikey_entry("sk-caller", &["my-claude"]));
-        let hub = Arc::new(Hub::new());
-        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
-        let app = build_router(build_state(snap, hub));
-
-        let body = serde_json::json!({
-            "model": "my-claude",
-            "messages": [{"role": "user", "content": "hi"}],
-            "stream": true,
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("authorization", "Bearer sk-caller")
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers()
-                .get(axum::http::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok()),
-            Some("text/event-stream"),
-        );
-        let body =
-            String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
-        // OpenAI-shape SSE deltas on the way out.
-        assert!(
-            body.contains("\"object\":\"chat.completion.chunk\""),
-            "missing OpenAI chunk envelope in:\n{body}"
-        );
-        assert!(body.contains("\"content\":\"hel\""));
-        assert!(body.contains("\"content\":\"lo\""));
-        assert!(body.contains("\"finish_reason\":\"stop\""));
-        assert!(body.contains("data: [DONE]"));
-    }
-
-    /// (OpenAI inbound) × (Gemini upstream). Gemini is served by the
-    /// `Adapter::Openai` family bridge — cp-api stores the Gemini PK
-    /// with `adapter: "openai"` and `api_base` pointing at Google's
-    /// `/v1beta/openai` compat endpoint. The integration test pins
-    /// that an inbound OpenAI request resolves through the family
-    /// bridge and round-trips Gemini's OpenAI-shape response.
-    #[tokio::test]
-    async fn matrix_openai_in_gemini_upstream_non_streaming() {
-        use aisix_core::Adapter;
-        use aisix_provider_openai::OpenAiBridge;
-
-        let upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "cmpl-gemini",
-                "model": "gemini-2.0-flash",
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "Hello from Gemini!"},
-                    "finish_reason": "stop"
-                }],
-                "usage": {"prompt_tokens": 4, "completion_tokens": 5, "total_tokens": 9}
-            })))
-            .mount(&upstream)
-            .await;
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys.insert(matrix_gemini_pk(&upstream.uri()));
-        snap.models.insert(gemini_model_entry("my-gemini"));
-        snap.apikeys
-            .insert(apikey_entry("sk-caller", &["my-gemini"]));
-        let hub = Arc::new(Hub::new());
-        hub.register_family(Adapter::Openai, Arc::new(OpenAiBridge::new()));
-        let app = build_router(build_state(snap, hub));
-
-        let body = serde_json::json!({
-            "model": "my-gemini",
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("authorization", "Bearer sk-caller")
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v: serde_json::Value =
-            serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap()).unwrap();
-        assert_eq!(v["choices"][0]["message"]["content"], "Hello from Gemini!");
-        assert_eq!(v["usage"]["total_tokens"], 9);
     }
 
     /// (OpenAI inbound) × (DeepSeek upstream). DeepSeek is served by
@@ -13555,8 +11968,8 @@ data: [DONE]\n\n";
     // The gap these cover is SILENT: nothing errors and no metric goes to
     // zero when the drain is missing, so the only signal is a /logs row
     // that reads exactly like "no guardrail acted". `guardrail_blocked`
-    // covers the refusal case loudly enough; an enforced MASK on a
-    // non-`/mcp` endpoint was invisible end to end.
+    // covers the refusal case loudly enough; an enforced MASK on an
+    // LLM endpoint was invisible end to end.
     // ─────────────────────────────────────────────────────────────────
 
     /// A `kind: "pii"` row whose one custom pattern masks a version
@@ -13747,19 +12160,491 @@ data: [DONE]\n\n";
         assert!(hit.error_type.is_empty());
     }
 
+    /// Cross-provider contract: Anthropic upstream 5xx → client sees an
+    /// OpenAI-shape envelope `{error:{type:"upstream_error",...}}` with
+    /// status 502 (collapsed per `BridgeError::http_status`, see
+    /// crates/aisix-gateway/src/bridge.rs).
+    #[tokio::test]
+    async fn upstream_anthropic_5xx_collapses_to_502_with_openai_envelope() {
+        use aisix_provider_anthropic::AnthropicBridge;
+
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(503).set_body_string(
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"upstream busy"}}"#,
+            ))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(matrix_anthropic_pk(&upstream.uri()));
+        snap.models.insert(anthropic_model_entry("my-claude"));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-claude"]));
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let app = build_router(build_state(snap, hub));
+
+        let body = serde_json::json!({
+            "model": "my-claude",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 1024).await.unwrap()).unwrap();
+        // Anthropic-shape leaks must not bleed through to the client.
+        assert_eq!(v["error"]["type"], "upstream_error");
+        assert!(v["error"]["message"].is_string());
+    }
+
+    /// Cross-provider 4xx forwarding (issue #327): Anthropic upstream
+    /// 400 reaches the OpenAI-client side with `error.type` normalised
+    /// to the DP-stable `"upstream_error"` token — Anthropic's private
+    /// taxonomy (`invalid_request_error`, `authentication_error`, etc.)
+    /// must not bleed through.
+    #[tokio::test]
+    async fn upstream_anthropic_400_normalises_type_to_upstream_error() {
+        use aisix_provider_anthropic::AnthropicBridge;
+
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(400).set_body_raw(
+                br#"{"type":"error","error":{"type":"invalid_request_error","message":"bad input"}}"#.as_slice(),
+                "application/json",
+            ))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(matrix_anthropic_pk(&upstream.uri()));
+        snap.models.insert(anthropic_model_entry("my-claude"));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-claude"]));
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let app = build_router(build_state(snap, hub));
+
+        let body = serde_json::json!({
+            "model": "my-claude",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 1024).await.unwrap()).unwrap();
+        assert_eq!(v["error"]["type"], "upstream_error");
+        assert_eq!(v["error"]["message"], "bad input");
+        // Anthropic `invalid_request_error` doesn't derive an OpenAI
+        // string code — translation table emits `code: null`.
+        assert!(v["error"].get("code").is_none() || v["error"]["code"].is_null());
+    }
+
+    /// Issue #322 + #327 cross-wire contract: Anthropic upstream
+    /// `rate_limit_error` must derive OpenAI `error.code =
+    /// rate_limit_exceeded` (so SDK retry logic that switches on
+    /// `error.code` recognises the rate-limit failure regardless of
+    /// upstream), while `error.type` stays as the DP-stable
+    /// `"upstream_error"` (per #327, Anthropic's `rate_limit_error`
+    /// token must not bleed through).
+    #[tokio::test]
+    async fn upstream_anthropic_rate_limit_derives_openai_rate_limit_exceeded_code() {
+        use aisix_provider_anthropic::AnthropicBridge;
+
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(429).set_body_raw(
+                br#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#.as_slice(),
+                "application/json",
+            ))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(matrix_anthropic_pk(&upstream.uri()));
+        snap.models.insert(anthropic_model_entry("my-claude"));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-claude"]));
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let app = build_router(build_state(snap, hub));
+
+        let body = serde_json::json!({
+            "model": "my-claude",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 1024).await.unwrap()).unwrap();
+        // Per #327: `error.type` is the DP-stable token, never the
+        // upstream's. Per #322: `error.code` is the derived OpenAI
+        // string code so SDK retry logic fires correctly.
+        assert_eq!(v["error"]["type"], "upstream_error");
+        assert_eq!(v["error"]["code"], "rate_limit_exceeded");
+        assert_eq!(v["error"]["message"], "slow down");
+    }
+
+    fn matrix_anthropic_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        matrix_pk_entry(
+            MATRIX_ANTHROPIC_PK_ID,
+            "sk-ant-test",
+            api_base,
+            "anthropic",
+            "anthropic",
+        )
+    }
+
+    fn anthropic_model_entry(name: &str) -> ResourceEntry<Model> {
+        let cfg = format!(
+            r#"{{
+                "display_name": "{name}",
+                "provider": "anthropic",
+                "model_name": "claude-3-5-haiku-20241022",
+                "provider_key_id": "{MATRIX_ANTHROPIC_PK_ID}"
+            }}"#
+        );
+        ResourceEntry::new("model-anthropic-1", serde_json::from_str(&cfg).unwrap(), 1)
+    }
+
+    fn anthropic_snapshot(api_base: &str) -> (AisixSnapshot, Arc<Hub>) {
+        use aisix_provider_anthropic::AnthropicBridge;
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(matrix_anthropic_pk(api_base));
+        snap.models.insert(anthropic_model_entry("my-claude"));
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        (snap, hub)
+    }
+
+    fn anthropic_message_body() -> serde_json::Value {
+        serde_json::json!({
+            "id": "msg_up",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-3-5-haiku-20241022",
+            "content": [{"type": "text", "text": "hello"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10_000, "output_tokens": 10_000}
+        })
+    }
+
+    /// (OpenAI inbound) × (Anthropic upstream) × (non-streaming).
+    /// The most valuable cross-protocol cell — exercises real wire-shape
+    /// translation in both directions inside `AnthropicBridge::chat`.
+    #[tokio::test]
+    async fn matrix_openai_in_anthropic_upstream_non_streaming() {
+        use aisix_provider_anthropic::AnthropicBridge;
+
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-api-key", "sk-ant-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_01",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Hello from Claude!"}],
+                "model": "claude-3-5-haiku-20241022",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 5, "output_tokens": 4}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(matrix_anthropic_pk(&upstream.uri()));
+        snap.models.insert(anthropic_model_entry("my-claude"));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-claude"]));
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let app = build_router(build_state(snap, hub));
+
+        let body = serde_json::json!({
+            "model": "my-claude",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap()).unwrap();
+        // OpenAI-shape wire on the way out.
+        assert_eq!(v["object"], "chat.completion");
+        assert_eq!(v["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(v["choices"][0]["message"]["content"], "Hello from Claude!");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        assert_eq!(v["usage"]["prompt_tokens"], 5);
+        assert_eq!(v["usage"]["completion_tokens"], 4);
+    }
+
+    /// (OpenAI inbound) × (Anthropic upstream) × (streaming).
+    /// Pin the SSE event-stream translation: AnthropicBridge ingests
+    /// typed Anthropic events (message_start / content_block_delta /
+    /// message_delta / message_stop) and emits flat OpenAI deltas.
+    #[tokio::test]
+    async fn matrix_openai_in_anthropic_upstream_streaming() {
+        use aisix_provider_anthropic::AnthropicBridge;
+
+        let upstream = MockServer::builder().start().await;
+        let sse = "\
+event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-haiku-20241022\",\"stop_reason\":null,\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n\
+event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hel\"}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n\n\
+event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":2}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(matrix_anthropic_pk(&upstream.uri()));
+        snap.models.insert(anthropic_model_entry("my-claude"));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-claude"]));
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let app = build_router(build_state(snap, hub));
+
+        let body = serde_json::json!({
+            "model": "my-claude",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream"),
+        );
+        let body =
+            String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
+        // OpenAI-shape SSE deltas on the way out.
+        assert!(
+            body.contains("\"object\":\"chat.completion.chunk\""),
+            "missing OpenAI chunk envelope in:\n{body}"
+        );
+        assert!(body.contains("\"content\":\"hel\""));
+        assert!(body.contains("\"content\":\"lo\""));
+        assert!(body.contains("\"finish_reason\":\"stop\""));
+        assert!(body.contains("data: [DONE]"));
+    }
+
+    #[tokio::test]
+    async fn cache_hit_preserves_the_anthropic_cache_creation_split() {
+        use aisix_obs::UsageSink;
+        use aisix_provider_anthropic::AnthropicBridge;
+
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_cached",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-5",
+                "content": [{"type": "text", "text": "cached"}],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 7,
+                    "output_tokens": 11,
+                    "cache_creation_input_tokens": 300,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 0,
+                        "ephemeral_1h_input_tokens": 300
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(matrix_anthropic_pk(&upstream.uri()));
+        snap.models.insert(anthropic_model_entry("my-claude"));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-claude"]));
+        seed_cache_policy(&snap, "ttl-cache");
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let state = build_state_with_cache(snap, hub).with_usage_sink(UsageSink::new(tx));
+
+        let body = serde_json::json!({
+            "model": "my-claude",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let _ = run(build_router(state.clone()), make_req()).await;
+        let miss = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("event was never emitted")
+            .expect("sender dropped");
+        assert_eq!(miss.cache_status, "miss");
+        assert_eq!(miss.cache_creation_ttl.cache_creation_5m_tokens, Some(0));
+        assert_eq!(miss.cache_creation_ttl.cache_creation_1h_tokens, Some(300));
+
+        let _ = run(build_router(state), make_req()).await;
+        let hit = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("event was never emitted")
+            .expect("sender dropped");
+        assert_eq!(hit.cache_status, "hit");
+        assert_eq!(hit.cache_creation_tokens, 300);
+        assert_eq!(hit.cache_creation_ttl, miss.cache_creation_ttl);
+    }
+
+    #[tokio::test]
+    async fn responses_bridged_hangup_during_output_check_counts_against_tpm() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_message_body()))
+            .mount(&upstream)
+            .await;
+        let (snap, hub) = anthropic_snapshot(&upstream.uri());
+        assert_hangup_during_output_check_counts_against_tpm(
+            snap,
+            hub,
+            "my-claude",
+            "/v1/responses",
+            serde_json::json!({"model": "my-claude", "input": "hi"}),
+        )
+        .await;
+    }
+
+    /// AISIX-Cloud#790: a plain direct-model request (no routing group)
+    /// records the client-sent name in `requested_model` and keeps the
+    /// direct model's own id in `model_id`.
+    #[tokio::test]
+    async fn direct_model_requests_record_requested_model() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-direct",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hi there"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+
+        // OpenAI protocol: /v1/chat/completions.
+        let chat_req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": "my-gpt4",
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = run(build_router(state.clone()), chat_req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("chat usage event was never emitted")
+            .expect("sender dropped");
+        assert_eq!(event.requested_model, "my-gpt4");
+        // Direct request: target == requested entry, id unchanged.
+        assert_eq!(event.model_id, "model-id-1");
+        assert_eq!(event.requested_model_id, "model-id-1");
+    }
+
+    const MATRIX_ANTHROPIC_PK_ID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+
     // ─── Usage accounting across the protocol-conversion matrix ────
     //
     // AISIX-Cloud#1447. `UsageStats` stores whichever accounting shape
     // the UPSTREAM used; the client must be answered in ITS OWN
-    // protocol's shape. That makes six cells, three of which convert:
+    // protocol's shape. The inbound `/v1/messages` surface was removed,
+    // so the matrix walked below covers the two OpenAI clients against
+    // both upstream shapes:
     //
     //   client            upstream shape   conversion?
     //   /v1/chat/…        OpenAI           no  (identity)
     //   /v1/chat/…        Anthropic        YES
     //   /v1/responses     OpenAI           no  (verbatim passthrough)
     //   /v1/responses     Anthropic        YES
-    //   /v1/messages      OpenAI           YES
-    //   /v1/messages      Anthropic        no  (verbatim passthrough)
     //
     // …times streaming/non-streaming. Every cell is walked below, and
     // each is checked on BOTH exits: the bytes the client reads, and the
@@ -13784,7 +12669,6 @@ data: [DONE]\n\n";
     enum UmClient {
         Chat,
         Responses,
-        Messages,
     }
 
     /// Which accounting shape the upstream reports in. Not "which
@@ -14037,15 +12921,6 @@ event: message_stop\ndata: {}\n\n",
                 "/v1/responses",
                 serde_json::json!({"model": model_name, "input": "hi", "stream": streaming}),
             ),
-            UmClient::Messages => (
-                "/v1/messages",
-                serde_json::json!({
-                    "model": model_name,
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "max_tokens": 100,
-                    "stream": streaming,
-                }),
-            ),
         };
         let mut builder = Request::builder()
             .method("POST")
@@ -14106,15 +12981,8 @@ event: message_stop\ndata: {}\n\n",
     /// Pull the client-facing usage out of a streamed body.
     ///
     /// Chat and Responses each put a COMPLETE usage block on one
-    /// terminal frame, so the last one wins. Anthropic deliberately
-    /// splits it: `message_start` carries the input side (and the cache
-    /// counters), `message_delta` the output side — so a `/v1/messages`
-    /// client accumulates across frames, and this reader must too.
-    /// Merging field-wise by max also covers the translated stream,
-    /// where the input side is only known once the upstream's usage
-    /// frame lands and therefore rides the closing `message_delta`.
+    /// terminal frame, so the last one wins.
     fn um_usage_from_sse(client: UmClient, body: &str) -> serde_json::Value {
-        let mut merged = serde_json::Map::new();
         let mut last = serde_json::Value::Null;
         for line in body.lines() {
             let Some(data) = line.strip_prefix("data: ") else {
@@ -14128,33 +12996,13 @@ event: message_stop\ndata: {}\n\n",
             };
             let candidate = match client {
                 UmClient::Chat => v.get("usage").cloned(),
-                // `message_start` nests it under `message`; `message_delta`
-                // puts it at the top level. Both are Anthropic's shape.
-                UmClient::Messages => v
-                    .get("usage")
-                    .or_else(|| v.get("message").and_then(|m| m.get("usage")))
-                    .cloned(),
                 UmClient::Responses => v.get("response").and_then(|r| r.get("usage")).cloned(),
             };
-            let Some(c) = candidate.filter(serde_json::Value::is_object) else {
-                continue;
-            };
-            last = c.clone();
-            for (k, val) in c.as_object().unwrap() {
-                let keep = match (
-                    merged.get(k).and_then(serde_json::Value::as_u64),
-                    val.as_u64(),
-                ) {
-                    (Some(prev), Some(next)) => serde_json::json!(prev.max(next)),
-                    _ => val.clone(),
-                };
-                merged.insert(k.clone(), keep);
+            if let Some(c) = candidate.filter(serde_json::Value::is_object) {
+                last = c;
             }
         }
-        match client {
-            UmClient::Messages => serde_json::Value::Object(merged),
-            _ => last,
-        }
+        last
     }
 
     /// Every cell, regardless of conversion: the event carries the
@@ -14311,58 +13159,6 @@ event: message_stop\ndata: {}\n\n",
                         <= usage["input_tokens"].as_u64().unwrap(),
                     "{label}: cached_tokens must stay a subset of input_tokens"
                 );
-                um_assert_event_keeps_upstream_shape(&event, upstream, &label);
-            }
-        }
-    }
-
-    /// The Anthropic client's three input counters must always sum to
-    /// the 140 tokens the model read. They do NOT split it identically
-    /// across upstreams, and correctly so: an OpenAI-shape upstream has
-    /// no cache-write bucket to report, so its non-hit input is all
-    /// plain `input_tokens`. Fabricating a `cache_creation_input_tokens`
-    /// to make the two look alike would invent a number no upstream sent.
-    #[tokio::test]
-    async fn usage_matrix_messages_client_conserves_total_input() {
-        for streaming in [false, true] {
-            for upstream in [UmUpstream::OpenAiShape, UmUpstream::AnthropicShape] {
-                let label = format!("messages/{upstream:?}/stream={streaming}");
-                let (usage, event) = um_call(UmClient::Messages, upstream, streaming).await;
-                let get = |k: &str| usage.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
-                assert_eq!(get("output_tokens"), u64::from(UM_OUT), "{label}: output");
-                assert_eq!(
-                    get("input_tokens")
-                        + get("cache_creation_input_tokens")
-                        + get("cache_read_input_tokens"),
-                    u64::from(UM_TOTAL_IN),
-                    "{label}: the three input counters must sum to the real input"
-                );
-                assert_eq!(
-                    get("cache_read_input_tokens"),
-                    u64::from(UM_CACHE_READ),
-                    "{label}: cache read is reportable by both shapes"
-                );
-                match upstream {
-                    UmUpstream::AnthropicShape => {
-                        assert_eq!(get("input_tokens"), u64::from(UM_UNCACHED_IN), "{label}");
-                        assert_eq!(
-                            get("cache_creation_input_tokens"),
-                            u64::from(UM_CACHE_WRITE),
-                            "{label}"
-                        );
-                    }
-                    UmUpstream::OpenAiShape => {
-                        assert_eq!(
-                            get("input_tokens"),
-                            u64::from(UM_UNCACHED_IN + UM_CACHE_WRITE),
-                            "{label}: OpenAI has no cache-write bucket"
-                        );
-                        assert!(
-                            usage.get("cache_creation_input_tokens").is_none(),
-                            "{label}: never fabricate a cache write the upstream never reported"
-                        );
-                    }
-                }
                 um_assert_event_keeps_upstream_shape(&event, upstream, &label);
             }
         }

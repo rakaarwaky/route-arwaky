@@ -138,12 +138,12 @@ mod tests {
 
     #[test]
     fn apply_substitutes_capture_groups() {
-        let compiled = compile(&[rule("^/mcp-servers/([^/]+)/mcp$", "/mcp/$1")]);
+        let compiled = compile(&[rule("^/legacy-chat/([^/]+)$", "/v1/chat/$1")]);
         assert_eq!(
-            compiled[0].apply("/mcp-servers/github/mcp").as_deref(),
-            Some("/mcp/github")
+            compiled[0].apply("/legacy-chat/github").as_deref(),
+            Some("/v1/chat/github")
         );
-        assert_eq!(compiled[0].apply("/mcp-servers/github/sse"), None);
+        assert_eq!(compiled[0].apply("/legacy-chat/github/sse"), None);
         assert_eq!(compiled[0].apply("/v1/chat/completions"), None);
     }
 
@@ -162,21 +162,21 @@ mod tests {
     fn apply_supports_named_groups_and_braced_references() {
         let compiled = compile(&[rule(
             "^/gw/(?P<server>[^/]+)/v(\\d+)$",
-            "/mcp/${server}-v${2}",
+            "/v1/chat/${server}-v${2}",
         )]);
         assert_eq!(
             compiled[0].apply("/gw/github/v2").as_deref(),
-            Some("/mcp/github-v2")
+            Some("/v1/chat/github-v2")
         );
     }
 
     #[test]
     fn with_path_preserves_the_query_string() {
-        let uri: http::Uri = "http://gw.example/mcp-servers/github/mcp?probe=1"
+        let uri: http::Uri = "http://gw.example/legacy-chat/github?probe=1"
             .parse()
             .unwrap();
-        let rewritten = with_path(&uri, "/mcp/github").unwrap();
-        assert_eq!(rewritten.path(), "/mcp/github");
+        let rewritten = with_path(&uri, "/v1/chat/github").unwrap();
+        assert_eq!(rewritten.path(), "/v1/chat/github");
         assert_eq!(rewritten.query(), Some("probe=1"));
         assert_eq!(rewritten.host(), Some("gw.example"));
     }

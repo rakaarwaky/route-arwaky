@@ -392,7 +392,6 @@ describe("is_final_attempt marks the one last row of a request", () => {
 
   test.for([
     ["images", "/v1/images/generations", { model: "fm-all-fail", prompt: "a cat" }],
-    ["decisions", "/v1/decisions", { model: "fm-all-fail", input: "x", questions: [{ type: "predicate", name: "q", instructions: "i" }] }],
     ["speech", "/v1/audio/speech", { model: "fm-all-fail", input: "x", voice: "alloy" }],
   ] as const)("%s: all-failed ends on the last failure", { timeout: 30_000 }, async ([label, path, payload], ctx) => {
     if (!etcdReachable) return ctx.skip();

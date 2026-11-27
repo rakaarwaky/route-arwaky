@@ -15,7 +15,6 @@
 //! resolve from an API key's `team_id` / `user_id`; team membership and
 //! limits stay owned by the control plane.
 
-pub mod a2a_agent;
 pub mod apikey;
 pub mod budget;
 pub mod cache_policy;
@@ -23,10 +22,6 @@ pub mod claim_mapping;
 pub mod embedding;
 pub mod ensemble;
 pub mod guardrail;
-pub mod mcp_auth_settings;
-pub mod mcp_policy;
-pub mod mcp_ref;
-pub mod mcp_server;
 pub mod model;
 pub mod model_ref;
 pub mod observability_exporter;
@@ -46,8 +41,7 @@ pub mod team;
 pub mod usage_accounting;
 pub mod user;
 
-pub use a2a_agent::{A2aAgent, A2aAuthType, A2aProtocolVersion};
-pub use apikey::{ApiKey, McpServerLimit};
+pub use apikey::ApiKey;
 pub use budget::{
     budget_next_period_start, budget_period_start, parse_budget_timezone, Budget, BudgetExhausted,
     BudgetFailMode, BudgetMemberExhausted, BudgetPeriod, BudgetPolicy, BudgetReason, BudgetScope,
@@ -58,20 +52,11 @@ pub use claim_mapping::{ClaimMapping, ClaimMatch, ClaimMatchOp, ClaimResolve};
 pub use embedding::EmbeddingConfig;
 pub use ensemble::{EnsembleConfig, Judge, PanelMember};
 pub use guardrail::{
-    AliyunAiGuardrailConfig, AliyunTextModerationConfig, AppliedGuardrail,
-    AzureContentSafetyConfig, AzureContentSafetyTextModerationConfig, BedrockAWSCredentials,
-    BedrockConfig, BedrockLatencyMode, CustomConfig, Guardrail, GuardrailAttachment,
-    GuardrailEnforcedHit, GuardrailExecution, GuardrailHookPoint, GuardrailInputMessages,
-    GuardrailKind, GuardrailMetricsSink, GuardrailMonitorHit, GuardrailScopeType, GuardrailScore,
+    AppliedGuardrail, CustomConfig, Guardrail, GuardrailAttachment, GuardrailEnforcedHit,
+    GuardrailExecution, GuardrailHookPoint, GuardrailInputMessages, GuardrailKind,
+    GuardrailMetricsSink, GuardrailMonitorHit, GuardrailScopeType, GuardrailScore,
     KeywordConfig, KeywordPattern, LakeraConfig, OpenaiModerationConfig, PiiConfig,
     PiiCustomPattern, PiiDetectorConfig, PresidioConfig, PresidioEntityConfig, SemanticConfig,
-};
-pub use mcp_auth_settings::{McpAnonymousAccess, McpAuthSettings, McpServerAllowlist};
-pub use mcp_policy::{McpAccess, McpPolicy, McpPolicyScope};
-pub use mcp_ref::{LiveMcpServerIndex, McpServerIndex, McpToolRef};
-pub use mcp_server::{
-    McpAuthType, McpProtocolVersion, McpServer, McpServerType, McpTokenExchangeProfile,
-    McpTransport,
 };
 pub use model::{
     Adapter, BackgroundModelCheck, CooldownConfig, EffortAction, MappedEffort, Model,
@@ -83,7 +68,7 @@ pub use observability_exporter::{
     ObjectStoreProvider, ObservabilityExporter, OtlpHttpConfig, SlsContentMode,
 };
 pub use oidc_provider::{
-    BoundClaimExpect, HmacSecret, OidcClientSecret, OidcLogin, OidcProvider, HMAC_SECRET_MIN_BYTES,
+    BoundClaimExpect, HmacSecret, OidcProvider, HMAC_SECRET_MIN_BYTES,
 };
 pub use passthrough_route::{PassthroughAuthMode, PassthroughCredentialMode, PassthroughRoute};
 pub use policy_conditions::{
@@ -96,21 +81,19 @@ pub use provider_key::{
     ApiEndpoint, ApiSurface, ParamConstraints, ProviderApis, ProviderKey, RequestOverrides,
     ResponseOverrides, StreamDoneMarker, TelemetryKind, TelemetryTags,
 };
-pub use rate_limit::{McpRateLimit, RateLimit, RateLimitWindowType};
+pub use rate_limit::{RateLimit, RateLimitWindowType};
 pub use rate_limit_policy::{PolicyScope, PolicyWindow, RateLimitPolicy};
 pub use routing::{
     default_hash_on, HashOnSource, HashOnType, Routing, RoutingStrategy, RoutingTarget,
     WhenAllUnavailablePolicy,
 };
 pub use schema::{
-    unknown_field_paths, validate_a2a_agent, validate_a2a_agent_lenient, validate_apikey,
+    unknown_field_paths, validate_apikey,
     validate_apikey_lenient, validate_budget, validate_budget_lenient, validate_budget_policy,
     validate_budget_policy_lenient, validate_cache_policy, validate_cache_policy_lenient,
     validate_claim_mapping, validate_claim_mapping_lenient, validate_guardrail,
     validate_guardrail_attachment, validate_guardrail_attachment_lenient,
-    validate_guardrail_lenient, validate_mcp_auth_settings, validate_mcp_auth_settings_lenient,
-    validate_mcp_policy, validate_mcp_policy_lenient, validate_mcp_server,
-    validate_mcp_server_lenient, validate_model, validate_model_lenient,
+    validate_guardrail_lenient, validate_model, validate_model_lenient,
     validate_observability_exporter, validate_observability_exporter_lenient,
     validate_oidc_provider, validate_oidc_provider_lenient, validate_passthrough_route,
     validate_passthrough_route_lenient, validate_pricing, validate_pricing_lenient,
@@ -120,9 +103,8 @@ pub use schema::{
     validate_user_lenient, SchemaError,
 };
 pub use semantic::{
-    Aggregation, ClassifierType, DistanceMetric, EmbeddingFailureMode, OnEmbeddingFailure,
-    Semantic, SemanticClassifier, SemanticMatch, SemanticRoute, SemanticSessionAffinity,
-    TYPESAFE_PROVIDER,
+    Aggregation, DistanceMetric, EmbeddingFailureMode, OnEmbeddingFailure, Semantic, SemanticMatch,
+    SemanticRoute, SemanticSessionAffinity,
 };
 pub use snapshot::{AisixSnapshot, KeyOwnerNames};
 pub use tags::{effective_tags, is_valid_tag_key, tag_value_from_claim, Tags, TAG_KEY_PATTERN};

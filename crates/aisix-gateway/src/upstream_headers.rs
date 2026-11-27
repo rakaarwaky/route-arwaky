@@ -51,7 +51,7 @@ use http::{
 /// Whether a client's copy of a header may be forwarded by this pipeline.
 ///
 /// Re-exported from `aisix-core`, which owns the criterion so that every
-/// surface — `/v1/*`, MCP, and `/passthrough/*` — answers it alike.
+/// surface — `/v1/*` and `/passthrough/*` — answers it alike.
 pub use aisix_core::{client_header_forwardable, header_forward_blocked};
 
 /// The authenticated caller's non-secret identity, resolved once per

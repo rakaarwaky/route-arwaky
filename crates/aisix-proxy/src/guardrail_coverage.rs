@@ -2,10 +2,9 @@
 //! [`crate::build_router`] mounts.
 //!
 //! This exists because the same defect kept landing on one sibling at a
-//! time. `/v1/messages/count_tokens` shipped with no chain at all; `/mcp`
-//! consulted the chain only when a `tools/call` happened to carry text;
+//! time. `/v1/messages/count_tokens` shipped with no chain at all;
 //! `/v1/audio/*` and `/v1/images/edits` only when a `prompt` part happened
-//! to be present; `/a2a` never. Each was invisible because the test that
+//! to be present. Each was invisible because the test that
 //! was supposed to cover the family restated a hand-written list of
 //! endpoints, and a list nobody updates agrees with itself forever.
 //!
@@ -68,64 +67,6 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
         "/v1/models",
         Posture::NoUpstreamContent("lists the gateway's own snapshot; contacts no upstream"),
     ),
-    (
-        "/.well-known/oauth-protected-resource",
-        Posture::NoUpstreamContent("RFC 9728 metadata served by the gateway itself"),
-    ),
-    (
-        "/.well-known/oauth-protected-resource/mcp",
-        Posture::NoUpstreamContent("RFC 9728 metadata served by the gateway itself"),
-    ),
-    (
-        "/.well-known/oauth-protected-resource/mcp/:server",
-        Posture::NoUpstreamContent("RFC 9728 metadata served by the gateway itself"),
-    ),
-    (
-        "/.well-known/oauth-authorization-server/mcp/:server",
-        Posture::NoUpstreamContent("RFC 8414 metadata served by the gateway itself"),
-    ),
-    (
-        "/mcp/:server/.well-known/openid-configuration",
-        Posture::NoUpstreamContent("RFC 8414 metadata served by the gateway itself"),
-    ),
-    (
-        "/mcp/:server/.well-known/jwks.json",
-        Posture::NoUpstreamContent("an empty key set served by the gateway itself"),
-    ),
-    (
-        "/mcp/:server/oauth/register",
-        Posture::NoUpstreamContent("answers from the request alone; stores nothing"),
-    ),
-    (
-        "/mcp/:server/oauth/authorize",
-        Posture::NoUpstreamContent("a browser redirect carrying OAuth parameters only"),
-    ),
-    (
-        "/mcp/:server/oauth/token",
-        Posture::NoUpstreamContent("issues or exchanges OAuth tokens; no caller content"),
-    ),
-    (
-        "/mcp/:server/oauth/credential",
-        Posture::NoUpstreamContent("deletes the caller's stored token; contacts no upstream"),
-    ),
-    (
-        "/mcp-oauth/callback",
-        Posture::NoUpstreamContent("a browser redirect carrying OAuth parameters only"),
-    ),
-    (
-        "/mcp-oauth/login/callback",
-        Posture::NoUpstreamContent("a browser redirect carrying OAuth parameters only"),
-    ),
-    (
-        "/mcp-oauth/consent",
-        Posture::NoUpstreamContent("a browser form carrying OAuth parameters only"),
-    ),
-    (
-        "/a2a/:agent/.well-known/agent-card.json",
-        Posture::NoUpstreamContent(
-            "serves the agent's card with the URL rewritten; no caller body",
-        ),
-    ),
     // --- reads of a job/asset the caller already created ----------------
     (
         "/v1/videos/:id",
@@ -160,44 +101,17 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
         Posture::NoUpstreamContent("cancels by id; carries no caller text"),
     ),
     // --- content-bearing surfaces --------------------------------------
-    ("/v1beta/models/*model_action", Posture::Enforced),
-    (
-        "/v1beta1/projects/:project/locations/:location/publishers/google/models/*model_action",
-        Posture::Enforced,
-    ),
     ("/v1/chat/completions", Posture::Enforced),
     ("/v1/completions", Posture::Enforced),
     ("/v1/embeddings", Posture::Enforced),
     ("/v1/images/generations", Posture::Enforced),
     ("/v1/images/edits", Posture::Enforced),
-    ("/v1/messages", Posture::Enforced),
-    ("/v1/messages/count_tokens", Posture::Enforced),
     ("/v1/rerank", Posture::Enforced),
-    (
-        "/v1/systemone",
-        Posture::Unscreened(
-            "product decision: attached guardrails do not run on the decision endpoints and \
-             nothing is redacted there, the same posture the reference gateway takes. Not a gap \
-             to close without a new decision.",
-        ),
-    ),
-    (
-        "/v1/decisions",
-        Posture::Unscreened(
-            "product decision: attached guardrails do not run on the decision endpoints and \
-             nothing is redacted there, the same posture the reference gateway takes. Not a gap \
-             to close without a new decision.",
-        ),
-    ),
     ("/v1/responses", Posture::Enforced),
     ("/v1/audio/transcriptions", Posture::Enforced),
     ("/v1/audio/translations", Posture::Enforced),
     ("/v1/audio/speech", Posture::Enforced),
     ("/v1/videos", Posture::Enforced),
-    ("/mcp", Posture::Enforced),
-    ("/mcp/", Posture::Enforced),
-    ("/mcp/:server", Posture::Enforced),
-    ("/a2a/:agent", Posture::Enforced),
     (
         "/api-ws/v1/inference",
         Posture::EnforcedNotDrivableInCrate(
@@ -325,8 +239,6 @@ const CALLER: &str = "sk-census-caller";
 const CALLER_HASH: &str = "d73b98669c1f938ed09ee3d8e81ecdbb58f7bf38c57a4f78c301e7bdadc2fdf2";
 const GUARDRAIL_ROW: &str = "census-block";
 const PK_ID: &str = "11111111-1111-1111-1111-111111111111";
-const ANTHROPIC_PK_ID: &str = "22222222-2222-2222-2222-222222222222";
-const MCP_SERVER_ID: &str = "33333333-3333-3333-3333-333333333333";
 
 /// A script with a verdict that owes nothing to the text it is handed. A
 /// keyword or PII row could not distinguish "the chain ran" from "the chain
@@ -354,7 +266,7 @@ fn cfg() -> ProxyConfig {
 }
 
 /// A snapshot wired so every content-bearing surface can resolve what it
-/// needs (key, models, MCP server, A2A agent) and reach its guardrail gate.
+/// needs (key, models) and reach its guardrail gate.
 /// The upstreams deliberately point nowhere: a surface that reaches one has
 /// already failed the test.
 fn census_snapshot() -> AisixSnapshot {
@@ -364,8 +276,6 @@ fn census_snapshot() -> AisixSnapshot {
         "key_hash": CALLER_HASH,
         "allowed_models": ["*"],
         "allowed_routes": ["*"],
-        "allowed_agents": ["*"],
-        "mcp_access": { "allow": ["*"] },
     }))
     .expect("valid api key");
     snap.apikeys.insert(ResourceEntry::new("ak-census", key, 1));
@@ -380,26 +290,8 @@ fn census_snapshot() -> AisixSnapshot {
     .expect("valid provider key");
     snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
 
-    let anthropic_pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
-        "display_name": "census-anthropic",
-        "api_key": "sk-ant-unused",
-        "api_base": "http://127.0.0.1:1",
-        "provider": "anthropic",
-        "adapter": "anthropic",
-    }))
-    .expect("valid provider key");
-    snap.provider_keys
-        .insert(ResourceEntry::new(ANTHROPIC_PK_ID, anthropic_pk, 1));
-
     for (id, name, provider, model_name, pk_id) in [
         ("m-openai", "census-openai", "openai", "gpt-4o-mini", PK_ID),
-        (
-            "m-anthropic",
-            "census-anthropic",
-            "anthropic",
-            "claude-haiku-4-5-20251001",
-            ANTHROPIC_PK_ID,
-        ),
     ] {
         let model: aisix_core::Model = serde_json::from_value(serde_json::json!({
             "display_name": name,
@@ -422,24 +314,6 @@ fn census_snapshot() -> AisixSnapshot {
     snap.models
         .insert(ResourceEntry::new("m-embedding", embedding, 1));
 
-    let mcp: aisix_core::McpServer = serde_json::from_value(serde_json::json!({
-        "name": "census",
-        "url": "http://127.0.0.1:1/mcp",
-        "enabled": true,
-    }))
-    .expect("valid mcp server");
-    snap.mcp_servers
-        .insert(ResourceEntry::new(MCP_SERVER_ID, mcp, 1));
-
-    let agent: aisix_core::A2aAgent = serde_json::from_value(serde_json::json!({
-        "name": "census",
-        "url": "http://127.0.0.1:1/a2a",
-        "enabled": true,
-    }))
-    .expect("valid a2a agent");
-    snap.a2a_agents
-        .insert(ResourceEntry::new("agent-census", agent, 1));
-
     let guardrail: aisix_core::Guardrail = serde_json::from_value(serde_json::json!({
         "name": GUARDRAIL_ROW,
         "enabled": true,
@@ -455,7 +329,7 @@ fn census_snapshot() -> AisixSnapshot {
     snap
 }
 
-/// A hub with the two provider bridges the fixtures name. `/v1/embeddings`
+/// A hub with the provider bridge the fixtures name. `/v1/embeddings`
 /// resolves its bridge BEFORE the guardrail gate, so a bare hub would answer
 /// 503 and the census would never reach the check it exists to make.
 fn census_hub() -> Arc<aisix_gateway::Hub> {
@@ -463,10 +337,6 @@ fn census_hub() -> Arc<aisix_gateway::Hub> {
     hub.register_specialized(
         "openai",
         Arc::new(aisix_provider_openai::OpenAiBridge::new()),
-    );
-    hub.register_specialized(
-        "anthropic",
-        Arc::new(aisix_provider_anthropic::AnthropicBridge::new()),
     );
     hub
 }
@@ -560,16 +430,6 @@ pub(crate) fn fixture(surface: &str) -> Option<Request<Body>> {
             .body(Body::from(body.to_string()))
             .unwrap()
     };
-    let anthropic = |uri: &str, body: serde_json::Value| {
-        Request::builder()
-            .method("POST")
-            .uri(uri.to_string())
-            .header("x-api-key", CALLER)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap()
-    };
     let form = |uri: &str, parts: &[(&str, &str)]| {
         Request::builder()
             .method("POST")
@@ -582,21 +442,7 @@ pub(crate) fn fixture(surface: &str) -> Option<Request<Body>> {
             .body(Body::from(multipart(parts)))
             .unwrap()
     };
-    let jsonrpc = |uri: &str, body: serde_json::Value| {
-        Request::builder()
-            .method("POST")
-            .uri(uri.to_string())
-            .header("authorization", format!("Bearer {CALLER}"))
-            .header("host", "census.aisix.example.com")
-            .header("content-type", "application/json")
-            .header("accept", "application/json, text/event-stream")
-            .body(Body::from(body.to_string()))
-            .unwrap()
-    };
-
     Some(match surface {
-        "/v1beta/models/*model_action" => json("/v1beta/models/census-openai:generateContent",serde_json::json!({"contents":[{"parts":[{"text":""}]}]})),
-        "/v1beta1/projects/:project/locations/:location/publishers/google/models/*model_action" => json("/v1beta1/projects/test/locations/us/publishers/google/models/census-openai:streamGenerateContent?alt=sse",serde_json::json!({"contents":[{"parts":[{"text":""}]}]})),
         "/v1/chat/completions" => json(
             surface,
             serde_json::json!({
@@ -619,21 +465,6 @@ pub(crate) fn fixture(surface: &str) -> Option<Request<Body>> {
         // No `prompt` part at all — the exact shape that used to skip the
         // chain outright.
         "/v1/images/edits" => form(surface, &[("model", "census-openai"), ("image", "x")]),
-        "/v1/messages" => anthropic(
-            surface,
-            serde_json::json!({
-                "model": "census-anthropic",
-                "max_tokens": 16,
-                "messages": [{ "role": "user", "content": "" }],
-            }),
-        ),
-        "/v1/messages/count_tokens" => anthropic(
-            surface,
-            serde_json::json!({
-                "model": "census-anthropic",
-                "messages": [{ "role": "user", "content": "" }],
-            }),
-        ),
         "/v1/rerank" => json(
             surface,
             serde_json::json!({ "model": "census-openai", "query": "", "documents": [""] }),
@@ -656,25 +487,6 @@ pub(crate) fn fixture(surface: &str) -> Option<Request<Body>> {
             surface,
             serde_json::json!({ "model": "census-openai", "prompt": "a cat" }),
         ),
-        // `"arguments": {}` — the reported MCP bypass.
-        "/mcp" | "/mcp/" => jsonrpc(
-            surface,
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": { "name": "census__tool", "arguments": {} },
-            }),
-        ),
-        "/mcp/:server" => jsonrpc(
-            "/mcp/census",
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": { "name": "tool", "arguments": {} },
-            }),
-        ),
         // The jobs surfaces that still screen: both send a re-serialised
         // JSON request body, and both route off the encoded file id rather
         // than a `model` field, so neither needs a prior upload to drive.
@@ -693,23 +505,13 @@ pub(crate) fn fixture(surface: &str) -> Option<Request<Body>> {
                 "training_file": crate::jobs::encode_routed_id("file-census", "census-openai"),
             }),
         ),
-        // `tasks/get` carries no message at all.
-        "/a2a/:agent" => jsonrpc(
-            "/a2a/census",
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tasks/get",
-                "params": { "id": "task-1" },
-            }),
-        ),
         _ => return None,
     })
 }
 
-/// Every envelope on the proxy — OpenAI 422, the Anthropic error shape, the
-/// JSON-RPC error object, and the `/mcp` `isError` tool result — renders its
-/// refusal through `error::guardrail_block_message`, which names the firing
+/// Every envelope on the proxy — OpenAI 422, and the Anthropic error shape
+/// upstreams answer in — renders its refusal through
+/// `error::guardrail_block_message`, which names the firing
 /// row. So one substring recognises a genuine guardrail refusal on all of
 /// them, and cannot be satisfied by an unrelated 4xx (a missing field, an
 /// unknown model, a dead upstream) — which is the failure mode a
@@ -819,13 +621,10 @@ async fn an_enforced_surface_reports_the_refusal_it_makes() {
             ));
             continue;
         }
-        // No surface is exempt here, `/a2a` included —
-        // `guardrail_blocked_telemetry` has to exempt it because its
-        // counters are the gateway's own reading of the request text,
-        // filled before the chain runs, and that file's fixtures carry
-        // real text. These are contentless by construction, so zero is
-        // the honest answer on every one of them and an exemption would
-        // protect nothing while hiding a surface that started billing.
+        // No surface is exempt: these fixtures are contentless by
+        // construction, so zero is the honest answer on every one of them
+        // and an exemption would protect nothing while hiding a surface
+        // that started billing.
         for event in &events {
             if event.prompt_tokens != 0 || event.completion_tokens != 0 {
                 wrong.push(format!(

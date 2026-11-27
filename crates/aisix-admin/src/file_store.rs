@@ -14,7 +14,7 @@ use aisix_core::resource::Resource;
 use aisix_core::resource::ResourceEntry;
 use aisix_core::snapshot::{ResourceTable, SnapshotHandle};
 use aisix_core::{
-    A2aAgent, AisixSnapshot, ApiKey, CachePolicy, Guardrail, McpServer, Model,
+    AisixSnapshot, ApiKey, CachePolicy, Guardrail, Model,
     ObservabilityExporter, PassthroughRoute, ProviderKey,
 };
 
@@ -76,8 +76,6 @@ impl_file_managed_store! {
     { Guardrail, guardrails, get_guardrail, list_guardrails }
     { CachePolicy, cache_policies, get_cache_policy, list_cache_policies }
     { ObservabilityExporter, observability_exporters, get_observability_exporter, list_observability_exporters }
-    { McpServer, mcp_servers, get_mcp_server, list_mcp_servers }
-    { A2aAgent, a2a_agents, get_a2a_agent, list_a2a_agents }
     { PassthroughRoute, passthrough_routes, get_passthrough_route, list_passthrough_routes }
 }
 

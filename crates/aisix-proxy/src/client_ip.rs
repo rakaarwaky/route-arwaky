@@ -214,7 +214,8 @@ impl ClientContext {
 /// lists in its `request_headers`, for `UsageEvent::request_headers`.
 ///
 /// Every emitter takes the map from here — through [`ClientContext`], or
-/// directly on `/mcp` and `/a2a`, which build none — so all events of one
+/// directly on the routes that build none (the passthrough routes) — so all
+/// events of one
 /// request carry the same values; each exporter then keeps only its own
 /// names (`OtlpHttpFanOut::fan_out`). Value rules:
 /// [`aisix_gateway::capture_header_values`]. Reading a header here never
@@ -391,7 +392,7 @@ fn parse_routing_tags(raw: &str) -> Vec<String> {
 /// An unparseable CIDR entry is skipped rather than opening the list.
 /// An EMPTY list is also out — "allowlist everything" has to be spelled
 /// by the caller (passthrough routes treat an unset list as
-/// unrestricted; the MCP anonymous block requires a non-empty one), so
+/// unrestricted; an anonymous configuration requires a non-empty one), so
 /// this primitive never has to guess which of the two an empty list means.
 pub(crate) fn ip_in_cidrs(source_ip: &str, cidrs: &[String]) -> bool {
     let Ok(ip) = source_ip.parse::<std::net::IpAddr>() else {

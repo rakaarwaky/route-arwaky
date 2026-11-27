@@ -48,7 +48,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[serde(rename_all = "snake_case")]
 pub enum InternalCallPurpose {
     SemanticRouteEmbedding,
-    SemanticRouteDecision,
     SemanticCacheEmbedding,
     GuardrailEmbedding,
 }
@@ -57,7 +56,6 @@ impl InternalCallPurpose {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SemanticRouteEmbedding => "semantic_route_embedding",
-            Self::SemanticRouteDecision => "semantic_route_decision",
             Self::SemanticCacheEmbedding => "semantic_cache_embedding",
             Self::GuardrailEmbedding => "guardrail_embedding",
         }
@@ -222,8 +220,8 @@ pub struct UsageEvent {
 
     /// Set exactly on a CHILD event: one model call the gateway made on
     /// this request's behalf rather than at the caller's direction —
-    /// `semantic_route_embedding` and `semantic_route_decision` (a semantic
-    /// router's embedding or classifier call), `semantic_cache_embedding`
+    /// `semantic_route_embedding` (a semantic router's embedding call),
+    /// `semantic_cache_embedding`
     /// (the semantic cache's lookup embedding, a cache hit included) or
     /// `guardrail_embedding` (a semantic or custom guardrail's embedding).
     ///
@@ -377,12 +375,6 @@ pub struct UsageEvent {
     ///
     /// Absent (0) on the non-terminal attempts of a request, and on any
     /// path that never reached response delivery.
-    ///
-    /// `/a2a` is the one exception to the streaming rule above: it records
-    /// the WHOLE stream, because an agent's stream of task updates is the
-    /// call's product rather than a delivery mechanism for one. The
-    /// subtraction against `upstream_ttft_ms` therefore does not describe
-    /// gateway overhead there — it is the rest of the agent's own work.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub downstream_latency_ms: u32,
 
@@ -667,11 +659,11 @@ pub struct UsageEvent {
     pub inbound_protocol: String,
 
     /// What the caller asked the gateway to DO, from a fixed set:
-    /// `chat`, `messages`, `count_tokens`, `responses`, `completions`,
-    /// `embeddings`, `rerank`, `systemone`, `decisions`, `image_generation`,
+    /// `chat`, `responses`, `completions`,
+    /// `embeddings`, `rerank`, `image_generation`,
     /// `image_edit`, `transcription`, `translation`, `speech`, `video_generation`,
     /// `realtime`, `files`, `batches`, `fine_tuning`, `batch_completion`,
-    /// `mcp`, `a2a`, `passthrough`.
+    /// `passthrough`.
     ///
     /// That list is the whole of it, and a consumer building a filter or a
     /// facet should take it verbatim. `aisix_proxy::operation` is where the
@@ -833,8 +825,7 @@ pub struct UsageEvent {
     /// peer address was unavailable. cp-api stores empty as NULL.
     /// How the caller authenticated, when it was NOT the ordinary
     /// credential path: `anonymous` for a request admitted with no
-    /// credential at all by a gateway entry configured for it (the MCP
-    /// anonymous entries, AISIX-Cloud#1313). Empty means the request
+    /// credential at all by a gateway entry configured for it. Empty means the request
     /// presented and passed a credential of its own — the overwhelming
     /// majority, so the field stays off the wire for them.
     ///
@@ -879,90 +870,6 @@ pub struct UsageEvent {
     /// `request_headers`.
     #[serde(skip)]
     pub upstream_response_headers: std::collections::BTreeMap<String, String>,
-
-    // ─── MCP gateway attribution ───
-    /// Registered name of the upstream MCP server a `tools/call` was routed
-    /// to (the namespace prefix of the requested tool). Empty for non-MCP
-    /// events; cp-api stores empty as NULL. Older cp-api images that predate
-    /// this field ignore it (DP-first rollout).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub mcp_server_name: String,
-
-    /// Name of the MCP tool invoked, without the server prefix. Empty for
-    /// non-MCP events; cp-api stores empty as NULL.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub mcp_tool_name: String,
-
-    // ─── A2A gateway attribution ───
-    /// Registered name of the upstream A2A agent a request was routed to.
-    /// Empty for non-A2A events; cp-api stores empty as NULL. Older cp-api
-    /// images that predate this field ignore it (DP-first rollout).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub a2a_agent_name: String,
-
-    /// The JSON-RPC method invoked on the A2A agent, exactly as the caller
-    /// wrote it (such as `message/send`, or its 1.0 spelling `SendMessage`).
-    /// Empty for non-A2A events; cp-api stores empty as NULL.
-    ///
-    /// Unbounded by nature — a caller picks the string — so this is the
-    /// forensic value only. Aggregate on `a2a_operation`.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub a2a_method: String,
-
-    /// The canonical operation `a2a_method` names, collapsing the two wire
-    /// vocabularies onto one bounded set (`message/send`, `message/stream`,
-    /// `tasks/get`, …) and everything unrecognised onto `unknown`.
-    ///
-    /// A gateway may front a 0.3 agent and a 1.0 agent at once, and those call
-    /// the same operation `message/stream` and `SendStreamingMessage`. This is
-    /// the field to group or label by; `a2a_method` keeps the raw value.
-    /// Empty for non-A2A events.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub a2a_operation: String,
-
-    /// The A2A wire version this agent is pinned to (`0.3` / `1.0`) — what the
-    /// gateway announced to it in the `A2A-Version` header. Empty for non-A2A
-    /// events.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub a2a_protocol_version: String,
-
-    /// The A2A task this call created or acted on. Empty when the call names
-    /// no task — a first `message/send` whose agent answers with a bare
-    /// message never has one.
-    ///
-    /// High-cardinality by design: it joins a request to a task across the
-    /// `message/send` → `tasks/get` → `tasks/resubscribe` sequence, so it
-    /// belongs in logs and traces and never in a metric label.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub a2a_task_id: String,
-
-    /// The A2A context (conversation) the call belongs to — the id that ties
-    /// a multi-turn interaction's tasks together. Empty when the exchange
-    /// carried none. High-cardinality, same as `a2a_task_id`.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub a2a_context_id: String,
-
-    /// The last task state the upstream reported on this call, normalized to
-    /// the specification's set (`submitted`, `working`, `input-required`,
-    /// `completed`, `canceled`, `failed`, `rejected`, `auth-required`) or
-    /// `unknown` for anything else.
-    ///
-    /// For a streamed call this is the state the task was in when the stream
-    /// ended — including when the caller walked away mid-task, where no
-    /// terminal state is invented. Empty when no response carried a state at
-    /// all (the call failed before the upstream answered).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub a2a_task_state: String,
-
-    /// Events the gateway relayed downstream on a streamed A2A call.
-    ///
-    /// Read together with `upstream_ttft_ms` and `upstream_latency_ms` it
-    /// separates the two ways a stream disappoints: nothing arrived for a long
-    /// time (high TTFT), or plenty arrived and none of it advanced the task
-    /// (high count, no terminal state). 0 for a unary call, and for a stream
-    /// whose upstream produced nothing at all.
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
-    pub a2a_stream_event_count: u32,
 
     // ─── Passthrough-route attribution (AISIX-Cloud#1312) ───
     /// Registered name of the passthrough route that served the request.
@@ -1393,7 +1300,6 @@ impl UsageSink {
             "anthropic" => "anthropic",
             "gemini" => "gemini",
             "dashscope" => "dashscope",
-            "mcp" => "mcp",
             _ => "other",
         };
 
@@ -2244,10 +2150,6 @@ mod tests {
             (
                 InternalCallPurpose::SemanticRouteEmbedding,
                 "semantic_route_embedding",
-            ),
-            (
-                InternalCallPurpose::SemanticRouteDecision,
-                "semantic_route_decision",
             ),
             (
                 InternalCallPurpose::SemanticCacheEmbedding,

@@ -25,7 +25,7 @@
 //!   the whole row being skipped. Published so a consumer that needs to know
 //!   what this build will LOAD can read it instead of deriving it from the
 //!   strict files. It is NOT a write contract, and for `model`, `api_key`,
-//!   `guardrail` and `mcp_policy` it relaxes more than unknown fields —
+//!   `guardrail` it relaxes more than unknown fields —
 //!   `schemas/README.md` lists what.
 //!
 //! The five nested struct types have no standalone validator on either path,

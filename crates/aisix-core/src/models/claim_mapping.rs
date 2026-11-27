@@ -161,11 +161,11 @@ mod tests {
     fn deserialises_full_mapping() {
         let m: ClaimMapping = serde_json::from_str(
             r#"{
-              "name": "mcp-admins",
+              "name": "platform-admins",
               "jwt_provider": "corp-keycloak",
               "priority": 200,
               "match": [
-                {"claim": "groups", "op": "contains", "values": ["mcp-admin", "platform"]},
+                {"claim": "groups", "op": "contains", "values": ["platform-admin", "platform"]},
                 {"claim": "realm_access.department", "op": "exact", "values": ["ai-lab"]}
               ],
               "resolve": {"api_key_id": "k-admin"},

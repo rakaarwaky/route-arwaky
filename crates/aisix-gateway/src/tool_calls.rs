@@ -782,11 +782,11 @@ mod tests {
             "tools": [
                 {"type": "function", "name": "shell"},
                 {"type": "function", "name": "lazy", "defer_loading": true},
-                {"type": "namespace", "name": "mcp__half", "tools": [
+                {"type": "namespace", "name": "half__tools", "tools": [
                     {"type": "function", "name": "eager"},
                     {"type": "function", "name": "deferred", "defer_loading": true},
                 ]},
-                {"type": "namespace", "name": "mcp__all", "tools": [
+                {"type": "namespace", "name": "all__tools", "tools": [
                     {"type": "function", "name": "x", "defer_loading": true},
                 ]},
             ],
@@ -795,17 +795,17 @@ mod tests {
                 {"role": "user", "content": "hi"},
                 {"type": "additional_tools", "tools": [search.clone()]},
                 search_output("ts_1", json!([
-                    {"type": "namespace", "name": "mcp__docs", "description": "Docs.", "tools": [
+                    {"type": "namespace", "name": "docs__tools", "description": "Docs.", "tools": [
                         {"type": "function", "name": "read", "description": "first", "defer_loading": true},
                         {"type": "function", "name": "write", "defer_loading": true},
                     ]},
                     {"type": "function", "name": "shell", "description": "loaded shell", "defer_loading": true},
-                    {"type": "namespace", "name": "mcp__half", "tools": [
+                    {"type": "namespace", "name": "half__tools", "tools": [
                         {"type": "function", "name": "eager", "description": "loaded eager", "defer_loading": true},
                     ]},
                 ])),
                 search_output("ts_2", json!([
-                    {"type": "namespace", "name": "mcp__docs", "description": "Docs again.", "tools": [
+                    {"type": "namespace", "name": "docs__tools", "description": "Docs again.", "tools": [
                         {"type": "function", "name": "read", "description": "second", "defer_loading": true},
                     ]},
                     {"type": "function", "name": "lazy", "defer_loading": true},
@@ -821,12 +821,12 @@ mod tests {
             declared(&body),
             vec![
                 json!({"type": "function", "name": "shell"}),
-                json!({"type": "namespace", "name": "mcp__half", "tools": [
+                json!({"type": "namespace", "name": "half__tools", "tools": [
                     {"type": "function", "name": "eager"},
                 ]}),
                 search,
                 json!({"type": "function", "name": "lazy"}),
-                json!({"type": "namespace", "name": "mcp__docs", "description": "Docs.", "tools": [
+                json!({"type": "namespace", "name": "docs__tools", "description": "Docs.", "tools": [
                     {"type": "function", "name": "read", "description": "first"},
                     {"type": "function", "name": "write"},
                 ]}),
@@ -849,18 +849,18 @@ mod tests {
         let text = client_tool_search_output_text(&search_output(
             "c",
             json!([
-                {"type": "namespace", "name": "mcp__docs", "tools": [
+                {"type": "namespace", "name": "docs__tools", "tools": [
                     {"type": "function", "name": "read"}, {"type": "function", "name": "write"},
                 ]},
                 {"type": "function", "name": "shell"},
             ]),
         ));
         assert!(
-            text.contains("mcp__docs__read, mcp__docs__write, shell"),
+            text.contains("docs__tools__read, docs__tools__write, shell"),
             "{text}"
         );
         let none = client_tool_search_output_text(&search_output("c", json!([])));
-        assert!(!none.contains("mcp__"), "{none}");
+        assert!(!none.contains("docs__"), "{none}");
         assert_ne!(none, text);
     }
 

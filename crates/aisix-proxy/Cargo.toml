@@ -9,30 +9,9 @@ authors.workspace = true
 description = "aisix: /v1/* proxy router (OpenAI-compatible) + middleware + hooks"
 
 [dependencies]
-aisix-a2a = { path = "../aisix-a2a" }
 aisix-core = { path = "../aisix-core" }
 aisix-gateway = { path = "../aisix-gateway" }
-# Mounts the downstream-facing `/mcp` MCP gateway endpoint (mcp.rs): the
-# proxy builds an `McpGateway` from the snapshot's `mcp_servers` per request.
-aisix-mcp = { path = "../aisix-mcp" }
-# /v1/messages handler reaches into the Anthropic wire helpers
-# (parse_inbound_request / chat_response_into_anthropic_json /
-# AnthropicSseEncoder) so it can translate Anthropic-protocol
-# requests into ChatFormat for any upstream and back. The
-# Anthropic-passthrough branch also reaches into aisix-provider-openai's
-# `overrides::apply_*` primitives so the PK `request.*` block (param
-# renames, constraints, default body fields, default headers) takes
-# effect on outbound `/v1/messages` requests — without this the
-# override pipeline silently no-ops on the Anthropic path (#335 /
-# #337). These two crates, plus the Azure one below (used for its
-# credential only), are the only provider crates the proxy depends on
-# directly — others stay behind the Bridge trait.
-aisix-provider-anthropic = { path = "../aisix-provider-anthropic" }
 aisix-provider-openai = { path = "../aisix-provider-openai" }
-# `/v1/systemone` and `/v1/decisions` call Microsoft Foundry directly and
-# authenticate with an Azure key exactly as the Azure bridge does
-# (`resolve_credential`), including the Entra ID client-credentials shape.
-aisix-provider-azure-openai = { path = "../aisix-provider-azure-openai" }
 aisix-obs = { path = "../aisix-obs" }
 aisix-ratelimit = { path = "../aisix-ratelimit" }
 aisix-cache = { path = "../aisix-cache" }
@@ -94,9 +73,6 @@ lofty.workspace = true
 [dev-dependencies]
 # `test-util` drives the SSE-heartbeat tests on a paused clock.
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
-# aisix-provider-anthropic + aisix-provider-openai moved to
-# [dependencies] so the /v1/messages handler can use their primitives
-# in non-test builds too.
 wiremock.workspace = true
 # Captures the auth-denial log lines so their per-request fields are pinned.
 tracing-subscriber.workspace = true

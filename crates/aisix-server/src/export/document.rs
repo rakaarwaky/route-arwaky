@@ -248,27 +248,6 @@ pub fn build_export_document(
         |_, _| {}
     );
     export!(
-        mcp_servers,
-        "mcp_servers",
-        "MCP_SERVER",
-        |s| s.name.clone(),
-        |doc, ctx| { redact_top_level(doc, "secret", ctx) }
-    );
-    export!(
-        mcp_policies,
-        "mcp_policies",
-        "MCP_POLICY",
-        |_| String::new(),
-        |_, _| {}
-    );
-    export!(
-        a2a_agents,
-        "a2a_agents",
-        "A2A_AGENT",
-        |a| a.name.clone(),
-        |doc, ctx| { redact_top_level(doc, "secret", ctx) }
-    );
-    export!(
         cache_policies,
         "cache_policies",
         "CACHE_POLICY",
@@ -299,9 +278,6 @@ pub fn build_export_document(
         |p| p.name.clone(),
         |doc, ctx| {
             redact_top_level(doc, "hmac_secret", ctx);
-            if let Some(login) = doc.get_mut("login") {
-                redact_by_key(login, &["client_secret"], ctx);
-            }
         }
     );
     export!(
@@ -316,13 +292,6 @@ pub fn build_export_document(
         "passthrough_routes",
         "PASSTHROUGH_ROUTE",
         |r| r.name.clone(),
-        |_, _| {}
-    );
-    export!(
-        mcp_auth_settings,
-        "mcp_auth_settings",
-        "MCP_AUTH_SETTINGS",
-        |_| String::new(),
         |_, _| {}
     );
     export!(teams, "teams", "TEAM", |t| t.name.clone(), |_, _| {});
@@ -557,7 +526,6 @@ fn dangling_references(snapshot: &AisixSnapshot) -> Vec<String> {
         ("models", ids(&snapshot.models)),
         ("api_keys", ids(&snapshot.apikeys)),
         ("guardrails", ids(&snapshot.guardrails)),
-        ("mcp_servers", ids(&snapshot.mcp_servers)),
         ("passthrough_routes", ids(&snapshot.passthrough_routes)),
     ]);
 
@@ -577,8 +545,6 @@ fn dangling_references(snapshot: &AisixSnapshot) -> Vec<String> {
         ("guardrails", to_docs(&snapshot.guardrails)),
         ("cache_policies", to_docs(&snapshot.cache_policies)),
         ("claim_mappings", to_docs(&snapshot.claim_mappings)),
-        ("mcp_auth_settings", to_docs(&snapshot.mcp_auth_settings)),
-        ("mcp_policies", to_docs(&snapshot.mcp_policies)),
         ("passthrough_routes", to_docs(&snapshot.passthrough_routes)),
         (
             "rate_limit_policies",
@@ -634,7 +600,6 @@ fn dangling_references(snapshot: &AisixSnapshot) -> Vec<String> {
         );
         let target = match a.scope_type {
             GuardrailScopeType::Model => "models",
-            GuardrailScopeType::McpServer => "mcp_servers",
             GuardrailScopeType::ApiKey => "api_keys",
             GuardrailScopeType::PassthroughRoute => "passthrough_routes",
             // `env` carries no scope_id; a team is not a resource here.
@@ -677,30 +642,14 @@ fn reference_paths(kind: &str) -> &'static [(&'static str, &'static str)] {
             ("semantic.default_id", "models"),
             ("semantic.embedding_model_id", "models"),
             ("semantic.on_embedding_failure.target_id", "models"),
-            ("semantic.classifier.model_id", "models"),
-            ("semantic.classifier.provider_key_id", "provider_keys"),
-            ("semantic.classifier.on_failure.target_id", "models"),
         ],
-        "api_keys" => &[
-            ("allowed_model_ids.[]", "models"),
-            ("mcp_rate_limits_by_id.{}", "mcp_servers"),
-            ("mcp_access.allow_ids.[].server_id", "mcp_servers"),
-            ("mcp_access.deny_ids.[].server_id", "mcp_servers"),
-        ],
+        "api_keys" => &[("allowed_model_ids.[]", "models")],
         "guardrails" => &[("embedding_model_id", "models")],
         "cache_policies" => &[
             ("applies_to_model_id", "models"),
             ("semantic.embedding_model_id", "models"),
         ],
         "claim_mappings" => &[("resolve.api_key_id", "api_keys")],
-        "mcp_auth_settings" => &[
-            ("anonymous.api_key_id", "api_keys"),
-            ("anonymous.server_ids.[]", "mcp_servers"),
-        ],
-        "mcp_policies" => &[
-            ("allow_ids.[].server_id", "mcp_servers"),
-            ("deny_ids.[].server_id", "mcp_servers"),
-        ],
         "passthrough_routes" => &[
             ("anonymous_key_id", "api_keys"),
             ("provider_key_id", "provider_keys"),

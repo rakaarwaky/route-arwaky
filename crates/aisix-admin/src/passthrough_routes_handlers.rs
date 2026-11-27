@@ -1,5 +1,5 @@
 //! Read handlers for `/admin/v1/passthrough_routes`: list and get-by-id,
-//! same shape as [`crate::mcp_servers_handlers`]. Cross-field coupling
+//! same shape as [`crate::models_handlers`]. Cross-field coupling
 //! (match dimensions, target shape, per-mode required companions) lives in
 //! the canonical schema, enforced by the loader every configuration source
 //! goes through.

@@ -1,17 +1,11 @@
-//! Storage shared by every gateway of one environment: small values with a
-//! TTL and a version, written with a create-only or compare-and-set
-//! precondition.
+//! In-process store for small values with a TTL and a version, written
+//! with a create-only or compare-and-set precondition.
 //!
-//! Two backends implement [`SharedStore`]: the dp-manager's store API in
-//! managed mode (`aisix-server`), and [`MemoryStore`] wherever there is no
-//! dp-manager. The environment is the backend's concern, never a parameter.
-//!
-//! Values include upstream tokens and the key sessions are sealed with, in the
-//! clear: encrypting them at rest and restricting who can read them is the
-//! backend's job.
-//!
-//! Every write states a precondition, so a writer can always tell whether it
-//! won. [`consume`] builds an atomic single-use read out of that.
+//! Vendored into the Route Arwaky fork with the agent gateways removed:
+//! the semantic router's session pins need a place to live between
+//! requests. The store
+//! is one process: a restart loses the pins, which degrades a pinned
+//! session to an unpinned one, never to an error.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -88,47 +82,6 @@ pub trait SharedStore: Send + Sync {
         key: &str,
         if_version: Option<i64>,
     ) -> Result<(), StoreError>;
-}
-
-/// What a consumed key holds until the delete that follows lands.
-const CONSUMED: &[u8] = b"consumed";
-const CONSUMED_TTL: Duration = Duration::from_secs(60);
-
-/// Read `key` so that, of any number of concurrent callers on any number of
-/// gateways, exactly one gets the value. `Ok(None)` is everyone else, as well
-/// as a key that holds nothing.
-///
-/// The value is replaced by compare-and-set rather than deleted: a delete is
-/// idempotent, so two readers of one version would both see it succeed.
-pub async fn consume(
-    store: &dyn SharedStore,
-    namespace: &str,
-    key: &str,
-) -> Result<Option<Vec<u8>>, StoreError> {
-    let Some(stored) = store.get(namespace, key).await? else {
-        return Ok(None);
-    };
-    if stored.value == CONSUMED {
-        return Ok(None);
-    }
-    match store
-        .put(
-            namespace,
-            key,
-            CONSUMED.to_vec(),
-            CONSUMED_TTL,
-            &BTreeMap::new(),
-            PutCondition::IfVersion(stored.version),
-        )
-        .await
-    {
-        Ok(_) => {}
-        Err(StoreError::PreconditionFailed) => return Ok(None),
-        Err(error) => return Err(error),
-    }
-    // Best effort: the tombstone expires on its own.
-    let _ = store.delete(namespace, key, None).await;
-    Ok(Some(stored.value))
 }
 
 /// Past this many live entries in one namespace a write answers
@@ -351,34 +304,4 @@ mod tests {
         put("tokens", "k".to_owned()).await.unwrap();
     }
 
-    #[tokio::test]
-    async fn consume_hands_the_value_to_one_caller() {
-        let store = MemoryStore::default();
-        create(&store, "k", "a").await.unwrap();
-        assert_eq!(
-            consume(&store, "ns", "k").await.unwrap().as_deref(),
-            Some(&b"a"[..])
-        );
-        assert_eq!(consume(&store, "ns", "k").await.unwrap(), None);
-    }
-
-    /// The tombstone is what makes the race safe: a second reader that got
-    /// its GET in first still loses the compare-and-set.
-    #[tokio::test]
-    async fn a_reader_of_a_consumed_version_loses() {
-        let store = MemoryStore::default();
-        let version = create(&store, "k", "a").await.unwrap();
-        store
-            .put(
-                "ns",
-                "k",
-                CONSUMED.to_vec(),
-                TTL,
-                &BTreeMap::new(),
-                PutCondition::IfVersion(version),
-            )
-            .await
-            .unwrap();
-        assert_eq!(consume(&store, "ns", "k").await.unwrap(), None);
-    }
 }

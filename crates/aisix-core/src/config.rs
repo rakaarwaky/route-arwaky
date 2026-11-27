@@ -93,23 +93,6 @@ pub struct Config {
     /// Missing or `enabled = false` runs standalone.
     #[serde(default)]
     pub managed: ManagedConfig,
-    /// Deployment-wide override for the AWS Bedrock endpoint URL,
-    /// applied to every kind=bedrock guardrail dispatcher built from
-    /// the snapshot. Unset (the default) → SDK default (real AWS).
-    ///
-    /// Set this when pointing the DP at a local Bedrock-compatible
-    /// service (LocalStack, a fakecloud / WireMock sidecar in e2e),
-    /// or when an outbound HTTP proxy needs to terminate the call.
-    /// Empty string is treated as unset so a `docker run -e
-    /// AISIX_BEDROCK_ENDPOINT_URL=` doesn't accidentally redirect.
-    ///
-    /// Top-level on purpose — overriding the Bedrock endpoint is a
-    /// deployment concern, not a per-guardrail-row configuration that
-    /// a tenant should be able to set. The matching env var
-    /// `AISIX_BEDROCK_ENDPOINT_URL` is what gets picked up by
-    /// config-rs via the `AISIX_` prefix.
-    #[serde(default)]
-    pub bedrock_endpoint_url: Option<String>,
     /// Keys the loaded file or environment carried that name no setting:
     /// the dotted path, and the `AISIX_*` variable that set it, if one did.
     /// See [`Config::ignored_keys`].
@@ -704,7 +687,7 @@ pub struct ProxyConfig {
     /// It is then ignored, and nothing binds it.
     pub addr: String,
     /// Cap on inbound request bodies across the whole proxy surface
-    /// (JSON, multipart, passthrough, MCP, A2A). `0` — the default —
+    /// (JSON, multipart, passthrough). `0` — the default —
     /// disables the cap, matching the reference LLM proxy's
     /// out-of-box behaviour: providers accept larger requests than any
     /// fixed gateway default (Anthropic takes 32 MB), so a gateway-side
@@ -786,8 +769,7 @@ pub struct ProxyConfig {
     /// once, no cascading — and the request then flows
     /// through the normal endpoint (auth, ACL, quota, …) as if the client
     /// had sent the rewritten path. Lets operators map legacy URL shapes
-    /// onto AISIX endpoints, e.g. per-server MCP paths onto
-    /// `/mcp/{server}`. Empty (the default) = no rewriting.
+    /// onto AISIX endpoints. Empty (the default) = no rewriting.
     ///
     /// Env-only deployments (the chart injects config purely through
     /// `AISIX_*` vars, which cannot express a structured list) set the
@@ -1116,14 +1098,14 @@ impl RealIpConfig {
 /// supported, operator-declared capability, while turning that credential
 /// into a logged identifier is never useful.
 pub const CREDENTIAL_HEADERS: &[&str] = &[
-    "authorization",        // OpenAI / Anthropic / Vertex Bearer
+    "authorization",        // OpenAI / bearer tokens generally
     "x-aisix-api-key",      // the gateway's own credential header
-    "x-api-key",            // Anthropic raw, also OpenAI legacy proxies
-    "x-goog-api-key",       // Gemini API key
-    "api-key",              // Azure OpenAI key
-    "x-amz-security-token", // AWS SigV4 session header (Bedrock)
-    "x-amz-date",           // AWS SigV4 timestamp (Bedrock)
-    "x-amz-content-sha256", // AWS SigV4 body hash (Bedrock)
+    "x-api-key",            // raw provider keys, also legacy proxies
+    "x-goog-api-key",       // Google API keys
+    "api-key",              // raw provider keys, common on Azure deployments
+    "x-amz-security-token", // AWS SigV4 session header
+    "x-amz-date",           // AWS SigV4 timestamp
+    "x-amz-content-sha256", // AWS SigV4 body hash
     "proxy-authorization",  // proxy auth — never operator-controllable
     "cookie",               // session bleed between caller and upstream
     "host",                 // URL hijack via Host header
@@ -1488,13 +1470,6 @@ pub struct HistogramBucketsConfig {
     pub request_ttft: Option<Vec<f64>>,
     /// `aisix_guardrail_latency_seconds`
     pub guardrail_latency: Option<Vec<f64>>,
-    /// `aisix_a2a_ttfb_seconds`
-    ///
-    /// Separate from `request_ttft` on purpose: an agent's wait for its first
-    /// event and a model's wait for its first token have the same shape but
-    /// not the same range — an A2A task may think for minutes before it says
-    /// anything. Defaults to the same edges as `request_ttft`.
-    pub a2a_ttfb: Option<Vec<f64>>,
 }
 
 /// One rule matches the inbound `User-Agent` after removing control
@@ -1850,33 +1825,13 @@ pub struct UpstreamConfig {
     /// Downloading a chat request's media URL for an upstream that cannot
     /// read one itself — see [`MediaFetchConfig`].
     pub media_fetch: MediaFetchConfig,
-    /// Amazon Bedrock endpoints the provider key does not name — see
-    /// [`BedrockUpstreamConfig`].
-    pub bedrock: BedrockUpstreamConfig,
 }
 
-/// Amazon Bedrock endpoints beyond the `bedrock-runtime` one a provider key
-/// names with `api_base`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(default)]
-pub struct BedrockUpstreamConfig {
-    /// Base URL of Bedrock Mantle, where `/v1/messages/count_tokens` for a
-    /// Claude model is counted when `bedrock-runtime`'s CountTokens refuses
-    /// that model (`POST {mantle_endpoint}/anthropic/v1/messages/count_tokens`,
-    /// signed with the provider key's credentials). `null` (the default)
-    /// derives the public regional host from the provider key's region,
-    /// `https://bedrock-mantle.{region}.api.aws`; set it for a private
-    /// (VPC endpoint) or GovCloud deployment. One value serves every
-    /// Bedrock provider key.
-    pub mantle_endpoint: Option<String>,
-}
 
 /// When a chat request carries an image, audio or file part as a URL and
-/// the target upstream cannot read that URL (Amazon Bedrock, Claude on
-/// Vertex AI, an `http://` URL toward Anthropic or Gemini), the gateway
-/// downloads it and sends the bytes inline. An upstream that reads the URL
-/// itself still gets the URL.
+/// the target upstream cannot read that URL itself, the gateway downloads
+/// it and sends the bytes inline. An upstream that reads the URL itself
+/// still gets the URL.
 ///
 /// Which addresses the download may reach is
 /// [`OutboundConfig::ssrf_protection`].
@@ -1902,12 +1857,11 @@ impl Default for MediaFetchConfig {
 }
 
 /// Outbound requests to a URL neither the operator nor the configured service
-/// chose: the media download (`upstream.media_fetch`), whose URL an API caller
-/// supplied, and an OAuth document or endpoint an MCP server's metadata names on
-/// another authority (scheme, host and port) than the server's `url`. Configured
-/// URLs — a provider key's `api_base`, guardrail, MCP and A2A endpoints, a trust
-/// provider and its discovery document, an MCP server's configured OAuth endpoints
-/// and what it publishes on its own authority, JWKS, exporters — are not governed
+/// chose — the media download (`upstream.media_fetch`), whose URL an API caller
+/// supplied. Configured
+/// URLs — a provider key's `api_base`, guardrail endpoints, a trust
+/// provider and its discovery document,
+/// JWKS, exporters — are not governed
 /// by it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
@@ -1967,7 +1921,6 @@ impl Default for UpstreamConfig {
             retries: DEFAULT_UPSTREAM_RETRIES,
             tls: OutboundTlsConfig::default(),
             media_fetch: MediaFetchConfig::default(),
-            bedrock: BedrockUpstreamConfig::default(),
         }
     }
 }
@@ -1977,8 +1930,8 @@ impl Default for UpstreamConfig {
 /// Used twice, because the two peer classes are issued certificates by
 /// different authorities and must be configurable apart: `upstream.tls`
 /// covers everything the gateway calls out to on a request path — the
-/// provider bridges, guardrail services, MCP and A2A upstreams, the
-/// OIDC/JWKS fetches, the Realtime WebSocket, Bedrock, and the
+/// provider bridges, guardrail services,
+/// the OIDC/JWKS fetches, the Realtime WebSocket, and the
 /// log-export object stores — while a `redis.tls` block covers the
 /// shared cache / rate-limit backend.
 ///
@@ -2148,9 +2101,8 @@ impl Default for ShutdownConfig {
 /// injects such variables, rather than reported as an ignored key.
 /// `config_top_level_keys_match_the_struct` fails the build when a field
 /// is added or renamed without this list following.
-const TOP_LEVEL_ENV_KEYS: [&str; 13] = [
+const TOP_LEVEL_ENV_KEYS: [&str; 12] = [
     "admin",
-    "bedrock_endpoint_url",
     "cache",
     "downstream",
     "etcd",
@@ -2277,7 +2229,6 @@ const ENV_LIST_PARSE_KEYS: &[&str] = &[
     "observability.metrics.buckets.request_e2e_latency",
     "observability.metrics.buckets.request_ttft",
     "observability.metrics.buckets.guardrail_latency",
-    "observability.metrics.buckets.a2a_ttfb",
     "observability.heap_profiling.auto_dump.thresholds",
     "cache.redis.nodes",
     "cache.redis.sentinels",
@@ -2956,7 +2907,7 @@ admin:
         if !in_child_with_env(
             "a_flat_top_level_env_var_still_overrides_the_file",
             "TEST_ENV_FLAT_TOP_LEVEL_CHILD",
-            &[("AISIX_BEDROCK_ENDPOINT_URL", "http://localstack:4566")],
+            &[("AISIX_RESOURCES_FILE", "/tmp/aisix-resources.json")],
         ) {
             return;
         }
@@ -2964,8 +2915,8 @@ admin:
         let f = write_yaml(ENV_TEST_CONFIG);
         let cfg = Config::load_from_path(Some(f.path())).unwrap();
         assert_eq!(
-            cfg.bedrock_endpoint_url.as_deref(),
-            Some("http://localstack:4566"),
+            cfg.resources_file.as_deref(),
+            Some("/tmp/aisix-resources.json"),
         );
         assert!(Config::ignored_env_overrides().is_empty());
     }
@@ -3041,7 +2992,7 @@ admin:
         let overrides = EnvOverrides::partition(
             [
                 ("aisix_proxy__addr", "127.0.0.1:1"),
-                ("Aisix_Bedrock_Endpoint_Url", "http://localhost:4566"),
+                ("Aisix_Resources_File", "http://localhost:4566"),
                 ("PATH", "/usr/bin"),
                 ("AISIX_OSS_SERVICE_HOST", "10.96.0.12"),
             ]
@@ -3050,7 +3001,7 @@ admin:
         );
         let mut kept: Vec<&str> = overrides.source.keys().map(String::as_str).collect();
         kept.sort_unstable();
-        assert_eq!(kept, ["Aisix_Bedrock_Endpoint_Url", "aisix_proxy__addr"]);
+        assert_eq!(kept, ["Aisix_Resources_File", "aisix_proxy__addr"]);
         assert_eq!(overrides.warnings.len(), 1);
         assert!(overrides.warnings[0].starts_with("AISIX_OSS_SERVICE_HOST "));
     }
@@ -3798,9 +3749,9 @@ etcd:
 proxy:
   addr: "0.0.0.0:3000"
   url_rewrites:
-    - name: per-server-mcp-compat
-      match: "^/mcp-servers/([^/]+)/mcp$"
-      rewrite: "/mcp/$1"
+    - name: legacy-chat-compat
+      match: "^/legacy-chat/([^/]+)$"
+      rewrite: "/v1/chat/$1"
 admin:
   addr: "127.0.0.1:3001"
   admin_keys: ["k1"]
@@ -3808,7 +3759,7 @@ admin:
         );
         let cfg = Config::load_from_path(Some(f.path())).unwrap();
         assert_eq!(cfg.proxy.url_rewrites.len(), 1);
-        assert_eq!(cfg.proxy.url_rewrites[0].replacement, "/mcp/$1");
+        assert_eq!(cfg.proxy.url_rewrites[0].replacement, "/v1/chat/$1");
         assert!(cfg.proxy.url_rewrites[0].hosts.is_none());
 
         let f = write_yaml(
@@ -3819,8 +3770,8 @@ etcd:
 proxy:
   addr: "0.0.0.0:3000"
   url_rewrites:
-    - match: "^/mcp-servers/([^/+/mcp$"
-      rewrite: "/mcp/$1"
+    - match: "^/legacy-chat/([^/+$"
+      rewrite: "/v1/chat/$1"
 admin:
   addr: "127.0.0.1:3001"
   admin_keys: ["k1"]
@@ -3977,7 +3928,7 @@ etcd:
   prefix: "/aisix"
 proxy:
   addr: "0.0.0.0:3000"
-  url_rewrites: '[{"name":"compat","match":"^/mcp-servers/([^/]+)/mcp$","rewrite":"/mcp/$1"}]'
+  url_rewrites: '[{"name":"compat","match":"^/legacy-chat/([^/]+)$","rewrite":"/v1/chat/$1"}]'
 admin:
   addr: "127.0.0.1:3001"
   admin_keys: ["k1"]
@@ -4466,11 +4417,11 @@ admin:
         // An unknown group reference expands to the empty string at runtime
         // — every legacy request would silently land on the wrong endpoint.
         case(
-            "    - match: \"^/mcp-servers/([^/]+)/mcp$\"\n      rewrite: \"/mcp/$2\"",
+            "    - match: \"^/legacy/([^/]+)$\"\n      rewrite: \"/v1/chat/$2\"",
             "unknown capture group",
         );
         case(
-            "    - match: \"^/gw/(?P<server>[^/]+)$\"\n      rewrite: \"/mcp/${srv}\"",
+            "    - match: \"^/gw/(?P<server>[^/]+)$\"\n      rewrite: \"/v1/chat/${srv}\"",
             "unknown capture group",
         );
         // `?` would absorb the caller's query; `#` would truncate the path.
@@ -4499,7 +4450,7 @@ proxy:
   addr: "0.0.0.0:3000"
   url_rewrites:
     - match: "^/gw/(?P<server>[^/]+)/v(\\d+)$"
-      rewrite: "/mcp/${server}-v${2}"
+      rewrite: "/v1/chat/${server}-v${2}"
 admin:
   addr: "127.0.0.1:3001"
   admin_keys: ["k1"]
@@ -5782,49 +5733,6 @@ managed:
         let cfg = Config::load_from_path(Some(f.path())).unwrap();
         assert_eq!(cfg.ignored_keys().len(), 1);
         assert!(cfg.ignored_keys()[0].starts_with("managed.registration_token is not a setting"));
-    }
-
-    #[test]
-    fn bedrock_endpoint_url_defaults_to_none_when_unset() {
-        // Minimal config without bedrock_endpoint_url → field should
-        // be `None`, matching "real AWS Bedrock" semantics.
-        let f = write_yaml(
-            r#"
-etcd:
-  endpoints: ["http://127.0.0.1:2379"]
-proxy:
-  addr: "0.0.0.0:3000"
-admin:
-  addr: "127.0.0.1:3001"
-  admin_keys: ["k1"]
-"#,
-        );
-        let cfg = Config::load_from_path(Some(f.path())).unwrap();
-        assert!(cfg.bedrock_endpoint_url.is_none());
-    }
-
-    #[test]
-    fn bedrock_endpoint_url_round_trips_through_yaml() {
-        // Operators set this when pointing the DP at LocalStack /
-        // fakecloud / a Bedrock-compatible mock; pin that the field
-        // makes it through the loader and back out.
-        let f = write_yaml(
-            r#"
-etcd:
-  endpoints: ["http://127.0.0.1:2379"]
-proxy:
-  addr: "0.0.0.0:3000"
-admin:
-  addr: "127.0.0.1:3001"
-  admin_keys: ["k1"]
-bedrock_endpoint_url: "http://fakecloud:8000"
-"#,
-        );
-        let cfg = Config::load_from_path(Some(f.path())).unwrap();
-        assert_eq!(
-            cfg.bedrock_endpoint_url.as_deref(),
-            Some("http://fakecloud:8000"),
-        );
     }
 
     #[test]

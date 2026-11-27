@@ -2515,13 +2515,9 @@ fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
         cache_policies,
         observability_exporters,
         rate_limit_policies,
-        mcp_servers,
-        mcp_policies,
-        a2a_agents,
         oidc_providers,
         claim_mappings,
         passthrough_routes,
-        mcp_auth_settings,
         pricing,
         global_pricing,
         teams,
@@ -2554,15 +2550,6 @@ fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
     for e in rate_limit_policies.entries() {
         dst.rate_limit_policies.insert_arc(e);
     }
-    for e in mcp_servers.entries() {
-        dst.mcp_servers.insert_arc(e);
-    }
-    for e in mcp_policies.entries() {
-        dst.mcp_policies.insert_arc(e);
-    }
-    for e in a2a_agents.entries() {
-        dst.a2a_agents.insert_arc(e);
-    }
     for e in oidc_providers.entries() {
         dst.oidc_providers.insert_arc(e);
     }
@@ -2571,9 +2558,6 @@ fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
     }
     for e in passthrough_routes.entries() {
         dst.passthrough_routes.insert_arc(e);
-    }
-    for e in mcp_auth_settings.entries() {
-        dst.mcp_auth_settings.insert_arc(e);
     }
     for e in pricing.entries() {
         dst.pricing.insert_arc(e);
@@ -2614,13 +2598,9 @@ fn remove_from_snapshot(snap: &AisixSnapshot, kind: &str, id: &str) {
         cache_policies,
         observability_exporters,
         rate_limit_policies,
-        mcp_servers,
-        mcp_policies,
-        a2a_agents,
         oidc_providers,
         claim_mappings,
         passthrough_routes,
-        mcp_auth_settings,
         pricing,
         global_pricing,
         teams,
@@ -2654,15 +2634,6 @@ fn remove_from_snapshot(snap: &AisixSnapshot, kind: &str, id: &str) {
         "rate_limit_policies" => {
             rate_limit_policies.remove(id);
         }
-        "mcp_servers" => {
-            mcp_servers.remove(id);
-        }
-        "mcp_policies" => {
-            mcp_policies.remove(id);
-        }
-        "a2a_agents" => {
-            a2a_agents.remove(id);
-        }
         "oidc_providers" => {
             oidc_providers.remove(id);
         }
@@ -2671,9 +2642,6 @@ fn remove_from_snapshot(snap: &AisixSnapshot, kind: &str, id: &str) {
         }
         "passthrough_routes" => {
             passthrough_routes.remove(id);
-        }
-        "mcp_auth_settings" => {
-            mcp_auth_settings.remove(id);
         }
         // Not the `pricing` kind but the table selector — a global-prefix
         // pricing row arrives here as `global_pricing`. See
@@ -2764,13 +2732,9 @@ fn snapshot_has(snap: &AisixSnapshot, kind: &str, id: &str) -> bool {
         cache_policies,
         observability_exporters,
         rate_limit_policies,
-        mcp_servers,
-        mcp_policies,
-        a2a_agents,
         oidc_providers,
         claim_mappings,
         passthrough_routes,
-        mcp_auth_settings,
         pricing,
         global_pricing,
         teams,
@@ -2788,13 +2752,9 @@ fn snapshot_has(snap: &AisixSnapshot, kind: &str, id: &str) -> bool {
         "cache_policies" => cache_policies.get_by_id(id).is_some(),
         "observability_exporters" => observability_exporters.get_by_id(id).is_some(),
         "rate_limit_policies" => rate_limit_policies.get_by_id(id).is_some(),
-        "mcp_servers" => mcp_servers.get_by_id(id).is_some(),
-        "mcp_policies" => mcp_policies.get_by_id(id).is_some(),
-        "a2a_agents" => a2a_agents.get_by_id(id).is_some(),
         "oidc_providers" => oidc_providers.get_by_id(id).is_some(),
         "claim_mappings" => claim_mappings.get_by_id(id).is_some(),
         "passthrough_routes" => passthrough_routes.get_by_id(id).is_some(),
-        "mcp_auth_settings" => mcp_auth_settings.get_by_id(id).is_some(),
         "pricing" => pricing.get_by_id(id).is_some(),
         "global_pricing" => global_pricing.get_by_id(id).is_some(),
         "teams" => teams.get_by_id(id).is_some(),
@@ -2831,13 +2791,9 @@ fn resource_counts(snap: &AisixSnapshot) -> BTreeMap<String, usize> {
             snap.observability_exporters.len(),
         ),
         ("rate_limit_policies", snap.rate_limit_policies.len()),
-        ("mcp_servers", snap.mcp_servers.len()),
-        ("mcp_policies", snap.mcp_policies.len()),
-        ("a2a_agents", snap.a2a_agents.len()),
         ("oidc_providers", snap.oidc_providers.len()),
         ("claim_mappings", snap.claim_mappings.len()),
         ("passthrough_routes", snap.passthrough_routes.len()),
-        ("mcp_auth_settings", snap.mcp_auth_settings.len()),
         ("pricing", snap.pricing.len()),
         ("global_pricing", snap.global_pricing.len()),
         ("teams", snap.teams.len()),
@@ -4912,12 +4868,6 @@ mod tests {
             "issuer": "https://idp.example.com/realms/agents",
             "audiences": ["aisix-gateway"]
         }"#;
-        // The MCP OAuth discovery settings row (AISIX-Cloud#1143) —
-        // configuring the resource URL mid-run must activate the
-        // discovery surface without a resync.
-        const VALID_MCP_AUTH_SETTINGS: &[u8] = br#"{
-            "resource_url": "https://gw.example.com/mcp"
-        }"#;
         // A claim mapping created mid-run (AISIX-Cloud#564) — same
         // guard: a rule added via watch must be live without a resync.
         const VALID_CLAIM_MAPPING: &[u8] = br#"{
@@ -4955,11 +4905,6 @@ mod tests {
                 "OidcProvider",
             ),
             (
-                "/aisix/mcp_auth_settings/env-1",
-                VALID_MCP_AUTH_SETTINGS,
-                "McpAuthSettings",
-            ),
-            (
                 "/aisix/claim_mappings/cm-1",
                 VALID_CLAIM_MAPPING,
                 "ClaimMapping",
@@ -4987,11 +4932,6 @@ mod tests {
         );
         assert_eq!(snap.oidc_providers.len(), 1, "OidcProvider not merged");
         assert_eq!(snap.claim_mappings.len(), 1, "ClaimMapping not merged");
-        assert_eq!(
-            snap.mcp_auth_settings.len(),
-            1,
-            "McpAuthSettings not merged"
-        );
     }
 
     #[tokio::test]
@@ -5018,13 +4958,6 @@ mod tests {
                     br#"{"name":"idp","issuer":"https://idp.example.com","audiences":["aisix"]}"#,
                     1,
                 ),
-                // AISIX-Cloud#1143: clearing the resource URL projects a
-                // delete; it must deactivate the discovery surface.
-                entry(
-                    "/aisix/mcp_auth_settings/env-1",
-                    br#"{"resource_url":"https://gw.example.com/mcp"}"#,
-                    1,
-                ),
                 // AISIX-Cloud#564: deleting a claim mapping must reach
                 // the snapshot, or revoking a rule never takes effect.
                 entry(
@@ -5049,8 +4982,6 @@ mod tests {
         assert_eq!(sup.handle().load().claim_mappings.len(), 1);
         assert!(sup.apply_delete("/aisix/claim_mappings/cm-1"));
         assert!(sup.handle().load().claim_mappings.is_empty());
-        assert!(sup.apply_delete("/aisix/mcp_auth_settings/env-1"));
-        assert!(sup.handle().load().mcp_auth_settings.is_empty());
     }
 
     #[tokio::test]

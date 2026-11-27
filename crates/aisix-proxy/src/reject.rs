@@ -34,15 +34,12 @@ use crate::usage_attr::UNRESOLVED_MODEL_LABEL;
 /// already record, so the series doesn't fork.
 const UNRESOLVED_PROVIDER_LABEL: &str = "unknown";
 
-/// Which wire envelope the caller expects. The Anthropic-protocol routes
-/// (`/v1/messages`, `/v1/messages/count_tokens`) must answer in Anthropic
-/// shape or the Claude SDK can't parse the error (#336) — the rejection
-/// path is no exception.
+/// Which wire envelope the caller expects. Route Arwaky serves only
+/// the OpenAI envelope; the parameter remains so call sites state the
+/// envelope they belong to.
 #[derive(Clone, Copy)]
 pub(crate) enum Envelope {
     OpenAi,
-    Gemini,
-    Anthropic,
 }
 
 /// Emit the access log + request metrics for a request refused before
@@ -65,8 +62,6 @@ pub(crate) fn reject_before_dispatch(
     record_rejection(state, method, path, request_id, api_key_id, started, &err);
     match envelope {
         Envelope::OpenAi => err.into_response(),
-        Envelope::Gemini => err.into_gemini_response(),
-        Envelope::Anthropic => err.into_anthropic_response(),
     }
 }
 
@@ -105,7 +100,6 @@ pub(crate) fn record_rejection(
         routing_fallback_count: None,
         error_kind: Some(error_kind),
         error: Some(&error),
-        mcp: None,
         cache: None,
         request_body_bytes: None,
         response_body_bytes: None,
@@ -165,15 +159,14 @@ pub(crate) fn emit_unrouted_access_log(
         routing_fallback_count: None,
         error_kind: None,
         error: None,
-        mcp: None,
         cache: None,
         request_body_bytes: None,
         response_body_bytes: None,
     });
 }
 
-/// Count a request answered without dispatch (`/v1/models`, the A2A agent
-/// card, the OAuth discovery documents) in the request families. Nothing
+/// Count a request answered without dispatch (`/v1/models` and the other
+/// pre-dispatch rejections) in the request families. Nothing
 /// upstream was resolved, so only the route, the caller and the outcome are
 /// labelled.
 pub(crate) fn record_undispatched(
@@ -253,8 +246,8 @@ where
                 if axum_response.status() != axum::http::StatusCode::BAD_REQUEST {
                     return Err(axum_response);
                 }
-                // Fallback mirrors the handlers' own idiom (see mcp.rs /
-                // a2a.rs); unreachable in the real router, where
+                // Fallback mirrors the handlers' own idiom; unreachable in
+                // the real router, where
                 // `ensure_request_id` runs before routing.
                 let request_id = parts
                     .extensions
@@ -361,9 +354,6 @@ mod tests {
         let state = state();
         let router = crate::build_router(state.clone());
         for (method, path) in [
-            ("POST", "/a2a/%ff"),
-            ("GET", "/a2a/%ff/.well-known/agent-card.json"),
-            ("GET", "/mcp/%ff"),
             ("GET", "/v1/files/%ff"),
             ("DELETE", "/v1/files/%ff"),
             ("GET", "/v1/files/%ff/content"),

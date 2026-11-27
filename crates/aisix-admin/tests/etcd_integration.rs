@@ -296,7 +296,6 @@ async fn apikeys_round_trip_through_real_etcd() {
         json!({
             "key_hash": key_hash,
             "allowed_models": ["it-gpt4"],
-            "mcp_access": {"allow": ["github__create_issue", "*"]}
         }),
     )
     .await;
@@ -318,27 +317,6 @@ async fn provider_keys_round_trip_through_real_etcd() {
             "provider": "openai",
             "adapter": "openai",
             "api_key": "sk-it"
-        }),
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn mcp_servers_round_trip_through_real_etcd() {
-    let Some(url) = etcd_url() else {
-        eprintln!("skipping: ADMIN_TEST_ETCD_URL not set");
-        return;
-    };
-    direct_write_read_round_trip(
-        &url,
-        "mcp_servers",
-        "/admin/v1/mcp_servers",
-        "mcp-it-1",
-        json!({
-            "name": "github-it",
-            "url": "https://api.example.com/mcp",
-            "auth_type": "bearer",
-            "secret": "tok-it"
         }),
     )
     .await;
@@ -400,30 +378,6 @@ async fn observability_exporters_round_trip_through_real_etcd() {
     .await;
 }
 
-#[tokio::test]
-async fn a2a_agents_round_trip_through_real_etcd() {
-    let Some(url) = etcd_url() else {
-        eprintln!("skipping: ADMIN_TEST_ETCD_URL not set");
-        return;
-    };
-    direct_write_read_round_trip(
-        &url,
-        "a2a_agents",
-        "/admin/v1/a2a_agents",
-        "a2a-it-1",
-        json!({
-            "name": "invoice-it",
-            "url": "https://agents.example.com/a2a"
-        }),
-    )
-    .await;
-}
-
-// ─────────────────────────── Removed write path ───────────────────────────
-
-/// The write contract holds against the real etcd-backed store too:
-/// resource writes answer 405 (`Allow: GET`), rotate is 404, and
-/// nothing lands in etcd.
 #[tokio::test]
 async fn admin_writes_are_refused_against_real_etcd() {
     let Some(url) = etcd_url() else {
@@ -562,16 +516,6 @@ async fn loader_picks_up_every_direct_write() {
                 "endpoint": "https://otel.example.com/v1/traces"
             }),
         ),
-        (
-            "mcp_servers",
-            "mcp-loader-1",
-            json!({"name": "loader-mcp", "url": "https://api.example.com/mcp"}),
-        ),
-        (
-            "a2a_agents",
-            "a2a-loader-1",
-            json!({"name": "loader-a2a", "url": "https://agents.example.com/a2a"}),
-        ),
     ];
     for (kind, id, doc) in &writes {
         seed(&mut client, &prefix, kind, id, doc).await;
@@ -615,7 +559,7 @@ async fn loader_picks_up_every_direct_write() {
          likely a subkey drift against the match arms in \
          aisix_etcd::loader: {stats:?}"
     );
-    assert_eq!(stats.accepted, 8, "expected 8 entries; got {stats:?}");
+    assert_eq!(stats.accepted, 6, "expected 6 entries; got {stats:?}");
 
     // Each resource table should now have exactly one entry.
     assert_eq!(snap.models.len(), 1);
@@ -624,8 +568,6 @@ async fn loader_picks_up_every_direct_write() {
     assert_eq!(snap.guardrails.len(), 1);
     assert_eq!(snap.cache_policies.len(), 1);
     assert_eq!(snap.observability_exporters.len(), 1);
-    assert_eq!(snap.mcp_servers.len(), 1);
-    assert_eq!(snap.a2a_agents.len(), 1);
 }
 
 /// The admin read path against an etcd whose auth token stops working

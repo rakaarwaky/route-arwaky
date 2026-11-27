@@ -192,7 +192,7 @@ fn base64_omitted(original_bytes: usize) -> String {
 /// beside a mime type; `source.bytes` of an `image` / `document` / `video` / `audio`
 /// object;
 /// a replayed `image_generation_call`'s `result`; and the image APIs' `b64_json`,
-/// `partial_image_b64` and `bytesBase64Encoded`; and an MCP content block's
+/// `partial_image_b64` and `bytesBase64Encoded`; and a tool-call content block's
 /// `data` on an `image` / `audio` block beside its `mimeType`, or `resource.blob`
 /// on an embedded `resource`.
 pub fn omit_base64_media(v: &mut Value) -> bool {

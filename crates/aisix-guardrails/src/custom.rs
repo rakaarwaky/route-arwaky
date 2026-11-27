@@ -649,7 +649,7 @@ impl Guardrail for CustomGuardrail {
         // policy over the CALL, not a text matcher: `checkInput` may block
         // on `ctx.model`, on a secret-backed lookup, or unconditionally,
         // and an operator who wrote such a rule expects it to decide a
-        // request that happens to carry no text (an argument-less MCP tool
+        // request that happens to carry no text (an argument-less tool
         // call, a transcription with no `prompt`). Running a local sandbox
         // on an empty context is cheap; the remote kinds keep their own
         // empty-text guards, so this costs no provider round-trip.
@@ -1388,7 +1388,7 @@ mod tests {
 
     /// A script's verdict is a decision about the CALL, not a text match,
     /// so it must be consulted even when the request carries nothing to
-    /// scan. This is the bug that let an MCP `tools/call` with
+    /// scan. This is the bug that let a tool `call` with
     /// `"arguments": {}` — and an audio upload with no `prompt` — execute
     /// under an unconditional block rule.
     #[tokio::test]
@@ -1408,7 +1408,7 @@ mod tests {
         }
     }
 
-    /// The segment hook — the path the MCP and LLM families take for a
+    /// The segment hook — the path the tool and LLM families take for a
     /// segment-moderating member — has the same obligation with zero slots.
     #[tokio::test]
     async fn empty_segment_list_still_reaches_the_script() {

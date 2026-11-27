@@ -314,7 +314,7 @@ pub const M_GUARDRAIL_LATENCY_SECONDS: &str = "aisix_guardrail_latency_seconds";
 /// Issue #408: counter for UsageEvent emission attempts, incremented before
 /// the `UsageSink` accepts or rejects the event. Operators slice this by:
 /// - `handler`: the bounded handler family that emitted the event (for
-///   example `chat`, `messages`, `count_tokens`, `responses`, `mcp`, or
+///   example `chat`, `messages`, `count_tokens`, `responses`, or
 ///   `passthrough_route`). Fixed enumeration, low cardinality.
 /// - `status_code`: bucketed as `2xx` / `4xx` / `5xx`.
 /// - `status`: the raw code (`429`, `502`, ...), so a query can name one
@@ -330,14 +330,16 @@ pub const M_GUARDRAIL_LATENCY_SECONDS: &str = "aisix_guardrail_latency_seconds";
 ///   their display name, from [`UsageEventLabels`]. Both come off one
 ///   ApiKey row, so the name is determined by the id and the pair is one
 ///   series, not one per name.
-/// - `inbound_protocol`: `openai` / `anthropic` / `mcp` / `other`, with
-///   non-HTTP and tunnel protocols folded into the bounded `other` bucket.
+/// - `inbound_protocol`: `openai` / `anthropic` / `gemini` / `dashscope`
+///   / `other`, with non-HTTP and passthrough protocols folded into the
+///   bounded `other` bucket.
 /// - `upstream_protocol`: the wire protocol of the ProviderKey the event
 ///   was attributed to, so this family joins with the request and usage
 ///   families on that dimension (AISIX-Cloud#1403). Read off the SAME
 ///   resolved row as `provider_key_id` / `provider_key_name`, and
 ///   `unknown` for an event that never selected an upstream (a
-///   pre-dispatch rejection, or a non-inference tunnel like `/mcp`).
+///   pre-dispatch rejection, or a passthrough relay with no LLM
+///   upstream).
 ///
 /// Paired with `aisix_usage_event_drops_total{reason}` for the
 /// `try_send` failure paths (sink full / closed).
@@ -407,8 +409,7 @@ pub const M_OTLP_FANOUT_FAILURES_TOTAL: &str = "aisix_otlp_fanout_failures_total
 ///   in an upstream error or timeout): a cache hit or a request that
 ///   failed before dispatch observes `downstream` only. Earlier failed
 ///   attempts and retry backoff are not observed on their own; they stay
-///   inside the `downstream` figure. On `/a2a` the attempt is the one
-///   call to the upstream agent. Ensemble models, whose response comes
+///   inside the `downstream` figure. Ensemble models, whose response comes
 ///   from no single upstream attempt, observe `downstream` only.
 ///
 /// Both observations of one request carry identical labels apart from
@@ -458,49 +459,6 @@ impl LatencySide {
         }
     }
 }
-
-// ── A2A gateway series (AISIX-Cloud#1215) ──────────────────────────────────
-//
-// The `aisix_proxy_*` families already count `/a2a` traffic and time it, but
-// only by route: which agent was reached and which operation was invoked are
-// not labels there, so "is the invoice agent's `message/stream` failing?" —
-// the question an agent-platform operator actually asks — cannot be answered
-// from them. These four carry that dimension and nothing else, so they stay
-// bounded: `agent` is a registered resource name, `operation` the canonical
-// bounded set, `state` the specification's task states. Task, context and
-// JSON-RPC request ids are deliberately absent — they belong in logs and
-// traces, never in a label.
-//
-// Request DURATION is not repeated here: `aisix_proxy_request_duration_seconds`
-// already times `/a2a` end to end, and a second histogram of the same quantity
-// would only be a second thing to keep in sync.
-/// A2A calls by agent, canonical operation and status class.
-///
-/// It does NOT agree with `aisix_proxy_requests_total{endpoint="/a2a"}`, and
-/// two differences are deliberate. A call refused before its agent is resolved
-/// — a bad key, a denied agent, an unknown one — has no agent or operation to
-/// file under, so it is counted there and not here. And a stream the caller
-/// abandoned is `4xx` here but `2xx` there, because the response head really
-/// did go out as a 200. Read this family for agent health and that one for
-/// route traffic; do not expect the totals to match.
-pub const M_A2A_REQUESTS_TOTAL: &str = "aisix_a2a_requests_total";
-/// Time from an A2A streaming call starting to the FIRST event the upstream
-/// agent pushed — the agent's own "time to first byte".
-///
-/// Named for the event rather than a token because an agent stream carries
-/// task updates, not tokens. It defaults to [`M_REQUEST_TTFT_SECONDS`]'s
-/// bucket edges — the same shape of wait — but takes its own `a2a_ttfb`
-/// operator override, so tuning one histogram never silently retunes the
-/// other.
-pub const M_A2A_TTFB_SECONDS: &str = "aisix_a2a_ttfb_seconds";
-/// Events relayed downstream on A2A streaming calls. Divided by
-/// [`M_A2A_REQUESTS_TOTAL`] over the streaming operations it gives events per
-/// call — how chatty an agent is, and whether that changed.
-pub const M_A2A_STREAM_EVENTS_TOTAL: &str = "aisix_a2a_stream_events_total";
-/// A2A calls by the task state they ended on, normalized to the
-/// specification's set plus `unknown`. The series an operator watches for
-/// tasks piling up in `input-required` or `failed`.
-pub const M_A2A_TASK_STATE_TOTAL: &str = "aisix_a2a_task_state_total";
 
 // ── Config load-observability series (load-observability contract) ─────────
 // Reflected from [`aisix_core::ConfigMetricsView`] at scrape time via
@@ -654,7 +612,6 @@ pub struct HistogramBuckets {
     pub request_e2e_latency: Vec<f64>,
     pub request_ttft: Vec<f64>,
     pub guardrail_latency: Vec<f64>,
-    pub a2a_ttfb: Vec<f64>,
 }
 
 impl Default for HistogramBuckets {
@@ -663,7 +620,6 @@ impl Default for HistogramBuckets {
             request_e2e_latency: DEFAULT_E2E_LATENCY_BUCKETS.to_vec(),
             request_ttft: DEFAULT_TTFT_BUCKETS.to_vec(),
             guardrail_latency: DEFAULT_GUARDRAIL_LATENCY_BUCKETS.to_vec(),
-            a2a_ttfb: DEFAULT_TTFT_BUCKETS.to_vec(),
         }
     }
 }
@@ -694,7 +650,6 @@ impl HistogramBuckets {
                 cfg.guardrail_latency.as_deref(),
                 DEFAULT_GUARDRAIL_LATENCY_BUCKETS,
             )?,
-            a2a_ttfb: resolve_edges("a2a_ttfb", cfg.a2a_ttfb.as_deref(), DEFAULT_TTFT_BUCKETS)?,
         })
     }
 }
@@ -1183,10 +1138,6 @@ impl Metrics {
                 (
                     Matcher::Full(M_GUARDRAIL_LATENCY_SECONDS.to_string()),
                     buckets.guardrail_latency.clone(),
-                ),
-                (
-                    Matcher::Full(M_A2A_TTFB_SECONDS.to_string()),
-                    buckets.a2a_ttfb.clone(),
                 ),
             ])),
         );
@@ -1822,7 +1773,7 @@ impl Metrics {
 
     /// Count one rate-limit rejection. `scope` is the exceeded
     /// dimension (`requests`/`tokens`/`concurrency`); `layer` names the
-    /// limit source (`api_key`/`model`/`mcp`/`policy`); `policy_id`
+    /// limit source (`api_key`/`model`/`policy`); `policy_id`
     /// identifies the offending policy on the `policy` layer (bounded
     /// by the configured policy count) and is empty elsewhere.
     /// Recorded at the quota gate, the one point every endpoint funnels
@@ -1934,90 +1885,6 @@ impl Metrics {
                 )
             },
         );
-    }
-
-    /// Record one finished A2A call across the whole `aisix_a2a_*` family.
-    ///
-    /// A single entry point rather than four, so a new call site cannot land
-    /// with half the series wired — the same anti-drift move
-    /// [`crate::metrics`]' request families make. Every label here is bounded
-    /// by construction: `agent` is a registered resource, `operation` and
-    /// `task_state` come from fixed sets.
-    ///
-    /// `ttfb` and `stream_events` are `None` / `0` for a unary call, which
-    /// observes neither series.
-    pub fn record_a2a_call(&self, labels: A2aLabels<'_>, call: A2aCallOutcome) {
-        let status = status_bucket(labels.status);
-        self.cached_counter(
-            M_A2A_REQUESTS_TOTAL,
-            1,
-            |k| {
-                k.label(labels.agent);
-                k.label(labels.operation);
-                k.label(status);
-            },
-            || {
-                metrics::counter!(
-                    M_A2A_REQUESTS_TOTAL,
-                    "agent" => labels.agent.to_string(),
-                    "operation" => labels.operation.to_string(),
-                    "status" => status.to_string(),
-                )
-            },
-        );
-        if let Some(ttfb) = call.ttfb {
-            self.cached_histogram(
-                M_A2A_TTFB_SECONDS,
-                ttfb.as_secs_f64(),
-                |k| {
-                    k.label(labels.agent);
-                    k.label(labels.operation);
-                },
-                || {
-                    metrics::histogram!(
-                        M_A2A_TTFB_SECONDS,
-                        "agent" => labels.agent.to_string(),
-                        "operation" => labels.operation.to_string(),
-                    )
-                },
-            );
-        }
-        if call.stream_events > 0 {
-            self.cached_counter(
-                M_A2A_STREAM_EVENTS_TOTAL,
-                u64::from(call.stream_events),
-                |k| {
-                    k.label(labels.agent);
-                    k.label(labels.operation);
-                },
-                || {
-                    metrics::counter!(
-                        M_A2A_STREAM_EVENTS_TOTAL,
-                        "agent" => labels.agent.to_string(),
-                        "operation" => labels.operation.to_string(),
-                    )
-                },
-            );
-        }
-        // Only a call that reached a task has a state to report; counting an
-        // empty one would invent a bucket for "the upstream never answered".
-        if !call.task_state.is_empty() {
-            self.cached_counter(
-                M_A2A_TASK_STATE_TOTAL,
-                1,
-                |k| {
-                    k.label(labels.agent);
-                    k.label(call.task_state);
-                },
-                || {
-                    metrics::counter!(
-                        M_A2A_TASK_STATE_TOTAL,
-                        "agent" => labels.agent.to_string(),
-                        "state" => call.task_state.to_string(),
-                    )
-                },
-            );
-        }
     }
 
     /// Count a request the client abandoned before it produced a response
@@ -2880,11 +2747,11 @@ impl Metrics {
     /// The surface labels are `&'static str` so prometheus cardinality is
     /// type-system-bounded:
     /// - `handler`: bounded handler family (`chat`, `embeddings`,
-    ///   `messages`, `mcp`, etc.)
+    ///   `messages`, etc.)
     /// - `status_code`: bucketed by `status_bucket()` (one of `2xx` /
     ///   `3xx` / `4xx` / `5xx` / `other`) — never a raw u16
     /// - `inbound_protocol`: normalised by the caller to one of
-    ///   `"openai"` / `"anthropic"` / `"mcp"` / `"other"` (audit MEDIUM-3 —
+    ///   `"openai"` / `"anthropic"` / `"other"` (audit MEDIUM-3 —
     ///   `&'static str` here prevents user-controlled cardinality)
     ///
     /// [`UsageEventLabels`] adds the model, the ProviderKey the event was
@@ -3095,35 +2962,6 @@ impl aisix_core::GuardrailMetricsSink for Metrics {
     fn record_guardrail_bypass(&self, reason: &str) {
         self.count_guardrail_bypass(reason);
     }
-}
-
-/// Who was called and how, for the `aisix_a2a_*` family. Every field is
-/// bounded: a registered agent name and the canonical operation set.
-#[derive(Clone, Copy)]
-pub struct A2aLabels<'a> {
-    /// Registered agent name. Borrowed: it comes from the snapshot, and an
-    /// unregistered agent is refused before any call is metered.
-    pub agent: &'a str,
-    /// Canonical operation. `&'static str` so the fixed set is enforced by the
-    /// compiler rather than by a comment — the same reason
-    /// `record_usage_event_emit` takes its handler that way.
-    pub operation: &'static str,
-    /// Raw HTTP status; bucketed to `2xx` / `4xx` / … at record time.
-    pub status: u16,
-}
-
-/// What one A2A call did, for the series that only some calls observe.
-#[derive(Clone, Copy, Default)]
-pub struct A2aCallOutcome {
-    /// Time to the upstream agent's first streamed event. `None` for a unary
-    /// call and for a stream that never produced one.
-    pub ttfb: Option<Duration>,
-    /// Events relayed downstream. 0 for a unary call.
-    pub stream_events: u32,
-    /// Normalized task state the call ended on; empty when no response
-    /// carried one. `&'static str` for the same reason as
-    /// [`A2aLabels::operation`].
-    pub task_state: &'static str,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -3357,13 +3195,14 @@ pub struct RequestLabels<'a> {
     /// the ProviderKey adapter's wire value, as resolved by the SAME
     /// two-tier rule dispatch uses (AISIX-Cloud#1403).
     ///
-    /// A bounded set: `openai` / `anthropic` / `bedrock` / `vertex` /
-    /// `azure-openai`, plus `unknown` for a request that never selected
-    /// an upstream (a pre-dispatch rejection, or a non-inference route
-    /// like `/mcp`). Distinct from `inbound_protocol`, which is the
-    /// protocol the CALLER spoke: a request arriving on `/v1/messages`
-    /// and served by an OpenAI-shape upstream carries
-    /// `inbound_protocol="anthropic", upstream_protocol="openai"`.
+    /// A bounded set: `openai`, plus `unknown` for a request that never
+    /// selected an upstream (a pre-dispatch rejection, or a passthrough
+    /// relay). Distinct from `inbound_protocol`, which is the protocol
+    /// the CALLER spoke.
+    ///
+    /// Older gateways also reported `anthropic` / `bedrock` / `vertex` /
+    /// `azure-openai` here; Route Arwaky dispatches the OpenAI adapter
+    /// only, so those no longer resolve to a bridge.
     ///
     /// `provider` cannot stand in for it: vendor identity is an open
     /// string, and the same vendor can be reached through different
@@ -3489,13 +3328,14 @@ pub struct UsageLabels<'a> {
     /// the ProviderKey adapter's wire value, as resolved by the SAME
     /// two-tier rule dispatch uses (AISIX-Cloud#1403).
     ///
-    /// A bounded set: `openai` / `anthropic` / `bedrock` / `vertex` /
-    /// `azure-openai`, plus `unknown` for a request that never selected
-    /// an upstream (a pre-dispatch rejection, or a non-inference route
-    /// like `/mcp`). Distinct from `inbound_protocol`, which is the
-    /// protocol the CALLER spoke: a request arriving on `/v1/messages`
-    /// and served by an OpenAI-shape upstream carries
-    /// `inbound_protocol="anthropic", upstream_protocol="openai"`.
+    /// A bounded set: `openai`, plus `unknown` for a request that never
+    /// selected an upstream (a pre-dispatch rejection, or a passthrough
+    /// relay). Distinct from `inbound_protocol`, which is the protocol
+    /// the CALLER spoke.
+    ///
+    /// Older gateways also reported `anthropic` / `bedrock` / `vertex` /
+    /// `azure-openai` here; Route Arwaky dispatches the OpenAI adapter
+    /// only, so those no longer resolve to a bridge.
     ///
     /// `provider` cannot stand in for it: vendor identity is an open
     /// string, and the same vendor can be reached through different
@@ -3635,7 +3475,7 @@ pub struct UsageEventLabels<'a> {
     /// three dimensions describing three different keys is exactly the
     /// drift `PkLabels` exists to prevent. `unknown` when nothing was
     /// resolved — the pre-dispatch failures, and the tunnels that have
-    /// no LLM upstream at all (`/mcp`, `/a2a`).
+    /// no LLM upstream at all.
     pub upstream_protocol: &'a str,
 }
 
@@ -4324,65 +4164,6 @@ mod tests {
         // layers leave the label empty.
         assert!(rendered.contains("policy_id=\"pol-1\""));
         assert!(rendered.contains("policy_id=\"\""));
-    }
-
-    #[test]
-    fn a2a_family_slices_by_agent_and_operation() {
-        let m = Metrics::new(false);
-        m.record_a2a_call(
-            A2aLabels {
-                agent: "invoices",
-                operation: "message/stream",
-                status: 200,
-            },
-            A2aCallOutcome {
-                ttfb: Some(Duration::from_millis(80)),
-                stream_events: 17,
-                task_state: "completed",
-            },
-        );
-        let rendered = m.render();
-        // The dimension the proxy families cannot answer: which agent, which
-        // operation.
-        assert!(rendered.contains(&format!(
-            "{M_A2A_REQUESTS_TOTAL}{{agent=\"invoices\",operation=\"message/stream\",status=\"2xx\"}} 1"
-        )));
-        assert!(rendered.contains(&format!(
-            "{M_A2A_STREAM_EVENTS_TOTAL}{{agent=\"invoices\",operation=\"message/stream\"}} 17"
-        )));
-        assert!(rendered.contains(&format!(
-            "{M_A2A_TASK_STATE_TOTAL}{{agent=\"invoices\",state=\"completed\"}} 1"
-        )));
-        // A real histogram, not a summary — the buckets are registered.
-        assert!(rendered.contains(&format!("{M_A2A_TTFB_SECONDS}_bucket")));
-        // Task and context ids are the whole reason this family is safe to
-        // label; neither may ever appear.
-        assert!(!rendered.contains("task_id="));
-        assert!(!rendered.contains("context_id="));
-    }
-
-    #[test]
-    fn a2a_unary_call_observes_only_the_series_it_has_data_for() {
-        let m = Metrics::new(false);
-        m.record_a2a_call(
-            A2aLabels {
-                agent: "invoices",
-                operation: "tasks/get",
-                status: 502,
-            },
-            // No stream, and the upstream never answered, so no task state.
-            A2aCallOutcome::default(),
-        );
-        let rendered = m.render();
-        assert!(rendered.contains(&format!(
-            "{M_A2A_REQUESTS_TOTAL}{{agent=\"invoices\",operation=\"tasks/get\",status=\"5xx\"}} 1"
-        )));
-        // An absent figure must not be recorded as zero: a call with no stream
-        // is not a call whose stream carried nothing, and a call with no
-        // answer has no task state to bucket.
-        assert!(!rendered.contains(M_A2A_STREAM_EVENTS_TOTAL));
-        assert!(!rendered.contains(M_A2A_TASK_STATE_TOTAL));
-        assert!(!rendered.contains(M_A2A_TTFB_SECONDS));
     }
 
     #[test]

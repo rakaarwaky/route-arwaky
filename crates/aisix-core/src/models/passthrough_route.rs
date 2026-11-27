@@ -32,11 +32,11 @@ pub struct PassthroughRoute {
     /// forwarded unchanged.
     ///
     /// A route WITHOUT `hosts` must not claim a
-    /// reserved gateway namespace (`/v1`, `/mcp`, `/a2a`, health probes) —
+    /// reserved gateway namespace (`/v1`, admin, health probes) —
     /// the typed routes would shadow it. A route WITH `hosts` may use any
     /// prefix: host-matched requests dispatch ahead of the typed routes,
     /// which is what lets a forward proxy relay an upstream's own
-    /// namespace (e.g. Copilot's `/mcp/...` on its chat host).
+    /// namespace on its chat host.
     /// At least one of `path_prefix` / `hosts` is required; when both are
     /// set the request must satisfy both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -299,7 +299,7 @@ const FORBIDDEN_HEADER_SLOTS: [&str; 5] = [
 
 /// Cross-field coupling for the flat `PassthroughRoute` schema, injected as
 /// an `allOf` by [`crate::models::schema::passthrough_route_root_schema`]
-/// (same pattern as [`super::mcp_server::mcp_server_credential_coupling`]).
+/// (the same pattern the resource schemas use everywhere).
 /// Every rule here is in both the published strict schema and the lenient
 /// one the loader runs, so a route is never half-configured at dispatch time.
 /// The loader is the only validation the gateway runs on a route: etcd, the
@@ -343,18 +343,18 @@ pub fn passthrough_route_coupling() -> Value {
         // so: host-matched requests are dispatched by the host middleware
         // wrapping the whole router, ahead of the typed routes, so the
         // prefix is reachable. Forward-proxy deployments need this — an
-        // upstream owns its own path space, and GitHub Copilot's CLI
-        // reaches its MCP server at `/mcp/readonly` on the same host it
-        // uses for chat inference. Requiring `hosts` keeps the exemption
-        // narrow: it cannot be used to shadow the gateway's own endpoints
-        // for ordinary (host-less) traffic.
+        // upstream owns its own path space and serves endpoints of its
+        // own there, on the same host it uses for chat inference.
+        // Requiring `hosts` keeps the exemption narrow: it cannot be
+        // used to shadow the gateway's own endpoints for ordinary
+        // (host-less) traffic.
         {
             "if": {
                 "required": ["path_prefix"],
                 "not": { "required": ["hosts"] }
             },
             "then": { "properties": { "path_prefix": {
-                "not": { "pattern": "^/(v1|mcp|a2a|admin|livez|readyz|metrics)(/|$)" }
+                "not": { "pattern": "^/(v1|admin|livez|readyz|metrics)(/|$)" }
             } } }
         },
         // Exactly one target shape.
@@ -650,10 +650,8 @@ mod coupling_tests {
         // routes, so it stays rejected…
         let mut doc = base();
         for p in [
-            "/mcp",
-            "/mcp/readonly",
+            "/v1",
             "/v1/chat/completions",
-            "/a2a",
             "/metrics",
         ] {
             doc["path_prefix"] = json!(p);
@@ -662,13 +660,13 @@ mod coupling_tests {
                 "host-less route on {p} must stay rejected"
             );
         }
-        // …but the same prefix WITH a host allowlist is exactly the
-        // forward-proxy shape (Copilot CLI's MCP server sits at /mcp on the
+        // …but a reserved prefix WITH a host allowlist is exactly the
+        // forward-proxy shape (an upstream serves its own endpoints on the
         // same host as chat) and host dispatch runs before the typed routes.
         let doc = json!({
-            "name": "copilot-cli-mcp",
+            "name": "copilot-cli",
             "hosts": ["api.business.githubcopilot.com"],
-            "path_prefix": "/mcp",
+            "path_prefix": "/v1",
             "preserve_host": true,
             "auth_mode": "header_key",
             "auth_header_name": "x-aisix-api-key",
@@ -676,7 +674,7 @@ mod coupling_tests {
         });
         assert!(
             validate_passthrough_route(&doc).is_ok(),
-            "host-matched route on /mcp must be accepted: {:?}",
+            "host-matched route on /v1 must be accepted: {:?}",
             validate_passthrough_route(&doc)
         );
         assert!(validate_passthrough_route_lenient(&doc).is_ok());

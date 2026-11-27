@@ -10,7 +10,6 @@
 //! |---|---|
 //! | `env`        | applies to every request in the environment |
 //! | `model`      | applies only when the request targets this model UUID |
-//! | `mcp_server` | applies only to MCP tool calls routed to this server UUID |
 //! | `api_key`    | applies only when authenticated with this API-key UUID |
 //! | `team`       | applies only when the API key belongs to this team UUID |
 //!
@@ -39,7 +38,6 @@ use crate::{Guardrail, GuardrailChain};
 pub enum ScopeKind {
     Env,
     Model,
-    McpServer,
     ApiKey,
     Team,
     PassthroughRoute,
@@ -87,13 +85,13 @@ impl IndexEntry {
     fn applies_to(&self, ctx: &RequestContext<'_>) -> bool {
         match self.scope_kind {
             ScopeKind::Env => true,
-            // `model_id` / `mcp_server_id` are empty on the requests that have
-            // no such identity (an MCP tool call resolves no model; an LLM
-            // request routes to no MCP server), so an attachment whose
-            // `scope_id` is itself empty must NOT match everything that lacks
-            // the dimension — compare only non-empty ids.
+            // `model_id` / `passthrough_route_id` are empty on the requests
+            // that have no such identity (an LLM request resolves no
+            // passthrough route; a passthrough-route request resolves no
+            // model), so an attachment whose `scope_id` is itself empty must
+            // NOT match everything that lacks the dimension — compare only
+            // non-empty ids.
             ScopeKind::Model => matches_id(self.scope_id.as_deref(), ctx.model_id),
-            ScopeKind::McpServer => matches_id(self.scope_id.as_deref(), ctx.mcp_server_id),
             ScopeKind::PassthroughRoute => {
                 matches_id(self.scope_id.as_deref(), ctx.passthrough_route_id)
             }
@@ -118,11 +116,9 @@ fn matches_id(scope_id: Option<&str>, ctx_id: &str) -> bool {
 #[derive(Debug, Clone, Copy)]
 pub struct RequestContext<'a> {
     /// UUID of the model the request targets (virtual or concrete).
-    /// Empty for a request that resolves no model, such as an MCP tool call.
+    /// Empty for a request that resolves no model, such as passthrough-route
+    /// traffic.
     pub model_id: &'a str,
-    /// UUID of the registered MCP server an MCP tool call is routed to.
-    /// Empty for every request that is not an MCP tool call.
-    pub mcp_server_id: &'a str,
     /// UUID of the passthrough route serving the request. Empty for every
     /// request that is not passthrough-route traffic.
     pub passthrough_route_id: &'a str,
@@ -145,17 +141,16 @@ pub struct GuardrailIndex {
 }
 
 /// Scope specificity rank: higher = more specific → wins dedup on equal priority.
-/// ApiKey > Team > Model > Env, matching the P0c spec in #379. `McpServer`
-/// and `PassthroughRoute` share `Model`'s rank: the three dimensions are
-/// mutually exclusive within a request (an MCP tool call resolves no model,
-/// an LLM request routes to no MCP server, and passthrough-route traffic
-/// resolves neither), so their relative order can never decide a
-/// deduplication.
+/// ApiKey > Team > Model > Env, matching the P0c spec in #379.
+/// `PassthroughRoute` shares `Model`'s rank: the two dimensions are
+/// mutually exclusive within a request (a passthrough-route request
+/// resolves no model; a model request resolves no route), so their
+/// relative order can never decide a deduplication.
 fn scope_specificity(k: &ScopeKind) -> u8 {
     match k {
         ScopeKind::ApiKey => 3,
         ScopeKind::Team => 2,
-        ScopeKind::Model | ScopeKind::McpServer | ScopeKind::PassthroughRoute => 1,
+        ScopeKind::Model | ScopeKind::PassthroughRoute => 1,
         ScopeKind::Env => 0,
     }
 }
@@ -296,7 +291,6 @@ mod tests {
         RequestContext {
             passthrough_route_id: "",
             model_id: model,
-            mcp_server_id: "",
             api_key_id: apikey,
             team_id: team,
         }
@@ -376,64 +370,26 @@ mod tests {
         );
     }
 
-    // 3b. McpServer-scope attachment applies only to tool calls routed to
-    // that server — and never to model traffic, which carries no server id.
-    #[tokio::test]
-    async fn mcp_server_scope_only_matching_server() {
-        let g = kw("g1", "secret");
-        let idx = GuardrailIndex::from_entries(vec![entry(
-            "g1",
-            ScopeKind::McpServer,
-            Some("mcp-A"),
-            50,
-            g,
-        )]);
-
-        let mcp_ctx = |server: &'static str| RequestContext {
-            passthrough_route_id: "",
-            model_id: "",
-            mcp_server_id: server,
-            api_key_id: "k1",
-            team_id: None,
-        };
-
-        let chain_a = idx.resolve(&mcp_ctx("mcp-A"));
-        assert!(chain_a.check_input(&req("secret")).await.is_block());
-
-        let chain_b = idx.resolve(&mcp_ctx("mcp-B"));
-        assert_eq!(
-            chain_b.check_input(&req("secret")).await,
-            GuardrailVerdict::Allow
-        );
-
-        // An LLM request carries no MCP server, so the attachment is inert.
-        let chain_llm = idx.resolve(&ctx("model-A", "k1", None));
-        assert_eq!(
-            chain_llm.check_input(&req("secret")).await,
-            GuardrailVerdict::Allow
-        );
-    }
-
     // 3c. A dimension a request does not carry never matches, even against an
     // attachment whose own scope_id is empty — the sentinel for "absent" must
     // not read as a wildcard.
     #[tokio::test]
     async fn empty_scope_id_never_matches_an_absent_dimension() {
         let idx = GuardrailIndex::from_entries(vec![
-            entry("g1", ScopeKind::McpServer, Some(""), 50, kw("g1", "secret")),
+            entry("g1", ScopeKind::PassthroughRoute, Some(""), 50, kw("g1", "secret")),
             entry("g2", ScopeKind::Model, Some(""), 50, kw("g2", "secret")),
         ]);
 
-        // An MCP tool call has no model; an LLM request has no MCP server.
-        let mcp_chain = idx.resolve(&RequestContext {
-            passthrough_route_id: "",
+        // A passthrough-route request carries no model; a model request
+        // carries no passthrough route.
+        let route_chain = idx.resolve(&RequestContext {
+            passthrough_route_id: "route-A",
             model_id: "",
-            mcp_server_id: "mcp-A",
             api_key_id: "k1",
             team_id: None,
         });
         assert_eq!(
-            mcp_chain.check_input(&req("secret")).await,
+            route_chain.check_input(&req("secret")).await,
             GuardrailVerdict::Allow
         );
 
@@ -714,7 +670,6 @@ mod tests {
             let _ = idx.resolve(&RequestContext {
                 passthrough_route_id: "",
                 model_id: &model,
-                mcp_server_id: "",
                 api_key_id: &key,
                 team_id: Some(&team),
             });

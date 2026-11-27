@@ -32,7 +32,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::{Stream, StreamExt};
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -41,7 +41,6 @@ use crate::attempt::{attempt_error_message, routing_error_class, AttemptRecord, 
 use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
-use crate::gemini::{self, Wire};
 use crate::routing::{is_retryable, RoutingRequest};
 use crate::state::ProxyState;
 
@@ -86,32 +85,17 @@ impl DispatchFailure {
 // same logic. See cooldown.rs for the audit context (#264 H-1).
 use crate::cooldown::decide_cooldown;
 
-enum ChatTarget<'a> {
-    Bridge(Arc<dyn aisix_gateway::Bridge>),
-    Gemini(&'a serde_json::Value),
-}
+struct ChatTargetBridge(Arc<dyn aisix_gateway::Bridge>);
 
-impl<'a> ChatTarget<'a> {
+impl ChatTargetBridge {
     fn resolve(
         state: &ProxyState,
         model: &aisix_core::Model,
         key: &aisix_core::ProviderKey,
-        gemini_body: Option<&'a serde_json::Value>,
     ) -> Option<Self> {
-        if let Some(raw) = gemini_body.filter(|_| {
-            crate::dispatch::serves_natively_with(model, Some(key), aisix_core::ApiSurface::Gemini)
-        }) {
-            return Some(Self::Gemini(raw));
-        }
+        let _ = model;
         let bridge = crate::dispatch::resolve_bridge(&state.hub, key)?;
-        if gemini_body.is_some() && !matches!(bridge.wire_protocol(), "openai" | "azure-openai") {
-            return None;
-        }
-        Some(Self::Bridge(bridge))
-    }
-
-    fn wire(&self, client: &ClientContext) -> Wire {
-        Wire::for_target(client, matches!(self, Self::Gemini(_)))
+        Some(Self(bridge))
     }
 
     async fn chat(
@@ -119,19 +103,14 @@ impl<'a> ChatTarget<'a> {
         req: &ChatFormat,
         ctx: &aisix_gateway::BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
-        match self {
-            Self::Gemini(raw) => {
-                gemini::native::chat(ctx, &gemini::with_model_effort(raw, &ctx.model)).await
-            }
-            Self::Bridge(_) if req.messages.is_empty() => Err(BridgeError::InvalidRequest(
+        if req.messages.is_empty() {
+            return Err(BridgeError::InvalidRequest(
                 "contents has no messages representable in Chat Completions".into(),
-            )),
-            Self::Bridge(bridge) => {
-                bridge
-                    .chat_cow(crate::effort_mapping::chat_request(req, &ctx.model), ctx)
-                    .await
-            }
+            ));
         }
+        self.0
+            .chat_cow(crate::effort_mapping::chat_request(req, &ctx.model), ctx)
+            .await
     }
 
     async fn chat_stream(
@@ -139,19 +118,14 @@ impl<'a> ChatTarget<'a> {
         req: &ChatFormat,
         ctx: &aisix_gateway::BridgeContext,
     ) -> Result<aisix_gateway::ChatChunkStream, BridgeError> {
-        match self {
-            Self::Gemini(raw) => {
-                gemini::native::chat_stream(ctx, &gemini::with_model_effort(raw, &ctx.model)).await
-            }
-            Self::Bridge(_) if req.messages.is_empty() => Err(BridgeError::InvalidRequest(
+        if req.messages.is_empty() {
+            return Err(BridgeError::InvalidRequest(
                 "contents has no messages representable in Chat Completions".into(),
-            )),
-            Self::Bridge(bridge) => {
-                bridge
-                    .chat_stream_cow(crate::effort_mapping::chat_request(req, &ctx.model), ctx)
-                    .await
-            }
+            ));
         }
+        self.0
+            .chat_stream_cow(crate::effort_mapping::chat_request(req, &ctx.model), ctx)
+            .await
     }
 }
 
@@ -193,7 +167,7 @@ pub async fn chat_completions(
     };
     req.thoughts_requested =
         aisix_gateway::chat::effort_asks_for_thoughts(req.extra.get("reasoning_effort"));
-    serve(&state, auth, client, req, None, started).await
+    serve(&state, auth, client, req, started).await
 }
 
 pub(crate) async fn serve(
@@ -201,7 +175,6 @@ pub(crate) async fn serve(
     auth: AuthenticatedKey,
     client: ClientContext,
     mut req: ChatFormat,
-    native_body: Option<serde_json::Value>,
     started: Instant,
 ) -> Response {
     let method = "POST";
@@ -235,7 +208,6 @@ pub(crate) async fn serve(
         &snapshot,
         &auth,
         &mut req,
-        native_body,
         &request_id,
         started,
         &client,
@@ -756,11 +728,7 @@ pub(crate) async fn serve(
                     // AISIX-Cloud#1279, the trace's terminal spans).
                 }
             }
-            if matches!(path, gemini::ENDPOINT | gemini::STREAM_ENDPOINT) {
-                err.into_gemini_response()
-            } else {
-                err.into_response()
-            }
+            err.into_response()
         }
     }
 }
@@ -1555,7 +1523,6 @@ async fn dispatch(
     // text in place before it reaches semantic routing, the cache key, or
     // the upstream.
     req: &mut ChatFormat,
-    mut native_body: Option<serde_json::Value>,
     request_id: &str,
     started: Instant,
     client: &ClientContext,
@@ -1580,7 +1547,7 @@ async fn dispatch(
     // `Arc<dyn Guardrail>`, which carries neither `applied()` nor the log.
     audit_out: &mut crate::usage_attr::GuardrailAudit,
 ) -> Result<Success, DispatchFailure> {
-    if req.messages.is_empty() && !native_body.as_ref().is_some_and(gemini::has_execution) {
+    if req.messages.is_empty() {
         // Refused ahead of model resolution, but a resolvable name still
         // reports the model it addressed, like every later refusal.
         let model_id = crate::model_resolve::resolve_model(snapshot, &req.model)
@@ -1638,7 +1605,6 @@ async fn dispatch(
     let guardrail_ctx = aisix_guardrails::RequestContext {
         passthrough_route_id: "",
         model_id: &model_id,
-        mcp_server_id: "",
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
@@ -1668,16 +1634,9 @@ async fn dispatch(
     // Split moderation: local/blob members check first (on the original
     // text), then the segment pass runs the Bedrock call and writes
     // ANONYMIZE masks back into `req` (#932 bedrock follow-up).
-    let policy_req = native_body
-        .as_ref()
-        .filter(|raw| resolved_chain.runs_on_input() && gemini::has_execution(raw))
-        .map(|raw| gemini::policy_input(&req.model, raw))
-        .transpose()
-        .map_err(&with_model)?;
     let (input_verdict, hits) = resolved_chain
-        .check_input_non_segment_observed(policy_req.as_ref().unwrap_or(req))
+        .check_input_non_segment_observed(req)
         .await;
-    drop(policy_req);
     monitor_hits_out.extend(hits);
     // The segment walker below borrows `req` mutably, so the addressed
     // model the check pass just read from `req.model` is taken first.
@@ -1691,10 +1650,7 @@ async fn dispatch(
         redactions_out,
         monitor_hits_out,
         signed_reasoning,
-        |g| match &mut native_body {
-            Some(raw) => gemini::redact(g, raw),
-            None => crate::redact::redact_chat_format(g, req),
-        },
+        |g| crate::redact::redact_chat_format(g, req),
     )
     .await;
     match input_verdict {
@@ -1745,17 +1701,10 @@ async fn dispatch(
     // routing embedding, the cache-key fingerprint, and the upstream
     // dispatch all see the masked text, so the matched values never leave
     // the gateway.
-    if let Some(raw) = native_body.as_mut() {
-        crate::redact::merge_counts(redactions_out, gemini::redact(resolved_chain.as_ref(), raw));
-        if !redactions_out.is_empty() {
-            *req = gemini::translate(&req.model, req.is_streaming(), raw).map_err(&with_model)?;
-        }
-    } else {
-        crate::redact::merge_counts(
-            redactions_out,
-            crate::redact::redact_chat_format(resolved_chain.as_ref(), req),
-        );
-    }
+    crate::redact::merge_counts(
+        redactions_out,
+        crate::redact::redact_chat_format(resolved_chain.as_ref(), req),
+    );
     crate::usage_attr::note_failure_request(snapshot, || captured_request_json(req));
 
     // Key-level budgets, decided from the pushed budget documents.
@@ -1771,20 +1720,6 @@ async fn dispatch(
     // the matched route name (None on a fall-through to `default` or a
     // non-semantic request) for the `x-aisix-route` response header.
     let budget_gate = crate::budget::gate(state, snapshot);
-    let bypass_chat_cache = AtomicBool::new(false);
-    let gemini_target = |model: &aisix_core::Model| {
-        let target = model
-            .provider_key_id
-            .as_deref()
-            .and_then(|id| snapshot.provider_keys.get_by_id(id))
-            .and_then(|key| ChatTarget::resolve(state, model, &key.value, native_body.as_ref()));
-        // A native reply has fields outside ChatFormat. A discarded target
-        // could have populated this alias's cache through the Chat endpoint.
-        if !matches!(target, Some(ChatTarget::Bridge(_))) {
-            bypass_chat_cache.store(true, Ordering::Relaxed);
-        }
-        target.is_some()
-    };
     let plan = crate::dispatch_plan::plan(
         state,
         snapshot,
@@ -1798,7 +1733,6 @@ async fn dispatch(
             api_key_id: auth.entry.id.as_str(),
             source_ip: &client.source_ip,
             context_origin: None,
-            gemini_target: native_body.is_some().then_some(&gemini_target),
             budget: Some(&budget_gate),
             client: Some(client),
         },
@@ -1809,7 +1743,6 @@ async fn dispatch(
     )
     .await
     .map_err(&with_model)?;
-    let bypass_chat_cache = bypass_chat_cache.into_inner();
     let attempt_models = &plan.attempts;
     let semantic_route = plan.semantic_route.clone();
 
@@ -1829,7 +1762,7 @@ async fn dispatch(
         // family/specialized bridge surfaces as 503 here, before
         // we commit to a long upstream call.
         let pk_entry = crate::dispatch::resolve_provider_key(snapshot, only).map_err(with_model)?;
-        if ChatTarget::resolve(state, only, &pk_entry.value, native_body.as_ref()).is_none() {
+        if ChatTargetBridge::resolve(state, only, &pk_entry.value).is_none() {
             return Err(with_model(ProxyError::ProviderUnavailable));
         }
     }
@@ -1905,7 +1838,6 @@ async fn dispatch(
         let mut last_reserve_reject: Option<ProxyError> = None;
 
         struct StreamWin {
-            wire: Wire,
             model: aisix_core::Model,
             /// Snapshot id of the winning target — the emitted event's
             /// `model_id` (AISIX-Cloud#790). Equals the requested
@@ -1945,7 +1877,7 @@ async fn dispatch(
                 continue 'targets;
             };
             let Some(target) =
-                ChatTarget::resolve(state, model, &pk_entry.value, native_body.as_ref())
+                ChatTargetBridge::resolve(state, model, &pk_entry.value)
             else {
                 last_reserve_reject = None;
                 last_err = Some(BridgeError::Config(
@@ -2139,7 +2071,6 @@ async fn dispatch(
                             },
                         );
                         won = Some(StreamWin {
-                            wire: target.wire(client).with_chat_audio(&ctx),
                             model: model.clone(),
                             target_id: attempt.id.clone(),
                             provider_lc: provider.to_ascii_lowercase(),
@@ -2232,7 +2163,6 @@ async fn dispatch(
             return Err(with_model(ProxyError::Bridge(err)).with_routing(stream_routing));
         };
         let StreamWin {
-            wire,
             model,
             target_id: winner_target_id,
             provider_lc: provider,
@@ -2370,7 +2300,6 @@ async fn dispatch(
             crate::token_estimate::PromptInput::Chat(Box::new(req.clone())),
         );
         let sse_stream = build_sse_stream(
-            wire,
             upstream,
             now,
             stream_guardrail,
@@ -2653,8 +2582,7 @@ async fn dispatch(
         .entries()
         .iter()
         .find(|entry| {
-            !bypass_chat_cache
-                && entry.value.enabled
+            entry.value.enabled
                 && entry
                     .value
                     .parsed_applies_to(snapshot)
@@ -2824,14 +2752,13 @@ async fn dispatch(
             .await
         };
         // Cached Chat audio can omit its format. Only the winning upstream
-        // attempt knows which format it requested for the Gemini media part.
+        // attempt knows which format it requested for the media part.
         let resolved = resolved.filter(|(cached, _, _)| {
-            native_body.is_none()
-                || cached.messages().all(|m| {
-                    !m.extra.get("audio").is_some_and(|audio| {
-                        audio["data"].is_string() && !audio["format"].is_string()
-                    })
+            cached.messages().all(|m| {
+                !m.extra.get("audio").is_some_and(|audio| {
+                    audio["data"].is_string() && !audio["format"].is_string()
                 })
+            })
         });
         match resolved {
             Some((mut cached, hit_layer, hit_similarity)) => {
@@ -3034,7 +2961,7 @@ async fn dispatch(
                     );
                 }
                 let (mut response, captured_content) =
-                    Wire::for_target(client, false).unary(now, cached, req, content_cap);
+                    unary_openai(now, cached, &req, content_cap);
                 if state.expose_debug_headers {
                     response
                         .headers_mut()
@@ -3137,7 +3064,6 @@ async fn dispatch(
     // to populate the `x-aisix-served-by` response header for routing
     // requests (AISIX-Cloud#410). Stays `None` until an attempt wins.
     let mut chosen_target_display_name: Option<String> = None;
-    let mut winner_wire = Wire::for_target(client, false);
     let mut upstream: Option<aisix_gateway::ChatResponse> = None;
     let retry_on_429 = plan.retry_on_429(&virtual_entry.value);
     let fallback_statuses: &[u16] = plan.fallback_statuses(&virtual_entry.value);
@@ -3173,7 +3099,7 @@ async fn dispatch(
         // (ProviderKey.adapter). The legacy `Provider`-keyed registry
         // is gone after #302 Phase A; a PK that matches neither tier is
         // a misconfiguration and surfaces as 503.
-        let Some(target) = ChatTarget::resolve(state, model, &pk_entry.value, native_body.as_ref())
+        let Some(target) = ChatTargetBridge::resolve(state, model, &pk_entry.value)
         else {
             last_reserve_reject = None;
             last_err = Some(BridgeError::Config(format!(
@@ -3331,7 +3257,6 @@ async fn dispatch(
                         },
                     );
                     won_member_reservation = member_reservation;
-                    winner_wire = target.wire(client).with_chat_audio(&ctx);
                     upstream = Some(resp);
                     break;
                 }
@@ -3685,7 +3610,7 @@ async fn dispatch(
             completion_tokens_u32,
         );
     }
-    let (mut response, captured_content) = winner_wire.unary(now, upstream, req, content_cap);
+    let (mut response, captured_content) = unary_openai(now, upstream, &req, content_cap);
     // Header only when the gate was open — policy-disabled requests have
     // no cache header at all so a user can tell at a glance whether the
     // gate ran. `bypass` = the caller's `Cache-Control: no-cache`
@@ -4263,7 +4188,6 @@ async fn dispatch_ensemble(
             crate::token_estimate::PromptInput::Chat(Box::new(build_judge_req())),
         );
         let sse_stream = build_sse_stream(
-            Wire::for_target(client, false),
             judge_stream,
             created_ts,
             stream_guardrail,
@@ -4703,7 +4627,7 @@ async fn dispatch_ensemble(
         });
     outcome.response.usage = aggregate_usage.clone();
     let (response, _) =
-        Wire::for_target(client, false).unary(created_ts, outcome.response, req, None);
+        unary_openai(created_ts, outcome.response, &req, None);
     Ok(Success {
         response,
         // No single provider/model/key governs an ensemble response.
@@ -4964,7 +4888,7 @@ fn emit_usage_event(
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.value.clone(),
         request_headers: client.request_headers.clone(),
-        // MCP attribution does not apply to the chat path.
+        // Tool/route attribution does not apply to the chat path.
         ..Default::default()
     };
     event.reasoning_unfolded_from_completion =
@@ -5292,7 +5216,6 @@ fn emit_access_log(
         routing_fallback_count: summary.fallback_count,
         error_kind,
         error: error.as_deref(),
-        mcp: None,
         cache: cache.or_else(|| target.cache()),
         request_body_bytes: None,
         response_body_bytes: None,
@@ -6237,9 +6160,43 @@ impl ChoiceTexts {
     }
 }
 
+/// OpenAI-wire terminal render of a successful (or cached) chat
+/// response: JSON body plus the optional content-capture record for
+/// full-content exporters.
+fn unary_openai(
+    now: i64,
+    resp: aisix_gateway::ChatResponse,
+    req: &ChatFormat,
+    content_cap: Option<u32>,
+) -> (Response, Option<CapturedContent>) {
+    let capture = content_cap.map(|cap| {
+        let content = CapturedContent::new(
+            &captured_request_json(req),
+            &resp.message.content_str(),
+            cap as usize,
+        );
+        (content, cap)
+    });
+    let content = capture.map(|(c, cap)| c.with_output(chat_message_output(&resp.message, cap)));
+    (
+        Json(crate::render::render_response(now, resp, &req.model)).into_response(),
+        content,
+    )
+}
+
+/// OpenAI-wire SSE error frame: an `event: error` frame carrying the
+/// already-rendered OpenAI payload.
+fn stream_error_event(payload: String) -> Event {
+    Event::default().event("error").data(payload)
+}
+
+/// OpenAI-wire SSE guardrail-block frame for the output path.
+fn guardrail_stream_event(name: Option<&str>, unavailable: Option<&str>) -> Event {
+    stream_error_event(crate::error::guardrail_block_frame_payload(name, unavailable))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_sse_stream<F>(
-    wire: Wire,
     upstream: aisix_gateway::ChatChunkStream,
     created: i64,
     output_guardrail: Option<StreamGuardrailContext>,
@@ -6388,7 +6345,6 @@ where
         // Render + serialise one held/live chunk into an SSE Event.
         // Serialisation of these plain structs can't realistically fail;
         // the Err arm mirrors the pre-hold-back defensive error frame.
-        let mut encoder = gemini::Encoder::default();
         macro_rules! chunk_event {
             ($chunk:expr) => {{
                 // The caller's wait ends here — not when the upstream chunk
@@ -6404,7 +6360,8 @@ where
                 }
                 let mut chunk = $chunk;
                 stream_id.stamp(&mut chunk.id);
-                encoder.chunk(wire, created, chunk, &client_facing_model)
+                let openai = crate::render::render_chunk(created, chunk, &client_facing_model);
+                Some(Event::default().json_data(openai).expect("serializable chat chunk"))
             }};
         }
         while let Some(item) = upstream.next().await {
@@ -6441,9 +6398,7 @@ where
                         comp.service_tier = Some(tier.as_str().to_owned());
                     }
                     // A Gemini output message describes candidate zero, including its finish reason.
-                    if let Some(fr) = chunk.finish_reason.as_ref()
-                        .filter(|_| wire == Wire::OpenAi || chunk.choice_index == 0)
-                    {
+                    if let Some(fr) = chunk.finish_reason.as_ref() {
                         comp.finish_reason = finish_reason_label(fr);
                     }
                     // Accumulate the assistant's content for the output
@@ -6628,9 +6583,8 @@ where
                     errored = true;
                     crate::attempt::StreamFailure::record(&mut guard.comp().failure, &err);
                     let etype = err.error_type();
-                    yield Ok::<_, Infallible>(gemini::stream_error(
-                        wire, err.http_status(), error_frame_payload(etype, &err.stream_frame_message()),
-                        gemini::native_error(&err),
+                    yield Ok::<_, Infallible>(stream_error_event(
+                        error_frame_payload(etype, &err.stream_frame_message()),
                     ));
                     None
                 }
@@ -6661,8 +6615,8 @@ where
                     errored = true;
                     guard.comp().record_refusal(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED));
                     ctx.chain.record_output_buffer_exceeded();
-                    yield Ok::<_, Infallible>(gemini::guardrail_event(
-                        wire, None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
+                    yield Ok::<_, Infallible>(guardrail_stream_event(
+                        None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
                     ));
                     break;
                 }
@@ -6744,8 +6698,8 @@ where
                                         );
                                         errored = true;
                                         guard.comp().record_refusal(guardrail_name.as_deref(), unavailable.as_deref());
-                                        yield Ok::<_, Infallible>(gemini::guardrail_event(
-                                            wire, guardrail_name.as_deref(), unavailable.as_deref(),
+                                        yield Ok::<_, Infallible>(guardrail_stream_event(
+                                            guardrail_name.as_deref(), unavailable.as_deref(),
                                         ));
                                         break;
                                     }
@@ -6822,8 +6776,8 @@ where
                                 if let Some(ctx) = output_guardrail.as_ref() {
                                     ctx.chain.record_output_buffer_exceeded();
                                 }
-                                yield Ok::<_, Infallible>(gemini::guardrail_event(
-                                    wire, None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
+                                yield Ok::<_, Infallible>(guardrail_stream_event(
+                                    None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
                                 ));
                                 break;
                             }
@@ -6852,7 +6806,7 @@ where
         // ensemble's body; a single upstream's is the last report with the
         // counters it left at zero estimated (`apply_estimated_usage`).
         // Stamped like the last chunk.
-        let final_usage = if !client_requested_usage || wire == Wire::Native {
+        let final_usage = if !client_requested_usage {
             None
         } else if let Some(base_usage) = base_usage.as_ref() {
             stream_usage.map(|u| u.saturating_add(base_usage))
@@ -7006,8 +6960,8 @@ where
                                 );
                                 errored = true;
                                 guard.comp().record_refusal(guardrail_name.as_deref(), unavailable.as_deref());
-                                yield Ok::<_, Infallible>(gemini::guardrail_event(
-                                    wire, guardrail_name.as_deref(), unavailable.as_deref(),
+                                yield Ok::<_, Infallible>(guardrail_stream_event(
+                                    guardrail_name.as_deref(), unavailable.as_deref(),
                                 ));
                                 true
                             }
@@ -7135,8 +7089,8 @@ where
                         );
                         errored = true;
                         guard.comp().record_refusal(guardrail_name.as_deref(), unavailable.as_deref());
-                        yield Ok::<_, Infallible>(gemini::guardrail_event(
-                            wire, guardrail_name.as_deref(), unavailable.as_deref(),
+                        yield Ok::<_, Infallible>(guardrail_stream_event(
+                            guardrail_name.as_deref(), unavailable.as_deref(),
                         ));
                     }
                     aisix_guardrails::GuardrailVerdict::Bypass { reason } => {
@@ -7175,9 +7129,7 @@ where
         // OR by the output-guardrail check above on a Block verdict.
         guard.count_ahead(!errored).await;
         if !errored {
-            if let Some(end) = encoder.finish(wire) {
-                yield Ok::<_, Infallible>(end);
-            }
+            yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
         }
         guard.count_ahead(false).await;
         guard.complete();

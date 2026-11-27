@@ -25,16 +25,6 @@
 //!   * `keyword` — literal/regex blocklist; runs entirely in DP
 //!     process. Configured via `keyword.patterns` (list of
 //!     `{ kind: "literal" | "regex", value: "..." }`).
-//!   * `bedrock` — calls AWS Bedrock's `ApplyGuardrail` on input
-//!     and/or output. The DP signs the call with SigV4 and maps
-//!     `GUARDRAIL_INTERVENED` to a block (PRD-09c §6.7).
-//!   * `azure_content_safety` — calls Azure AI Content Safety Prompt
-//!     Shield (`/contentsafety/text:shieldPrompt`). Detects jailbreak
-//!     and indirect injection attacks. P1 (PRD-09c §6 P1).
-//!   * `aliyun_text_moderation` — calls Aliyun's content-safety
-//!     guardrail (`TextModerationPlus` on `green-cip.<region>.aliyuncs.com`).
-//!     Risk-level moderation on input (`llm_query_moderation`) and output
-//!     (`llm_response_moderation`).
 //!   * `pii` — in-process sensitive-data detection + redaction
 //!     (built-in detectors + custom regex, `mask`/`block`).
 //!   * `lakera` — calls Lakera Guard `/v2/guard`; injection/jailbreak
@@ -116,408 +106,6 @@ pub struct KeywordConfig {
     pub patterns: Vec<KeywordPattern>,
 }
 
-/// AWS credentials for a Bedrock guardrail.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum BedrockAWSCredentials {
-    Static {
-        /// AWS access key ID for static Bedrock guardrail credentials.
-        #[schemars(length(min = 1))]
-        access_key_id: String,
-        /// AWS secret access key used to authenticate requests to Amazon
-        /// Bedrock. The gateway does not log the plaintext value.
-        #[schemars(length(min = 1))]
-        secret_access_key: String,
-        /// AWS session token that accompanies temporary access keys. The
-        /// gateway does not log the plaintext value.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[schemars(length(min = 1))]
-        session_token: Option<String>,
-        /// ARN of an IAM role to assume with these credentials through
-        /// `sts:AssumeRole`. The temporary credentials are refreshed before
-        /// they expire. When the credentials already belong to this role,
-        /// they are used as they are.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[schemars(length(min = 1))]
-        role_arn: Option<String>,
-        /// External ID the role's trust policy requires. Requires `role_arn`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[schemars(length(min = 1))]
-        external_id: Option<String>,
-        /// Session name for the assumed role. Requires `role_arn`. When
-        /// omitted, the gateway generates one.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[schemars(length(min = 1))]
-        role_session_name: Option<String>,
-    },
-    /// A Bedrock API key, sent as a bearer token instead of a SigV4
-    /// signature.
-    ApiKey {
-        /// Amazon Bedrock API key. The gateway does not log the plaintext
-        /// value.
-        #[schemars(length(min = 1))]
-        api_key: String,
-    },
-    /// Credentials from the gateway's own AWS environment: environment
-    /// variables, web identity (for example IRSA on EKS), the ECS
-    /// container credentials endpoint, or the EC2 instance profile.
-    /// Temporary credentials are refreshed before they expire.
-    DefaultChain {
-        /// ARN of an IAM role to assume with these credentials through
-        /// `sts:AssumeRole`. The temporary credentials are refreshed before
-        /// they expire. When the credentials already belong to this role,
-        /// they are used as they are.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[schemars(length(min = 1))]
-        role_arn: Option<String>,
-        /// External ID the role's trust policy requires. Requires `role_arn`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[schemars(length(min = 1))]
-        external_id: Option<String>,
-        /// Session name for the assumed role. Requires `role_arn`. When
-        /// omitted, the gateway generates one.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[schemars(length(min = 1))]
-        role_session_name: Option<String>,
-    },
-}
-
-/// Per-guardrail latency policy for `kind: "bedrock"`. Serial mode waits
-/// for the guardrail response; timed mode aborts at `timeout_ms` and applies
-/// `fail_open`.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "lowercase")]
-pub enum BedrockLatencyMode {
-    Serial,
-    Timed {
-        /// Maximum time in milliseconds to wait for the Bedrock guardrail response.
-        #[schemars(range(min = 100, max = 5000))]
-        timeout_ms: u32,
-    },
-}
-
-/// Config block for `kind: "azure_content_safety"`. Calls Azure AI
-/// Content Safety Prompt Shield API to detect jailbreak and indirect
-/// injection attacks.
-///
-/// The CP (cp-api) decrypts the envelope-encrypted `api_key` at kine-
-/// projection time so the DP always holds plaintext in memory. The
-/// key is never logged.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-pub struct AzureContentSafetyConfig {
-    /// Azure Cognitive Services resource endpoint, e.g.
-    /// `https://my-resource.cognitiveservices.azure.com`.
-    /// The gateway appends `/contentsafety/text:shieldPrompt?api-version=2024-09-01`.
-    #[schemars(length(min = 1))]
-    pub endpoint: String,
-    /// Azure subscription key sent with the `Ocp-Apim-Subscription-Key` header. Decrypted before
-    /// projection. Plaintext is held in memory only and is not logged.
-    #[schemars(length(min = 1))]
-    pub api_key: String,
-    /// HTTP call timeout in milliseconds. A value of `0` triggers the timeout immediately.
-    #[serde(default = "default_acs_timeout_ms")]
-    #[schemars(range(max = 4_294_967_295u32))]
-    pub timeout_ms: u32,
-    /// Fail-open policy for the output hook. When disabled (the default), an
-    /// Azure outage blocks model output instead of releasing unscanned content.
-    /// The input hook continues to use the top-level `fail_open` policy.
-    #[serde(default)]
-    pub output_fail_open: bool,
-}
-
-fn default_acs_timeout_ms() -> u32 {
-    5_000
-}
-
-/// Config block for `kind: "azure_content_safety_text_moderation"`. Calls
-/// Azure AI Content Safety `text:analyze` for category-severity and blocklist
-/// moderation on input and/or output, including streaming output.
-///
-/// Reuses the P1 connection block (endpoint + api_key + timeout_ms). cp-api
-/// projects only operator-set fields (omitempty), so every optional field
-/// carries a serde default matching the cp-api validator's documented
-/// default. Only `api_key` is a secret (decrypted by cp-api before kine
-/// projection). Every other field travels in the clear.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-pub struct AzureContentSafetyTextModerationConfig {
-    /// Azure Cognitive Services resource endpoint. The gateway appends
-    /// `/contentsafety/text:analyze?api-version=2024-09-01`.
-    #[schemars(length(min = 1))]
-    pub endpoint: String,
-    /// Azure subscription key sent with the `Ocp-Apim-Subscription-Key` header. Plaintext is held in
-    /// memory only and is not logged.
-    #[schemars(length(min = 1))]
-    pub api_key: String,
-    /// HTTP call timeout in milliseconds. `fail_open` and `output_fail_open`
-    /// govern the verdict when it elapses. A value of `0` triggers the timeout
-    /// immediately.
-    #[serde(default = "default_acs_timeout_ms")]
-    #[schemars(range(max = 4_294_967_295u32))]
-    pub timeout_ms: u32,
-
-    // --- moderation parameters ---
-    /// Severity scale used for Azure category scores. The four-level scale
-    /// returns even severities; the eight-level scale returns every integer
-    /// severity.
-    #[serde(default = "default_acs_output_type")]
-    pub output_type: String,
-    /// Categories to analyze.
-    #[serde(default = "default_acs_categories")]
-    pub categories: Vec<String>,
-    /// General severity threshold. A category at or above it blocks.
-    #[serde(default = "default_acs_severity_threshold")]
-    #[schemars(range(max = 7))]
-    pub severity_threshold: u8,
-    /// Per-category threshold overrides. These take precedence over the general threshold.
-    #[serde(default)]
-    pub severity_threshold_by_category: std::collections::BTreeMap<String, u8>,
-    /// Azure CS blocklist names to match against.
-    #[serde(default)]
-    pub blocklist_names: Vec<String>,
-    /// Forwarded to Azure's `haltOnBlocklistHit`.
-    #[serde(default)]
-    pub halt_on_blocklist_hit: bool,
-    /// Input-hook text selection. The default scans user messages only; the
-    /// alternate mode includes all message content. Ignored on the output hook.
-    #[serde(default = "default_acs_text_source")]
-    pub text_source: String,
-
-    // --- streaming-output controls (consumed by aisix-proxy build_sse_stream) ---
-    /// Streaming output moderation mode: sliding-window incremental release
-    /// or whole-response hold-back.
-    #[serde(default = "default_acs_stream_processing_mode")]
-    pub stream_processing_mode: String,
-    /// Sliding-window size in characters for window mode.
-    #[serde(default = "default_acs_window_size")]
-    #[schemars(range(min = 1, max = 10_000))]
-    pub window_size: u32,
-    /// Chars carried between windows so a span split across a boundary is still caught.
-    #[serde(default = "default_acs_window_overlap_size")]
-    pub window_overlap_size: u32,
-    /// Max bytes of model-generated content held back from a streamed response
-    /// before `on_buffer_exceeded` applies: in `buffer_full` mode, and in
-    /// `window` mode wherever output is held whole (the whole stream on
-    /// `/v1/messages` and `/v1/responses`, and tool-call arguments on
-    /// `/v1/chat/completions`) and no output guardrail in the chain uses
-    /// `buffer_full`, whose rows alone then set the cap. Counts assistant
-    /// text, reasoning, and tool-call arguments; SSE and JSON framing is not
-    /// counted.
-    #[serde(default = "default_acs_max_buffer_bytes")]
-    #[schemars(range(min = 1))]
-    pub max_buffer_bytes: u64,
-    /// Buffer-overflow policy for streamed output when the buffer cap is hit.
-    #[serde(default = "default_acs_on_buffer_exceeded")]
-    pub on_buffer_exceeded: String,
-    /// Fail-open policy for the output hook. When disabled, an Azure outage does not release unscanned model output.
-    #[serde(default)]
-    pub output_fail_open: bool,
-}
-
-fn default_acs_output_type() -> String {
-    "FourSeverityLevels".to_owned()
-}
-
-fn default_acs_categories() -> Vec<String> {
-    vec![
-        "Hate".to_owned(),
-        "Sexual".to_owned(),
-        "SelfHarm".to_owned(),
-        "Violence".to_owned(),
-    ]
-}
-
-fn default_acs_severity_threshold() -> u8 {
-    2
-}
-
-fn default_acs_text_source() -> String {
-    "concatenate_user_content".to_owned()
-}
-
-fn default_acs_stream_processing_mode() -> String {
-    "window".to_owned()
-}
-
-fn default_acs_window_size() -> u32 {
-    10_000
-}
-
-fn default_acs_window_overlap_size() -> u32 {
-    256
-}
-
-fn default_acs_max_buffer_bytes() -> u64 {
-    262_144
-}
-
-fn default_acs_on_buffer_exceeded() -> String {
-    "fail_closed".to_owned()
-}
-
-/// Config block for `kind: "aliyun_text_moderation"`. Calls Aliyun's
-/// content-safety guardrail (`TextModerationPlus`, action version
-/// `2022-03-02`) on the `green-cip.<region>.aliyuncs.com` endpoint for
-/// category-risk moderation on input and/or output (including streaming
-/// output.
-///
-/// The input hook uses the `llm_query_moderation` service code, the
-/// output hook `llm_response_moderation`. Aliyun grades each call with a
-/// `RiskLevel` (`none`/`low`/`medium`/`high`). The DP blocks when the
-/// returned level reaches `risk_level_threshold`.
-///
-/// Only `access_key_secret` is a secret (decrypted by cp-api before kine
-/// projection. It is plaintext in DP memory only and never logged). Every other
-/// field travels in the clear.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-pub struct AliyunTextModerationConfig {
-    /// Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The gateway
-    /// builds the endpoint `https://green-cip.<region>.aliyuncs.com`.
-    #[schemars(length(min = 1))]
-    pub region: String,
-    /// Explicit endpoint override as a full URL with no trailing slash. When set, it takes precedence over `region`.
-    #[serde(default)]
-    #[schemars(length(min = 1))]
-    pub endpoint: Option<String>,
-    /// Aliyun AccessKey ID.
-    #[schemars(length(min = 1))]
-    pub access_key_id: String,
-    /// Aliyun AccessKey secret. Decrypted before projection. Plaintext is held
-    /// in memory only and is not logged. Used to sign the request.
-    #[schemars(length(min = 1))]
-    pub access_key_secret: String,
-    /// Minimum risk level that triggers a block. A returned level at or above
-    /// this threshold blocks.
-    #[serde(default = "default_aliyun_risk_level_threshold")]
-    pub risk_level_threshold: String,
-    /// HTTP call timeout in milliseconds. `fail_open` and `output_fail_open`
-    /// govern the verdict when it elapses. A value of `0` triggers the timeout
-    /// immediately.
-    #[serde(default = "default_acs_timeout_ms")]
-    #[schemars(range(max = 4_294_967_295u32))]
-    pub timeout_ms: u32,
-    /// Fail-open policy for the output hook. When disabled, an Aliyun outage does not release unscanned model output.
-    #[serde(default)]
-    pub output_fail_open: bool,
-
-    // --- streaming-output controls (consumed by aisix-proxy build_sse_stream) ---
-    /// Streaming output moderation mode: sliding-window incremental release
-    /// or whole-response hold-back.
-    #[serde(default = "default_acs_stream_processing_mode")]
-    pub stream_processing_mode: String,
-    /// Sliding-window size in characters when window mode is used. Aliyun limits each `llm_response_moderation` call to 2,000 characters.
-    #[serde(default = "default_aliyun_window_size")]
-    #[schemars(range(min = 1, max = 2_000))]
-    pub window_size: u32,
-    /// Chars carried between windows so a span split across a boundary is still caught.
-    #[serde(default = "default_aliyun_window_overlap_size")]
-    pub window_overlap_size: u32,
-    /// Max bytes of model-generated content held back from a streamed response
-    /// before `on_buffer_exceeded` applies: in `buffer_full` mode, and in
-    /// `window` mode wherever output is held whole (the whole stream on
-    /// `/v1/messages` and `/v1/responses`, and tool-call arguments on
-    /// `/v1/chat/completions`) and no output guardrail in the chain uses
-    /// `buffer_full`, whose rows alone then set the cap. Counts assistant
-    /// text, reasoning, and tool-call arguments; SSE and JSON framing is not
-    /// counted.
-    #[serde(default = "default_acs_max_buffer_bytes")]
-    #[schemars(range(min = 1))]
-    pub max_buffer_bytes: u64,
-    /// Buffer-overflow policy for streamed output when the buffer cap is hit.
-    #[serde(default = "default_acs_on_buffer_exceeded")]
-    pub on_buffer_exceeded: String,
-}
-
-fn default_aliyun_risk_level_threshold() -> String {
-    "high".to_owned()
-}
-
-/// Config block for `kind: "aliyun_ai_guardrail"`. Calls Aliyun's AI
-/// Guardrails product (AI 安全护栏, action `MultiModalGuard`, version
-/// `2022-03-02`) on the `green-cip.<region>.aliyuncs.com` endpoint for
-/// policy-driven moderation on input and/or output (including streaming
-/// output).
-///
-/// A DIFFERENT Aliyun product from `aliyun_text_moderation`
-/// (TextModerationPlus / Content Moderation): AI Guardrails is activated,
-/// billed, and policy-configured separately (commodity
-/// `lvwang_guardrail_public_cn`), and its calls appear in the AI
-/// Guardrails console. The input hook uses the `query_security_check_pro`
-/// service code (`query_security_check` at `service_level: "basic"`), the
-/// output hook `response_security_check_pro` / `response_security_check`.
-///
-/// Verdicts follow the returned `Data.Suggestion`, which Aliyun computes
-/// from the check/block policies configured in its console — there is no
-/// local risk threshold. `block` blocks; anything else passes (detection
-/// detail lands in logs/telemetry).
-///
-/// Only `access_key_secret` is a secret (decrypted by cp-api before kine
-/// projection. It is plaintext in DP memory only and never logged). Every
-/// other field travels in the clear.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-pub struct AliyunAiGuardrailConfig {
-    /// Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The gateway
-    /// builds the endpoint `https://green-cip.<region>.aliyuncs.com`.
-    #[schemars(length(min = 1))]
-    pub region: String,
-    /// Explicit endpoint override as a full URL with no trailing slash. When set, it takes precedence over `region`.
-    #[serde(default)]
-    #[schemars(length(min = 1))]
-    pub endpoint: Option<String>,
-    /// Aliyun AccessKey ID.
-    #[schemars(length(min = 1))]
-    pub access_key_id: String,
-    /// Aliyun AccessKey secret. Decrypted before projection. Plaintext is held
-    /// in memory only and is not logged. Used to sign the request.
-    #[schemars(length(min = 1))]
-    pub access_key_secret: String,
-    /// Which AI Guardrails service tier to call: `pro` uses
-    /// `query_security_check_pro` / `response_security_check_pro`, `basic`
-    /// uses `query_security_check` / `response_security_check`. Must match
-    /// the tier activated on the Aliyun account.
-    #[serde(default = "default_aliyun_aig_service_level")]
-    pub service_level: String,
-    /// HTTP call timeout in milliseconds. `fail_open` and `output_fail_open`
-    /// govern the verdict when it elapses. A value of `0` triggers the timeout
-    /// immediately.
-    #[serde(default = "default_acs_timeout_ms")]
-    #[schemars(range(max = 4_294_967_295u32))]
-    pub timeout_ms: u32,
-    /// Fail-open policy for the output hook. When disabled, an Aliyun outage does not release unscanned model output.
-    #[serde(default)]
-    pub output_fail_open: bool,
-
-    // --- streaming-output controls (consumed by aisix-proxy build_sse_stream) ---
-    /// Streaming output moderation mode: sliding-window incremental release
-    /// or whole-response hold-back.
-    #[serde(default = "default_acs_stream_processing_mode")]
-    pub stream_processing_mode: String,
-    /// Sliding-window size in characters when window mode is used. Aliyun limits each MultiModalGuard call to 2,000 characters of text.
-    #[serde(default = "default_aliyun_window_size")]
-    #[schemars(range(min = 1, max = 2_000))]
-    pub window_size: u32,
-    /// Chars carried between windows so a span split across a boundary is still caught.
-    #[serde(default = "default_aliyun_window_overlap_size")]
-    pub window_overlap_size: u32,
-    /// Max bytes of model-generated content held back from a streamed response
-    /// before `on_buffer_exceeded` applies: in `buffer_full` mode, and in
-    /// `window` mode wherever output is held whole (the whole stream on
-    /// `/v1/messages` and `/v1/responses`, and tool-call arguments on
-    /// `/v1/chat/completions`) and no output guardrail in the chain uses
-    /// `buffer_full`, whose rows alone then set the cap. Counts assistant
-    /// text, reasoning, and tool-call arguments; SSE and JSON framing is not
-    /// counted.
-    #[serde(default = "default_acs_max_buffer_bytes")]
-    #[schemars(range(min = 1))]
-    pub max_buffer_bytes: u64,
-    /// Buffer-overflow policy for streamed output when the buffer cap is hit.
-    #[serde(default = "default_acs_on_buffer_exceeded")]
-    pub on_buffer_exceeded: String,
-}
-
-fn default_aliyun_aig_service_level() -> String {
-    "pro".to_owned()
-}
-
 /// One built-in detector selection for `kind: "pii"`. The `type` names the
 /// detector to enable; `action` optionally overrides the guardrail-level
 /// `default_action` for this detector only.
@@ -590,8 +178,7 @@ pub struct PiiConfig {
     // --- streaming-output controls (consumed by aisix-proxy) ---
     // Masking a streamed response requires the whole response to be held
     // back (the mask spans chunk boundaries), so kind=pii always uses the
-    // buffer_full policy on the output hook. These knobs mirror the ACS/
-    // Aliyun buffer_full parameters.
+    // buffer_full policy on the output hook.
     /// Max bytes of model-generated content held back from a streamed response
     /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
     /// and tool-call arguments; SSE and JSON framing is not counted.
@@ -607,37 +194,24 @@ fn default_pii_action() -> String {
     "mask".to_owned()
 }
 
-fn default_aliyun_window_size() -> u32 {
-    2_000
+fn default_acs_timeout_ms() -> u32 {
+    5_000
 }
 
-fn default_aliyun_window_overlap_size() -> u32 {
-    128
+fn default_acs_window_size() -> u32 {
+    10_000
 }
 
-/// Config block for `kind: "bedrock"`. The DP builds an
-/// `aisix-guardrails::BedrockGuardrail` from this and dispatches
-/// `ApplyGuardrail` on every governed request.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-pub struct BedrockConfig {
-    /// Guardrail identifier issued by the AWS console.
-    #[schemars(length(min = 1, max = 64))]
-    pub guardrail_id: String,
-    /// Version label: `DRAFT`, `1`, `2`, ...
-    #[schemars(length(min = 1, max = 16))]
-    pub guardrail_version: String,
-    /// AWS region for the Bedrock endpoint, such as `us-east-1`.
-    #[schemars(length(min = 1))]
-    pub region: String,
-    /// IAM credentials for Bedrock requests.
-    pub aws_credentials: BedrockAWSCredentials,
-    /// Bedrock guardrail latency policy. Timed mode caps wait time with `timeout_ms`.
-    pub latency_mode: BedrockLatencyMode,
-    /// Fail-open policy for the output hook. When disabled (the default), a
-    /// Bedrock outage blocks model output instead of releasing unscanned content.
-    /// The input hook continues to use the top-level `fail_open` policy.
-    #[serde(default)]
-    pub output_fail_open: bool,
+fn default_acs_window_overlap_size() -> u32 {
+    256
+}
+
+fn default_acs_max_buffer_bytes() -> u64 {
+    262_144
+}
+
+fn default_acs_on_buffer_exceeded() -> String {
+    "fail_closed".to_owned()
 }
 
 /// Config block for `kind: "lakera"`. Calls Lakera Guard
@@ -905,13 +479,11 @@ pub struct SemanticConfig {
     /// one against the model named in `embedding_model`, on your own
     /// traffic: a request that emits a usage event reports what it scored
     /// in `guardrail_scores`, including the requests this guardrail
-    /// allowed. Not every surface can produce that sample. `/a2a`,
-    /// `rerank`, `/v1/embeddings`, `/v1/images/*`, `/v1/videos`,
-    /// `/v1/audio/speech` and `/v1/messages/count_tokens` run the INPUT
+    /// allowed. Not every surface can produce that sample. `rerank`,
+    /// `/v1/embeddings`, `/v1/images/*`, `/v1/videos` and
+    /// `/v1/audio/speech` run the INPUT
     /// hook only, so an output-hook row scores nothing on them (audio
-    /// transcription and translation do run both); `/a2a` also resolves no
-    /// model and no MCP server, so only a row attached at the
-    /// environment, API-key or team scope reaches it at all.
+    /// transcription and translation do run both).
     // Defaulted at the TYPE level only so that a direction with no
     // example list may omit its key; both the write and the read schema
     // require it whenever `deny_examples` is non-empty, so the default is
@@ -1109,27 +681,6 @@ fn default_custom_stream_processing_mode() -> String {
 pub enum GuardrailKind {
     /// In-process literal/regex blocklist. Always available.
     Keyword(KeywordConfig),
-    /// AWS Bedrock managed guardrail using `ApplyGuardrail` on input, output, or both.
-    Bedrock(BedrockConfig),
-    /// Azure AI Content Safety Prompt Shield. Detects jailbreak and
-    /// indirect injection attacks via the `/contentsafety/text:shieldPrompt`
-    /// API.
-    AzureContentSafety(AzureContentSafetyConfig),
-    /// Azure AI Content Safety Text Moderation. Category-severity and
-    /// blocklist moderation via the `/contentsafety/text:analyze` API, on input
-    /// and/or output, including streaming output.
-    AzureContentSafetyTextModeration(AzureContentSafetyTextModerationConfig),
-    /// Aliyun content-safety guardrail. Risk-level moderation via the
-    /// `TextModerationPlus` action on `green-cip.<region>.aliyuncs.com`, on
-    /// input and/or output, including streaming output.
-    AliyunTextModeration(AliyunTextModerationConfig),
-    /// Aliyun AI Guardrails. Policy-driven moderation through the
-    /// `MultiModalGuard` action: the verdict follows the policy configured in
-    /// the provider's console. Content that policy marks for masking is
-    /// released with the provider's desensitized text in place of the
-    /// original, and blocked when no desensitized text is returned. Applies
-    /// on input and/or output, including streaming output.
-    AliyunAiGuardrail(AliyunAiGuardrailConfig),
     /// Built-in sensitive-data detection and redaction inside AISIX. Built-in
     /// detectors and custom regex patterns can mask matched spans or block
     /// traffic on input, output, or both, including buffered streaming output.
@@ -1170,13 +721,6 @@ impl GuardrailKind {
     pub fn kind_str(&self) -> &'static str {
         match self {
             GuardrailKind::Keyword(_) => "keyword",
-            GuardrailKind::Bedrock(_) => "bedrock",
-            GuardrailKind::AzureContentSafety(_) => "azure_content_safety",
-            GuardrailKind::AzureContentSafetyTextModeration(_) => {
-                "azure_content_safety_text_moderation"
-            }
-            GuardrailKind::AliyunTextModeration(_) => "aliyun_text_moderation",
-            GuardrailKind::AliyunAiGuardrail(_) => "aliyun_ai_guardrail",
             GuardrailKind::Pii(_) => "pii",
             GuardrailKind::Lakera(_) => "lakera",
             GuardrailKind::OpenaiModeration(_) => "openai_moderation",
@@ -1575,14 +1119,13 @@ impl Resource for Guardrail {
 /// Which dimension of the request a guardrail attachment is scoped to.
 ///
 /// `Env` applies to every request in the environment. The narrower scopes let
-/// operators attach a guardrail to only the models, MCP servers, API keys, or
-/// teams that need it.
+/// operators attach a guardrail to only the models, API keys, or teams that
+/// need it.
 ///
-/// `Model`, `McpServer` and `PassthroughRoute` select dimensions a request
-/// carries only one of: an MCP tool call resolves no model, an LLM request
-/// routes to no MCP server, and a passthrough-route request resolves neither.
-/// A `Model`-scoped guardrail therefore never inspects MCP or passthrough
-/// traffic, an `McpServer`-scoped one never inspects model traffic, and a
+/// `Model` and `PassthroughRoute` select dimensions a request carries at
+/// most one of: an LLM request resolves no passthrough route, and a
+/// passthrough-route request resolves no model. A `Model`-scoped guardrail
+/// therefore never inspects passthrough traffic, and a
 /// `PassthroughRoute`-scoped one inspects only the traffic of that route.
 ///
 /// Scope follows the entry the caller addresses: a guardrail attached to a
@@ -1594,14 +1137,13 @@ impl Resource for Guardrail {
 pub enum GuardrailScopeType {
     Env,
     Model,
-    McpServer,
     ApiKey,
     Team,
     PassthroughRoute,
 }
 
 /// Guardrail attachment that scopes one guardrail to an environment, model,
-/// MCP server, caller API key, or team. AISIX loads attachments with the
+/// caller API key, or team. AISIX loads attachments with the
 /// guardrail definitions and uses `scope_type` plus `scope_id` to decide which
 /// guardrails apply to each request.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
@@ -1613,8 +1155,8 @@ pub struct GuardrailAttachment {
     /// What dimension of the request this attachment is scoped to.
     pub scope_type: GuardrailScopeType,
 
-    /// The UUID of the specific resource (model / mcp_server / api_key /
-    /// team / passthrough_route). `None` when `scope_type` is `Env`
+    /// The UUID of the specific resource (model / api_key / team /
+    /// passthrough_route). `None` when `scope_type` is `Env`
     /// (applies to all requests).
     pub scope_id: Option<String>,
 
@@ -1766,294 +1308,6 @@ mod tests {
             serde_json::from_value(v).expect("outer fields must not reach the inner kind");
         assert_eq!(g.enforcement_mode, "monitor");
         assert_eq!(g.direction, "input");
-    }
-
-    #[test]
-    fn bedrock_kind_parses_with_serial_latency() {
-        let v = json!({
-            "name": "block-pii",
-            "kind": "bedrock",
-            "guardrail_id": "abcdefgh1234",
-            "guardrail_version": "DRAFT",
-            "region": "us-east-1",
-            "aws_credentials": {
-                "kind": "static",
-                "access_key_id": "AKIAEXAMPLE",
-                "secret_access_key": "PLAINTEXT_FOR_TEST"
-            },
-            "latency_mode": { "kind": "serial" }
-        });
-        let g: Guardrail = serde_json::from_value(v).unwrap();
-        match g.config {
-            GuardrailKind::Bedrock(b) => {
-                assert_eq!(b.guardrail_id, "abcdefgh1234");
-                assert_eq!(b.region, "us-east-1");
-                assert!(matches!(b.latency_mode, BedrockLatencyMode::Serial));
-                match b.aws_credentials {
-                    BedrockAWSCredentials::Static {
-                        access_key_id,
-                        secret_access_key,
-                        session_token: None,
-                        role_arn: None,
-                        ..
-                    } => {
-                        assert_eq!(access_key_id, "AKIAEXAMPLE");
-                        assert_eq!(secret_access_key, "PLAINTEXT_FOR_TEST");
-                    }
-                    other => panic!("expected static credentials, got {other:?}"),
-                }
-            }
-            _ => panic!("expected Bedrock variant"),
-        }
-    }
-
-    #[test]
-    fn bedrock_kind_parses_with_timed_latency() {
-        let v = json!({
-            "name": "block-pii",
-            "kind": "bedrock",
-            "guardrail_id": "id",
-            "guardrail_version": "1",
-            "region": "us-east-1",
-            "aws_credentials": {
-                "kind": "static",
-                "access_key_id": "AKIA",
-                "secret_access_key": "secret"
-            },
-            "latency_mode": { "kind": "timed", "timeout_ms": 500 }
-        });
-        let g: Guardrail = serde_json::from_value(v).unwrap();
-        match g.config {
-            GuardrailKind::Bedrock(b) => match b.latency_mode {
-                BedrockLatencyMode::Timed { timeout_ms } => assert_eq!(timeout_ms, 500),
-                _ => panic!("expected Timed"),
-            },
-            _ => panic!("expected Bedrock variant"),
-        }
-    }
-
-    #[test]
-    fn azure_content_safety_kind_parses() {
-        let v = json!({
-            "name": "shield",
-            "kind": "azure_content_safety",
-            "endpoint": "https://my-resource.cognitiveservices.azure.com",
-            "api_key": "plaintext-key",
-            "timeout_ms": 3000
-        });
-        let g: Guardrail = serde_json::from_value(v).unwrap();
-        assert_eq!(g.name, "shield");
-        match g.config {
-            GuardrailKind::AzureContentSafety(ref c) => {
-                assert_eq!(
-                    c.endpoint,
-                    "https://my-resource.cognitiveservices.azure.com"
-                );
-                assert_eq!(c.api_key, "plaintext-key");
-                assert_eq!(c.timeout_ms, 3000);
-            }
-            _ => panic!("expected AzureContentSafety variant"),
-        }
-    }
-
-    #[test]
-    fn azure_content_safety_timeout_defaults_to_5000() {
-        let v = json!({
-            "name": "shield",
-            "kind": "azure_content_safety",
-            "endpoint": "https://my-resource.cognitiveservices.azure.com",
-            "api_key": "k"
-        });
-        let g: Guardrail = serde_json::from_value(v).unwrap();
-        match g.config {
-            GuardrailKind::AzureContentSafety(ref c) => assert_eq!(c.timeout_ms, 5_000),
-            _ => panic!("expected AzureContentSafety variant"),
-        }
-    }
-
-    #[test]
-    fn azure_text_moderation_kind_parses_with_defaults() {
-        // cp-api omits unset fields (omitempty); the DP must apply the
-        // documented defaults so a minimal row still moderates correctly.
-        let v = json!({
-            "name": "moderate",
-            "kind": "azure_content_safety_text_moderation",
-            "endpoint": "https://my-resource.cognitiveservices.azure.com",
-            "api_key": "plaintext-key"
-        });
-        let g: Guardrail = serde_json::from_value(v).unwrap();
-        match g.config {
-            GuardrailKind::AzureContentSafetyTextModeration(ref c) => {
-                assert_eq!(c.timeout_ms, 5_000);
-                assert_eq!(c.output_type, "FourSeverityLevels");
-                assert_eq!(c.severity_threshold, 2);
-                assert_eq!(c.categories.len(), 4);
-                assert_eq!(c.text_source, "concatenate_user_content");
-                assert_eq!(c.stream_processing_mode, "window");
-                assert_eq!(c.window_size, 10_000);
-                assert_eq!(c.window_overlap_size, 256);
-                assert_eq!(c.max_buffer_bytes, 262_144);
-                assert_eq!(c.on_buffer_exceeded, "fail_closed");
-                assert!(!c.output_fail_open);
-            }
-            _ => panic!("expected AzureContentSafetyTextModeration variant"),
-        }
-    }
-
-    #[test]
-    fn azure_text_moderation_kind_round_trips_set_fields() {
-        let v = json!({
-            "name": "moderate",
-            "kind": "azure_content_safety_text_moderation",
-            "endpoint": "https://e.cognitiveservices.azure.com",
-            "api_key": "k",
-            "output_type": "EightSeverityLevels",
-            "categories": ["Hate", "Violence"],
-            "severity_threshold": 0,
-            "severity_threshold_by_category": { "Violence": 6 },
-            "stream_processing_mode": "buffer_full",
-            "window_overlap_size": 0,
-            "output_fail_open": true
-        });
-        let g: Guardrail = serde_json::from_value(v).unwrap();
-        match g.config {
-            GuardrailKind::AzureContentSafetyTextModeration(ref c) => {
-                assert_eq!(c.output_type, "EightSeverityLevels");
-                assert_eq!(
-                    c.severity_threshold, 0,
-                    "explicit 0 must survive (not defaulted to 2)"
-                );
-                assert_eq!(c.severity_threshold_by_category.get("Violence"), Some(&6));
-                assert_eq!(c.stream_processing_mode, "buffer_full");
-                assert_eq!(c.window_overlap_size, 0, "explicit 0 overlap must survive");
-                assert!(c.output_fail_open);
-            }
-            _ => panic!("expected AzureContentSafetyTextModeration variant"),
-        }
-    }
-
-    #[test]
-    fn aliyun_text_moderation_kind_parses_with_defaults() {
-        // cp-api omits unset fields (omitempty); the DP must apply the
-        // documented defaults so a minimal row still moderates correctly.
-        let v = json!({
-            "name": "aliyun-guard",
-            "kind": "aliyun_text_moderation",
-            "region": "cn-shanghai",
-            "access_key_id": "LTAI_EXAMPLE",
-            "access_key_secret": "PLAINTEXT_FOR_TEST"
-        });
-        let g: Guardrail = serde_json::from_value(v).unwrap();
-        match g.config {
-            GuardrailKind::AliyunTextModeration(ref c) => {
-                assert_eq!(c.region, "cn-shanghai");
-                assert_eq!(c.access_key_id, "LTAI_EXAMPLE");
-                assert_eq!(c.access_key_secret, "PLAINTEXT_FOR_TEST");
-                assert_eq!(c.endpoint, None);
-                assert_eq!(c.risk_level_threshold, "high");
-                assert_eq!(c.timeout_ms, 5_000);
-                assert!(!c.output_fail_open);
-                assert_eq!(c.stream_processing_mode, "window");
-                assert_eq!(c.window_size, 2_000);
-                assert_eq!(c.window_overlap_size, 128);
-                assert_eq!(c.max_buffer_bytes, 262_144);
-                assert_eq!(c.on_buffer_exceeded, "fail_closed");
-            }
-            _ => panic!("expected AliyunTextModeration variant"),
-        }
-    }
-
-    #[test]
-    fn aliyun_text_moderation_kind_round_trips_set_fields() {
-        let v = json!({
-            "name": "aliyun-guard",
-            "kind": "aliyun_text_moderation",
-            "region": "cn-beijing",
-            "endpoint": "http://127.0.0.1:8080",
-            "access_key_id": "id",
-            "access_key_secret": "secret",
-            "risk_level_threshold": "medium",
-            "timeout_ms": 3000,
-            "output_fail_open": true,
-            "stream_processing_mode": "buffer_full",
-            "window_size": 1000,
-            "window_overlap_size": 0
-        });
-        let g: Guardrail = serde_json::from_value(v).unwrap();
-        match g.config {
-            GuardrailKind::AliyunTextModeration(ref c) => {
-                assert_eq!(c.endpoint.as_deref(), Some("http://127.0.0.1:8080"));
-                assert_eq!(c.risk_level_threshold, "medium");
-                assert_eq!(c.timeout_ms, 3000);
-                assert!(c.output_fail_open);
-                assert_eq!(c.stream_processing_mode, "buffer_full");
-                assert_eq!(c.window_size, 1000);
-                assert_eq!(c.window_overlap_size, 0, "explicit 0 overlap must survive");
-            }
-            _ => panic!("expected AliyunTextModeration variant"),
-        }
-    }
-
-    #[test]
-    fn aliyun_ai_guardrail_kind_parses_with_defaults() {
-        // cp-api omits unset fields (omitempty); the DP must apply the
-        // documented defaults so a minimal row still moderates correctly.
-        let v = json!({
-            "name": "aig-guard",
-            "kind": "aliyun_ai_guardrail",
-            "region": "cn-shanghai",
-            "access_key_id": "LTAI_EXAMPLE",
-            "access_key_secret": "PLAINTEXT_FOR_TEST"
-        });
-        let g: Guardrail = serde_json::from_value(v).unwrap();
-        match g.config {
-            GuardrailKind::AliyunAiGuardrail(ref c) => {
-                assert_eq!(c.region, "cn-shanghai");
-                assert_eq!(c.access_key_id, "LTAI_EXAMPLE");
-                assert_eq!(c.access_key_secret, "PLAINTEXT_FOR_TEST");
-                assert_eq!(c.endpoint, None);
-                assert_eq!(c.service_level, "pro");
-                assert_eq!(c.timeout_ms, 5_000);
-                assert!(!c.output_fail_open);
-                assert_eq!(c.stream_processing_mode, "window");
-                assert_eq!(c.window_size, 2_000);
-                assert_eq!(c.window_overlap_size, 128);
-                assert_eq!(c.max_buffer_bytes, 262_144);
-                assert_eq!(c.on_buffer_exceeded, "fail_closed");
-            }
-            _ => panic!("expected AliyunAiGuardrail variant"),
-        }
-    }
-
-    #[test]
-    fn aliyun_ai_guardrail_kind_round_trips_set_fields() {
-        let v = json!({
-            "name": "aig-guard",
-            "kind": "aliyun_ai_guardrail",
-            "region": "cn-beijing",
-            "endpoint": "http://127.0.0.1:8080",
-            "access_key_id": "id",
-            "access_key_secret": "secret",
-            "service_level": "basic",
-            "timeout_ms": 3000,
-            "output_fail_open": true,
-            "stream_processing_mode": "buffer_full",
-            "window_size": 1000,
-            "window_overlap_size": 0
-        });
-        let g: Guardrail = serde_json::from_value(v).unwrap();
-        match g.config {
-            GuardrailKind::AliyunAiGuardrail(ref c) => {
-                assert_eq!(c.endpoint.as_deref(), Some("http://127.0.0.1:8080"));
-                assert_eq!(c.service_level, "basic");
-                assert_eq!(c.timeout_ms, 3000);
-                assert!(c.output_fail_open);
-                assert_eq!(c.stream_processing_mode, "buffer_full");
-                assert_eq!(c.window_size, 1000);
-                assert_eq!(c.window_overlap_size, 0, "explicit 0 overlap must survive");
-            }
-            _ => panic!("expected AliyunAiGuardrail variant"),
-        }
     }
 
     #[test]

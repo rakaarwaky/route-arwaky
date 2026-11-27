@@ -59,21 +59,13 @@ impl Surface {
 
 pub(crate) const CHAT: Surface = Surface::uniform("chat");
 pub(crate) const COMPLETIONS: Surface = Surface::uniform("completions");
-pub(crate) const MESSAGES: Surface = Surface::uniform("messages");
-pub(crate) const COUNT_TOKENS: Surface = Surface::uniform("count_tokens");
 pub(crate) const RESPONSES: Surface = Surface::uniform("responses");
 pub(crate) const EMBEDDINGS: Surface = Surface::uniform("embeddings");
 pub(crate) const RERANK: Surface = Surface::uniform("rerank");
-/// Named after the route, not the upstream format: a System One request an
-/// OpenAI model serves is still `systemone`, and the reverse is `decisions`.
-pub(crate) const SYSTEMONE: Surface = Surface::uniform("systemone");
-pub(crate) const DECISIONS: Surface = Surface::uniform("decisions");
 pub(crate) const REALTIME: Surface = Surface::uniform("realtime");
 pub(crate) const FILES: Surface = Surface::uniform("files");
 pub(crate) const BATCHES: Surface = Surface::uniform("batches");
 pub(crate) const FINE_TUNING: Surface = Surface::uniform("fine_tuning");
-pub(crate) const MCP: Surface = Surface::uniform("mcp");
-pub(crate) const A2A: Surface = Surface::uniform("a2a");
 
 pub(crate) const IMAGE_GENERATION: Surface = Surface::split("images", "image_generation");
 pub(crate) const IMAGE_EDIT: Surface = Surface::split("images", "image_edit");
@@ -114,11 +106,11 @@ pub(crate) const BATCH_COMPLETION: Surface = Surface::split("batch", "batch_comp
 /// names a model on. The row is not a model's row, it is the request's: the
 /// guard writes a `499` access-log line for any route it wraps, and a line
 /// an operator cannot find in the usage log by the same `request_id` is the
-/// gap this exists to close. So `/mcp`, `/a2a`, the passthrough namespace
-/// and the jobs surface report their own attribution (route, server/tool,
-/// agent) with the model fields empty, and `/v1/realtime` reports the
-/// pre-upgrade phase — after the upgrade its session runs detached from
-/// this guard and writes its own terminal event.
+/// gap this exists to close. So the passthrough namespace and the jobs
+/// surface report their own attribution with the model fields empty, and
+/// `/v1/realtime` reports the pre-upgrade phase — after the upgrade its
+/// session runs detached from this guard and writes its own terminal
+/// event.
 ///
 /// `None` is only for a route that emits no usage event AT ALL, whatever
 /// the outcome: the health probes, the two OAuth/agent-card discovery
@@ -127,16 +119,12 @@ pub(crate) const BATCH_COMPLETION: Surface = Surface::split("batch", "batch_comp
 /// and would have to mint one to say anything here.
 pub(crate) fn surface_for_endpoint(endpoint: &str) -> Option<Surface> {
     Some(match endpoint {
-        "/v1/chat/completions" | crate::gemini::ENDPOINT | crate::gemini::STREAM_ENDPOINT => CHAT,
+        "/v1/chat/completions" => CHAT,
         "/v1/completions" => COMPLETIONS,
         "/v1/embeddings" => EMBEDDINGS,
         "/v1/images/generations" => IMAGE_GENERATION,
         "/v1/images/edits" => IMAGE_EDIT,
-        "/v1/messages" => MESSAGES,
-        "/v1/messages/count_tokens" => COUNT_TOKENS,
         "/v1/rerank" => RERANK,
-        "/v1/systemone" => SYSTEMONE,
-        "/v1/decisions" => DECISIONS,
         "/v1/responses" => RESPONSES,
         "/v1/audio/transcriptions" => TRANSCRIPTION,
         "/v1/audio/translations" => TRANSLATION,
@@ -147,8 +135,6 @@ pub(crate) fn surface_for_endpoint(endpoint: &str) -> Option<Surface> {
         "/v1/files" | "/v1/files/:id" => FILES,
         "/v1/batches" | "/v1/batches/:id" => BATCHES,
         "/v1/fine_tuning/jobs" | "/v1/fine_tuning/jobs/:id" => FINE_TUNING,
-        "/mcp" | "/mcp/{server}" => MCP,
-        "/a2a" => A2A,
         // Both labels the passthrough family can carry. A route an operator
         // claimed under `/passthrough/` normalizes to the first; a
         // host-matched route, or a claimed prefix anywhere else, is not a
@@ -195,21 +181,12 @@ mod tests {
             "/v1/models",
             Emits::Nothing("catalog listing; reaches no upstream and meters nothing"),
         ),
-        ("/v1beta/models/*model_action", Emits::Usage(CHAT)),
-        (
-            "/v1beta1/projects/:project/locations/:location/publishers/google/models/*model_action",
-            Emits::Usage(CHAT),
-        ),
         ("/v1/chat/completions", Emits::Usage(CHAT)),
         ("/v1/completions", Emits::Usage(COMPLETIONS)),
         ("/v1/embeddings", Emits::Usage(EMBEDDINGS)),
         ("/v1/images/generations", Emits::Usage(IMAGE_GENERATION)),
         ("/v1/images/edits", Emits::Usage(IMAGE_EDIT)),
-        ("/v1/messages", Emits::Usage(MESSAGES)),
-        ("/v1/messages/count_tokens", Emits::Usage(COUNT_TOKENS)),
         ("/v1/rerank", Emits::Usage(RERANK)),
-        ("/v1/systemone", Emits::Usage(SYSTEMONE)),
-        ("/v1/decisions", Emits::Usage(DECISIONS)),
         ("/v1/responses", Emits::Usage(RESPONSES)),
         ("/v1/audio/transcriptions", Emits::Usage(TRANSCRIPTION)),
         ("/v1/audio/translations", Emits::Usage(TRANSLATION)),
@@ -234,66 +211,6 @@ mod tests {
         ("/v1/fine_tuning/jobs", Emits::Usage(FINE_TUNING)),
         ("/v1/fine_tuning/jobs/:id", Emits::Usage(FINE_TUNING)),
         ("/v1/fine_tuning/jobs/:id/cancel", Emits::Usage(FINE_TUNING)),
-        (
-            "/.well-known/oauth-protected-resource",
-            Emits::Nothing("RFC 9728 discovery; unauthenticated, meters nothing"),
-        ),
-        (
-            "/.well-known/oauth-protected-resource/mcp",
-            Emits::Nothing("RFC 9728 discovery; unauthenticated, meters nothing"),
-        ),
-        (
-            "/.well-known/oauth-protected-resource/mcp/:server",
-            Emits::Nothing("RFC 9728 discovery of a per-user sign-in; meters nothing"),
-        ),
-        (
-            "/.well-known/oauth-authorization-server/mcp/:server",
-            Emits::Nothing("RFC 8414 discovery of a per-user sign-in; meters nothing"),
-        ),
-        (
-            "/mcp/:server/.well-known/openid-configuration",
-            Emits::Nothing("RFC 8414 discovery of a per-user sign-in; meters nothing"),
-        ),
-        (
-            "/mcp/:server/.well-known/jwks.json",
-            Emits::Nothing("an empty key set; meters nothing"),
-        ),
-        (
-            "/mcp/:server/oauth/register",
-            Emits::Nothing("part of signing in; no tool is called"),
-        ),
-        (
-            "/mcp/:server/oauth/authorize",
-            Emits::Nothing("part of signing in; no tool is called"),
-        ),
-        (
-            "/mcp/:server/oauth/token",
-            Emits::Nothing("part of signing in; no tool is called"),
-        ),
-        (
-            "/mcp/:server/oauth/credential",
-            Emits::Nothing("removes a sign-in; no tool is called"),
-        ),
-        (
-            "/mcp-oauth/callback",
-            Emits::Nothing("part of signing in; no tool is called"),
-        ),
-        (
-            "/mcp-oauth/login/callback",
-            Emits::Nothing("part of signing in; no tool is called"),
-        ),
-        (
-            "/mcp-oauth/consent",
-            Emits::Nothing("part of signing in; no tool is called"),
-        ),
-        ("/mcp", Emits::Usage(MCP)),
-        ("/mcp/", Emits::Usage(MCP)),
-        ("/mcp/:server", Emits::Usage(MCP)),
-        ("/a2a/:agent", Emits::Usage(A2A)),
-        (
-            "/a2a/:agent/.well-known/agent-card.json",
-            Emits::Nothing("agent-card discovery; reaches no upstream on the caller's behalf"),
-        ),
         (FALLBACK_SURFACE, Emits::Usage(PASSTHROUGH)),
     ];
 
@@ -406,19 +323,13 @@ mod tests {
         for (surface, handler) in [
             (CHAT, "chat"),
             (COMPLETIONS, "completions"),
-            (MESSAGES, "messages"),
-            (COUNT_TOKENS, "count_tokens"),
             (RESPONSES, "responses"),
             (EMBEDDINGS, "embeddings"),
             (RERANK, "rerank"),
-            (SYSTEMONE, "systemone"),
-            (DECISIONS, "decisions"),
             (REALTIME, "realtime"),
             (FILES, "files"),
             (BATCHES, "batches"),
             (FINE_TUNING, "fine_tuning"),
-            (MCP, "mcp"),
-            (A2A, "a2a"),
             (IMAGE_GENERATION, "images"),
             (IMAGE_EDIT, "images"),
             (TRANSCRIPTION, "audio"),
@@ -444,9 +355,7 @@ mod tests {
     ///
     /// Derived rather than listed, because the guard sees only the
     /// NORMALIZED label (`crate::normalize_endpoint_label`) and several
-    /// routes share one — the A2A agent card normalizes to `/a2a`, and the
-    /// two OAuth discovery routes land in `other` beside the passthrough
-    /// fallback. A hand-written exemption list would let a route be quietly
+    /// routes share one. A hand-written exemption list would let a route be quietly
     /// dropped from the emitting side while its own sibling still meters,
     /// which is the AISIX-Cloud#1571 bug arriving one route at a time.
     /// Routes that file no usage row at any outcome yet NORMALIZE to a label
@@ -457,27 +366,7 @@ mod tests {
     /// Listed here so the pairing is visible: adding a route to a shared
     /// label without that call means a cancelled request on it is filed as
     /// its sibling's traffic.
-    const UNMETERED_ON_A_SHARED_LABEL: &[&str] = &[
-        "/a2a/:agent/.well-known/agent-card.json",
-        // Both normalize to `other`, which IS the passthrough family (every
-        // path no typed route claims reaches its fallback). Unauthenticated
-        // today, so the api_key gate would also hold — but that is a
-        // property of the handler, not of the label, and this list is where
-        // the label question is answered.
-        "/.well-known/oauth-protected-resource",
-        "/.well-known/oauth-protected-resource/mcp",
-        "/.well-known/oauth-protected-resource/mcp/:server",
-        "/.well-known/oauth-authorization-server/mcp/:server",
-        "/mcp/:server/.well-known/openid-configuration",
-        "/mcp/:server/.well-known/jwks.json",
-        "/mcp/:server/oauth/register",
-        "/mcp/:server/oauth/authorize",
-        "/mcp/:server/oauth/token",
-        "/mcp/:server/oauth/credential",
-        "/mcp-oauth/callback",
-        "/mcp-oauth/login/callback",
-        "/mcp-oauth/consent",
-    ];
+    const UNMETERED_ON_A_SHARED_LABEL: &[&str] = &[];
 
     #[test]
     fn every_route_the_guard_wraps_reports_a_cancel_it_can_name() {

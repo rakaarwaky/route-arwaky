@@ -113,67 +113,6 @@ impl RateLimit {
     }
 }
 
-/// Limits for one API key's calls to one MCP server
-/// (`ApiKey::mcp_rate_limits`).
-///
-/// Carries only the request-count dimensions of [`RateLimit`]: an MCP
-/// `tools/call` commits no tokens, so a token-rate cap here would never be
-/// consumed — the shape leaves `tpm`/`tpd` out rather than accepting a knob
-/// that is silently inert.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct McpRateLimit {
-    /// Tool calls per 1-second window.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rps: Option<u64>,
-
-    /// Tool calls per 60-second window.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rpm: Option<u64>,
-
-    /// Tool calls per 3,600-second window.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rph: Option<u64>,
-
-    /// Tool calls per 86,400-second window.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rpd: Option<u64>,
-
-    /// Max concurrent in-flight tool calls.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub concurrency: Option<u32>,
-
-    /// How the minute, hour, and day limits count. `rps` and `concurrency`
-    /// are unaffected.
-    #[serde(default, skip_serializing_if = "RateLimitWindowType::is_fixed")]
-    #[schemars(schema_with = "window_type_schema")]
-    pub window_type: RateLimitWindowType,
-}
-
-impl McpRateLimit {
-    pub const fn is_unrestricted(&self) -> bool {
-        self.rps.is_none()
-            && self.rpm.is_none()
-            && self.rph.is_none()
-            && self.rpd.is_none()
-            && self.concurrency.is_none()
-    }
-}
-
-impl From<&McpRateLimit> for RateLimit {
-    fn from(mcp: &McpRateLimit) -> Self {
-        Self {
-            tpm: None,
-            tpd: None,
-            rps: mcp.rps,
-            rpm: mcp.rpm,
-            rph: mcp.rph,
-            rpd: mcp.rpd,
-            concurrency: mcp.concurrency,
-            window_type: mcp.window_type,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,14 +162,5 @@ mod tests {
             ..Default::default()
         }
         .is_unrestricted());
-    }
-
-    #[test]
-    fn mcp_limit_carries_its_window_type_into_the_limiter_shape() {
-        let mcp: McpRateLimit =
-            serde_json::from_str(r#"{"rph": 3, "window_type": "sliding"}"#).unwrap();
-        let rl = RateLimit::from(&mcp);
-        assert_eq!(rl.rph, Some(3));
-        assert_eq!(rl.window_type, RateLimitWindowType::Sliding);
     }
 }

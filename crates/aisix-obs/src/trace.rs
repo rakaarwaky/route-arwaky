@@ -400,7 +400,7 @@ impl RequestTraceBundle {
     ///
     /// A request that never dispatched an attempt (`attempts` empty):
     /// - `dispatched_upstream` — a family that dispatches without
-    ///   per-attempt tracking (MCP / A2A / jobs / realtime, the ensemble
+    ///   per-attempt tracking (jobs / realtime, the ensemble
     ///   trunk bypass): one CLIENT span under SERVER, placed by the
     ///   handler's own measured duration ending now.
     /// - otherwise — a cache hit, a guardrail block, a pre-dispatch error:
@@ -935,7 +935,7 @@ mod tests {
         assert!(member.spans[0].end_unix_nano <= logical.end_unix_nano);
     }
 
-    /// Families that dispatch without per-attempt tracking (MCP / A2A /
+    /// Families that dispatch without per-attempt tracking (jobs /
     /// jobs): one CLIENT span under SERVER, placed by measured duration.
     #[test]
     fn no_attempts_with_latency_emits_one_client_child() {

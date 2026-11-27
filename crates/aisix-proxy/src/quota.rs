@@ -4,10 +4,7 @@
 //! 1. Budget pre-check (`budget::enforce_key`, from the pushed budget documents)
 //! 2. API-key inline rate limit (`auth.entry.id`)
 //! 3. Model inline rate limit (`model:<name>`) — when the resolved Model has one
-//! 4. MCP-server rate limit (`mcp:<api_key_id>:<server>`) — on an MCP
-//!    `tools/call`, the key's `mcp_rate_limits` entry for the server the
-//!    call targets
-//! 5. Policy-based rate limits — looked up from the snapshot's
+//! 4. Policy-based rate limits — looked up from the snapshot's
 //!    `rate_limit_policies` table. Classic rows match by scope
 //!    (api_key/model/team/member/team_member); `team_member` is a
 //!    per-member default for a team: it matches every key in the team
@@ -111,8 +108,9 @@ pub(crate) struct RoutingGroup<'a> {
 }
 
 /// The request's condition-dimension values at this gate point. Model
-/// dimensions are absent when no model is resolved (MCP, A2A) — leaves
-/// on them evaluate false while OR siblings can still match.
+/// dimensions are absent when no model is resolved (a passthrough
+/// route) — leaves on them evaluate false while OR siblings can still
+/// match.
 /// `routing_parent` is set only at the per-target gate of a routing
 /// dispatch; the request gate passes `None` (there the primary values
 /// already ARE the requested entry).
@@ -351,8 +349,7 @@ fn classic_rate_limit(policy: &RateLimitPolicy) -> Option<RateLimit> {
 }
 
 /// Reserve across all applicable rate-limit layers (api_key, model,
-/// mcp_server, policies). `mcp_server` is the MCP server an in-flight
-/// `tools/call` targets; `None` for every non-MCP endpoint.
+/// policies).
 ///
 /// All or nothing: when any layer refuses, every layer this call already
 /// counted is refunded ([`MultiReservation::refund`]), so a request the
@@ -362,7 +359,6 @@ async fn reserve_layers(
     snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     model_rl: Option<&ModelRateLimit>,
-    mcp_server: Option<&str>,
 ) -> Result<MultiReservation, ProxyError> {
     // Starts empty so the common no-limits request never allocates;
     // the first reservation (if any) grows it on demand.
@@ -372,7 +368,6 @@ async fn reserve_layers(
         snapshot,
         auth,
         model_rl,
-        mcp_server,
         &mut reservations,
     )
     .await
@@ -390,7 +385,6 @@ async fn reserve_request_layers(
     snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     model_rl: Option<&ModelRateLimit>,
-    mcp_server: Option<&str>,
     reservations: &mut Vec<aisix_ratelimit::Reservation>,
 ) -> Result<(), ProxyError> {
     // Layer 1: API key inline rate limit.
@@ -413,30 +407,7 @@ async fn reserve_request_layers(
         }
     }
 
-    // Layer 3: per-MCP-server limit carried by this key. Bucketed on
-    // `mcp:<api_key_id>:<server>` so each server the key reaches counts
-    // independently — of the other servers, and of every other key. The
-    // `<server>` half is whichever identity selected the limit (see
-    // `McpServerLimit`), so a rename does not silently hand the key a
-    // fresh window on a limit that was attached by id.
-    if let Some(server) = mcp_server {
-        // Through the same registered-server index the tool ACL resolves
-        // against, so a key that names its limits by server id and its
-        // grants by server id sees one rename take effect at one instant.
-        let servers = state.mcp_servers.for_snapshot(snapshot);
-        if let Some(limit) = auth.key().mcp_rate_limit(&servers, server) {
-            let rl = RateLimit::from(limit.limits);
-            if !rl.is_unrestricted() {
-                let key = format!("mcp:{}:{}", auth.entry.id, limit.bucket);
-                let r = pre_commit(state, snapshot, &key, &rl)
-                    .await
-                    .map_err(|e| reject(state, e, "mcp", None))?;
-                reservations.push(r);
-            }
-        }
-    }
-
-    // Layer 4+: Rate limit policies from snapshot.
+    // Layer 3+: Rate limit policies from snapshot.
     let input = condition_input(auth, model_rl, None);
     let phase = PolicyPhase::Request {
         defer_model_properties: model_rl.is_some_and(|m| m.routing_parent),
@@ -599,15 +570,15 @@ pub(crate) async fn enforce(
     model_rl: Option<&ModelRateLimit>,
 ) -> Result<MultiReservation, ProxyError> {
     crate::budget::enforce_key(state, snapshot, auth)?;
-    let reserved = reserve_layers(state, snapshot, auth, model_rl, None).await;
+    let reserved = reserve_layers(state, snapshot, auth, model_rl).await;
     refresh_remaining(state, snapshot, auth, model_rl);
     reserved
 }
 
 /// Refresh `aisix_ratelimit_remaining_{requests,tokens}` for the caller's
 /// key from its window as this gate left it — the one point every model
-/// route reserves through. A route that resolved no model (MCP, A2A, a
-/// video poll) has no `model` to label the gauge with and leaves it alone.
+/// route reserves through. A route that resolved no model (a video poll)
+/// has no `model` to label the gauge with and leaves it alone.
 fn refresh_remaining(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
@@ -648,19 +619,6 @@ fn refresh_remaining(
     ));
 }
 
-/// Apply budget + multi-layer rate-limit checks for one MCP `tools/call`
-/// against `mcp_server`, the server the called tool belongs to. Same gate
-/// as [`enforce`] plus the key's per-server layer; MCP resolves no model,
-/// so the model layers are never engaged.
-pub(crate) async fn enforce_mcp(
-    state: &ProxyState,
-    snapshot: &aisix_core::AisixSnapshot,
-    auth: &AuthenticatedKey,
-    mcp_server: &str,
-) -> Result<MultiReservation, ProxyError> {
-    crate::budget::enforce_key(state, snapshot, auth)?;
-    reserve_layers(state, snapshot, auth, None, Some(mcp_server)).await
-}
 
 /// The budget gauge labels of `auth`, shared by every emit site so the
 /// gauge-liveness sweep (`gauge_series_is_live` in the server) can judge
@@ -688,7 +646,7 @@ pub(crate) async fn enforce_rate_limit(
     auth: &AuthenticatedKey,
     model_rl: Option<&ModelRateLimit>,
 ) -> Result<MultiReservation, ProxyError> {
-    let reserved = reserve_layers(state, snapshot, auth, model_rl, None).await;
+    let reserved = reserve_layers(state, snapshot, auth, model_rl).await;
     if reserved.is_err() {
         refresh_remaining(state, snapshot, auth, model_rl);
     }
@@ -1605,8 +1563,8 @@ mod tests {
     #[test]
     fn or_branch_matches_model_less_request() {
         // §3.3 rule 3: a missing dimension only fails its own leaf. An
-        // MCP/A2A request (no model) still matches through the team
-        // branch of an OR group — and, carrying a model-property leaf,
+        // A model-less request (a passthrough route) still matches through
+        // the team branch of an OR group — and, carrying a model-property leaf,
         // the policy is evaluated at the request gate because a
         // model-less request has no target phase.
         let policy = make_conditional_policy(serde_json::json!({

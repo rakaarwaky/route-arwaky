@@ -9,7 +9,7 @@
 
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{
-    A2aAgent, ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter,
+    ApiKey, CachePolicy, Guardrail, Model, ObservabilityExporter,
     PassthroughRoute, ProviderKey,
 };
 use dashmap::DashMap;
@@ -55,15 +55,6 @@ pub trait ConfigStore: Send + Sync + 'static {
         &self,
     ) -> Result<Vec<ResourceEntry<ObservabilityExporter>>, StoreError>;
 
-    async fn get_mcp_server(
-        &self,
-        id: &str,
-    ) -> Result<Option<ResourceEntry<McpServer>>, StoreError>;
-    async fn list_mcp_servers(&self) -> Result<Vec<ResourceEntry<McpServer>>, StoreError>;
-
-    async fn get_a2a_agent(&self, id: &str) -> Result<Option<ResourceEntry<A2aAgent>>, StoreError>;
-    async fn list_a2a_agents(&self) -> Result<Vec<ResourceEntry<A2aAgent>>, StoreError>;
-
     async fn get_passthrough_route(
         &self,
         id: &str,
@@ -83,8 +74,6 @@ pub struct InMemoryStore {
     guardrails: DashMap<String, ResourceEntry<Guardrail>>,
     cache_policies: DashMap<String, ResourceEntry<CachePolicy>>,
     observability_exporters: DashMap<String, ResourceEntry<ObservabilityExporter>>,
-    mcp_servers: DashMap<String, ResourceEntry<McpServer>>,
-    a2a_agents: DashMap<String, ResourceEntry<A2aAgent>>,
     passthrough_routes: DashMap<String, ResourceEntry<PassthroughRoute>>,
 }
 
@@ -160,25 +149,6 @@ impl ConfigStore for InMemoryStore {
             .iter()
             .map(|r| r.clone())
             .collect())
-    }
-
-    async fn get_mcp_server(
-        &self,
-        id: &str,
-    ) -> Result<Option<ResourceEntry<McpServer>>, StoreError> {
-        Ok(self.mcp_servers.get(id).map(|r| r.clone()))
-    }
-
-    async fn list_mcp_servers(&self) -> Result<Vec<ResourceEntry<McpServer>>, StoreError> {
-        Ok(self.mcp_servers.iter().map(|r| r.clone()).collect())
-    }
-
-    async fn get_a2a_agent(&self, id: &str) -> Result<Option<ResourceEntry<A2aAgent>>, StoreError> {
-        Ok(self.a2a_agents.get(id).map(|r| r.clone()))
-    }
-
-    async fn list_a2a_agents(&self) -> Result<Vec<ResourceEntry<A2aAgent>>, StoreError> {
-        Ok(self.a2a_agents.iter().map(|r| r.clone()).collect())
     }
 
     async fn get_passthrough_route(

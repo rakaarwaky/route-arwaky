@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
+import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
@@ -19,7 +19,7 @@ import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 import { pickFreePort } from "../harness/ports.js";
 
 // AISIX-Cloud#2075: the model calls the gateway makes on a request's behalf
-// — a semantic router's embedding or classifier call, the semantic cache's
+// — a semantic router's embedding call, the semantic cache's
 // lookup embedding, a semantic guardrail's embeddings — are each a CHILD
 // usage event: same request id and caller as the request, the called
 // model's own identity and tokens, `internal_call_purpose` set, never the
@@ -27,8 +27,8 @@ import { pickFreePort } from "../harness/ports.js";
 // semantic router's carry the target it selected (`route_target_model_id`).
 //
 // A real aisix DP + etcd, read through the SLS export it emits (one
-// metadata-only logstore, one full-content logstore); the embedding,
-// decision and chat upstreams are deterministic local endpoints.
+// metadata-only logstore, one full-content logstore); the embedding and
+// chat upstreams are deterministic local endpoints.
 
 const CALLER_PLAINTEXT = "sk-internal-call-usage-2075";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
@@ -41,8 +41,6 @@ const EMBEDDING_DELAY_MS = 20;
 // The cancellation case must leave the bridge pending long enough for the
 // client to disconnect after the real DP has dispatched it.
 const CANCELLED_EMBEDDING_DELAY_MS = 30_000;
-const DECISION_SECRET = "ts-secret-2075";
-const INLINE_DECISION_SECRET = "ts-inline-secret-2075";
 
 const EMBED_MODEL = "icu-2075-embed";
 const ROUTER_MODEL = "icu-2075-router";
@@ -65,11 +63,6 @@ const FAILED_UPSTREAM_MODEL = "embedding-usage-failed-mock";
 const CANCELLED_EMBED_MODEL = "icu-2075-embed-cancelled";
 const CANCELLED_ROUTER_MODEL = "icu-2075-router-cancelled";
 const CANCELLED_UPSTREAM_MODEL = "embedding-usage-cancelled-mock";
-const JEV_MODEL = "icu-2075-jev";
-const JEV_UPSTREAM_MODEL = "jev-1.13.0";
-const JEV_ROUTER_MODEL = "icu-2075-jev-router";
-const JEV_INLINE_ROUTER_MODEL = "icu-2075-jev-inline-router";
-const JEV_FAILED_ROUTER_MODEL = "icu-2075-jev-failed-router";
 
 const ROUTE_EXAMPLE = "route-topic prototype";
 // Distinct per router: prototype embeddings are cached across requests, and
@@ -100,7 +93,6 @@ const GUARDRAIL_EXAMPLES = ["guardrail-prototype-first", "guardrail-prototype-se
 const GUARDRAIL_PROMPT = "guardrail-candidate-allowed";
 const CACHE_PROMPT = "cache-topic first wording";
 const CACHE_PARAPHRASE = "cache-topic second wording";
-const DECISION_PROMPT = "fix my python script";
 const BARRIER_PROMPT = "internal-call-usage-sls-barrier";
 
 function keywordVector(text: string): number[] {
@@ -182,55 +174,6 @@ async function startEmbeddingMock(): Promise<EmbeddingMock> {
   };
 }
 
-interface DecisionCall {
-  path: string;
-  headers: IncomingHttpHeaders;
-  body: Record<string, unknown> & { state?: string; model?: string };
-}
-
-/** A System One endpoint: picks `code` for "python", 500s for "boom". */
-async function startDecisionMock(): Promise<{
-  baseUrl: string;
-  calls: DecisionCall[];
-  close(): Promise<void>;
-}> {
-  const calls: DecisionCall[] = [];
-  const server: Server = createServer((req, res) => {
-    res.on("error", () => {});
-    let raw = "";
-    req.on("data", (c: Buffer) => (raw += c.toString("utf8")));
-    req.on("end", () => {
-      const body = JSON.parse(raw || "{}") as DecisionCall["body"];
-      calls.push({ path: req.url ?? "", headers: req.headers, body });
-      res.setHeader("content-type", "application/json");
-      if ((body.state ?? "").includes("boom")) {
-        res.statusCode = 500;
-        res.end(JSON.stringify({ detail: `cannot decide ${body.state}` }));
-        return;
-      }
-      res.statusCode = 200;
-      res.end(
-        JSON.stringify({
-          id: "dec-2075",
-          model: body.model,
-          answers: { route: { type: "choice", choice: "code", confidence: 0.93 } },
-          usage: { input_tokens: 300, output_tokens: 20 },
-        }),
-      );
-    });
-  });
-  const port = await pickFreePort();
-  await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
-  return {
-    baseUrl: `http://127.0.0.1:${port}`,
-    calls,
-    async close() {
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    },
-  };
-}
-
 type Row = Map<string, string>;
 
 interface ChatResponse {
@@ -249,17 +192,16 @@ describe("internal model calls as child usage events (#2075)", () => {
   let sls: MockSls | undefined;
   let otlp: MockOtlp | undefined;
   let embed: EmbeddingMock | undefined;
-  let decisions: Awaited<ReturnType<typeof startDecisionMock>> | undefined;
   let upstream: OpenAiUpstream | undefined;
   let streamUpstream: OpenAiUpstream | undefined;
   let callerKeyID = "";
   const ids: Record<string, string> = {};
 
   function runtime() {
-    if (!app || !sls || !embed || !decisions || !upstream || !streamUpstream) {
+    if (!app || !sls || !embed || !upstream || !streamUpstream) {
       throw new Error("internal call usage e2e setup did not complete");
     }
-    return { app, sls, embed, decisions, upstream, streamUpstream };
+    return { app, sls, embed, upstream, streamUpstream };
   }
 
   async function chat(model: string, prompt: string): Promise<ChatResponse> {
@@ -358,7 +300,6 @@ describe("internal model calls as child usage events (#2075)", () => {
     sls = await startMockSls();
     otlp = await startMockOtlp();
     embed = await startEmbeddingMock();
-    decisions = await startDecisionMock();
     upstream = await startOpenAiUpstream({
       nonStreamBody: {
         id: "cmpl-internal-call-usage",
@@ -496,61 +437,6 @@ describe("internal model calls as child usage events (#2075)", () => {
     });
     await embeddingRouter(CANCELLED_ROUTER_MODEL, CANCELLED_EMBED_MODEL, ROUTE_TARGET, ROUTE_EXAMPLE);
 
-    // The classifier's direct model: its Provider Key's api_base ends in
-    // `/v1`, and it carries a body override and a request header, all of
-    // which the decision call must honour as a direct `/v1/systemone` does.
-    const jevKey = await seed.createProviderKey({
-      display_name: "icu-2075-jev-pk",
-      api_key: DECISION_SECRET,
-      provider: "typesafe",
-      adapter: undefined,
-      api_base: `${decisions.baseUrl}/v1`,
-      request: {
-        default_body_fields: { icu_override: "from-provider-key" },
-        default_headers: { "x-icu-header": "key-${request.api_key.id}" },
-      },
-    });
-    const jev = await seed.createModel({
-      display_name: JEV_MODEL,
-      provider: "typesafe",
-      model_name: JEV_UPSTREAM_MODEL,
-      provider_key_id: jevKey.id,
-    });
-    ids[JEV_MODEL] = jev.id;
-    // An inline classifier's own key; its api_base ends in `/v1` too.
-    const inlineKey = await seed.createProviderKey({
-      display_name: "icu-2075-jev-inline-pk",
-      api_key: INLINE_DECISION_SECRET,
-      provider: "typesafe",
-      adapter: undefined,
-      api_base: `${decisions.baseUrl}/v1/`,
-    });
-    const notTypesafe = await seed.createProviderKey({
-      display_name: "icu-2075-not-typesafe-pk",
-      api_key: "sk-not-typesafe",
-      api_base: decisions.baseUrl,
-    });
-    const jevRouter = async (name: string, classifier: Record<string, unknown>) => {
-      const model = await seed.createModel({
-        display_name: name,
-        semantic: {
-          classifier: { type: "jev", timeout_ms: 2_000, ...classifier },
-          routes: [{ name: "code", target: ROUTE_TARGET, description: "programming questions" }],
-          default: ROUTE_DEFAULT,
-        },
-      });
-      ids[name] = model.id;
-    };
-    // Both spellings, as a control plane writes them for older gateways:
-    // the inline pair names a key the classifier must NOT use.
-    await jevRouter(JEV_ROUTER_MODEL, {
-      model_id: jev.id,
-      provider_key_id: notTypesafe.id,
-      model: "jev-inline-must-not-be-sent",
-    });
-    await jevRouter(JEV_INLINE_ROUTER_MODEL, { provider_key_id: inlineKey.id, model: "jev-inline" });
-    await jevRouter(JEV_FAILED_ROUTER_MODEL, { model_id: jev.id, on_failure: "fail" });
-
     const guardrail = await seed.createGuardrail(
       {
         enabled: true,
@@ -610,7 +496,6 @@ describe("internal model calls as child usage events (#2075)", () => {
     await upstream?.close();
     await streamUpstream?.close();
     await embed?.close();
-    await decisions?.close();
     await sls?.close();
     await otlp?.close();
   });
@@ -832,83 +717,6 @@ describe("internal model calls as child usage events (#2075)", () => {
     },
     60_000,
   );
-
-  test("a classifier naming a direct model calls it as a direct /v1/systemone does", async () => {
-    const { decisions } = runtime();
-    const before = decisions.calls.length;
-    const response = await chat(JEV_ROUTER_MODEL, DECISION_PROMPT);
-    expect(response.status).toBe(200);
-    expect(response.route).toBe("code");
-    expect(decisions.calls.length).toBe(before + 1);
-
-    const call = decisions.calls.at(-1)!;
-    // The key's api_base ends in `/v1`: one version segment, not two.
-    expect(call.path).toBe("/v1/systemone");
-    expect(call.headers.authorization).toBe(`Bearer ${DECISION_SECRET}`);
-    expect(call.headers["x-aisix-request-id"]).toBe(response.requestId);
-    expect(call.headers["x-icu-header"]).toBe(`key-${callerKeyID}`);
-    expect(call.body.model).toBe(JEV_UPSTREAM_MODEL);
-    expect(call.body.icu_override).toBe("from-provider-key");
-    expect(call.body.state).toBe(DECISION_PROMPT);
-
-    const { parent, children } = split(await rowsOf(response.requestId));
-    expect(children).toHaveLength(1);
-    const child = children[0]!;
-    expectChildOf(child, parent);
-    expect(child.get("internal_call_purpose")).toBe("semantic_route_decision");
-    expect(child.get("operation")).toBe("systemone");
-    expect(child.get("model_id")).toBe(ids[JEV_MODEL]);
-    expect(child.get("requested_model_id")).toBe(ids[JEV_MODEL]);
-    expect(child.get("requested_model")).toBe(JEV_MODEL);
-    expect(child.get("status_code")).toBe("200");
-    expect(child.get("prompt_tokens")).toBe("300");
-    expect(child.get("completion_tokens")).toBe("20");
-    expect(parent.get("model_id")).toBe(ids[ROUTE_TARGET]);
-    expect(parent.get("route_target_model_id")).toBe(ids[ROUTE_TARGET]);
-  });
-
-  test("an inline classifier's child names no model; its api_base `/v1` is not doubled", async () => {
-    const { decisions } = runtime();
-    const before = decisions.calls.length;
-    const response = await chat(JEV_INLINE_ROUTER_MODEL, DECISION_PROMPT);
-    expect(response.status).toBe(200);
-    expect(response.route).toBe("code");
-    expect(decisions.calls.length).toBe(before + 1);
-    const call = decisions.calls.at(-1)!;
-    expect(call.path).toBe("/v1/systemone");
-    expect(call.headers.authorization).toBe(`Bearer ${INLINE_DECISION_SECRET}`);
-    expect(call.body.model).toBe("jev-inline");
-
-    const { parent, children } = split(await rowsOf(response.requestId));
-    expect(children).toHaveLength(1);
-    const child = children[0]!;
-    expectChildOf(child, parent);
-    expect(child.get("internal_call_purpose")).toBe("semantic_route_decision");
-    expect(child.get("operation")).toBe("systemone");
-    expect(child.has("model_id")).toBe(false);
-    expect(child.has("requested_model_id")).toBe(false);
-    expect(child.get("prompt_tokens")).toBe("300");
-    expect(child.get("completion_tokens")).toBe("20");
-  });
-
-  test("a failed classifier call is a failed child without captured content", async () => {
-    const response = await chat(JEV_FAILED_ROUTER_MODEL, "boom python");
-    expect(response.status).toBe(503);
-    for (const logstore of [LOGSTORE, FULL_LOGSTORE]) {
-      const { parent, children } = split(await rowsOf(response.requestId, logstore));
-      expect(children).toHaveLength(1);
-      const child = children[0]!;
-      expectChildOf(child, parent);
-      expect(child.get("internal_call_purpose")).toBe("semantic_route_decision");
-      expect(child.get("model_id")).toBe(ids[JEV_MODEL]);
-      expect(child.get("status_code")).toBe("500");
-      expect(child.get("error_class")).toBe("upstream_status");
-      expect(JSON.stringify(Object.fromEntries(child))).not.toContain("boom");
-      for (const content of ["input_messages", "output_messages", "prompt", "response"]) {
-        expect(child.has(content), `child carries ${content}`).toBe(false);
-      }
-    }
-  });
 
   test("a semantic guardrail's embeddings are guardrail children", async () => {
     const { embed } = runtime();

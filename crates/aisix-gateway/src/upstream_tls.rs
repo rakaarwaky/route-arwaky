@@ -5,13 +5,10 @@
 //! of them fails silently — the request just keeps working against the
 //! public providers and keeps failing against the private one:
 //!
-//! - the workspace `reqwest` (provider bridges, guardrails, MCP
-//!   OpenAPI/OAuth, A2A, passthrough, JWKS/OIDC discovery, OTLP export)
+//! - the workspace `reqwest` (provider bridges, guardrails, passthrough,
+//!   JWKS/OIDC discovery, OTLP export)
 //!   via [`reqwest_material`], applied inside
 //!   [`crate::upstream_http::client_builder`];
-//! - rmcp's own `reqwest` line (MCP streamable-http), which is a
-//!   different crate version and so needs the raw PEM, not our parsed
-//!   `reqwest::Certificate`;
 //! - raw rustls (the Realtime WebSocket) via [`rustls_client_config`];
 //! - the AWS SDK (Bedrock) via [`extra_ca_pem`] — see the note on
 //!   [`TlsSettings::verify`] for the one knob that stack cannot express.
@@ -150,7 +147,7 @@ impl ClientIdentityPem {
 }
 
 /// The extra trust roots as raw PEM, for the stacks that parse PEM
-/// themselves (rmcp's reqwest line, the AWS SDK's `TrustStore`).
+/// themselves (the AWS SDK's `TrustStore`).
 pub fn extra_ca_pem() -> Option<Arc<Vec<u8>>> {
     crate::upstream_http::config().tls.extra_ca_pem.clone()
 }

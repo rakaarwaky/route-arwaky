@@ -1,7 +1,7 @@
 //! Byte-splicing rewrite of JSON string VALUES (AISIX-Cloud#1330).
 //!
-//! The MCP write-back channel must return every byte outside a masked
-//! span verbatim. A `serde_json::Value` round-trip cannot promise that:
+//! A write-back channel (a masked string span inside a JSON document)
+//! must return every byte outside the mask verbatim. A `serde_json::Value` round-trip cannot promise that:
 //! this workspace's `Map` is a BTreeMap (keys re-sort), and numbers
 //! re-serialise canonically (`1e3` → `1000.0`). So this module never
 //! re-serialises the document — it scans the raw bytes once, decodes
@@ -11,14 +11,15 @@
 //! survives byte-for-byte.
 //!
 //! Object KEYS are never offered for rewrite (they are schema, not
-//! data — same rule as `collect_string_leaves` in the MCP scan path),
+//! data — same rule as `collect_string_leaves` in the tool-result scan
+//! path),
 //! but they ARE decoded to build the path handed to the predicate.
 //!
 //! The scanner is iterative, so deeply nested JSON does not consume the
 //! Rust call stack. [`MAX_JSON_DEPTH`] bounds its per-request traversal
 //! allocations. It still fails safe: any unexpected byte, overrun, or
 //! depth excess returns an error rather than a partially rewritten document.
-//! Callers decide the failure policy (the MCP output hook fails closed).
+//! Callers decide the failure policy (the output hook fails closed).
 
 use std::ops::Range;
 

@@ -31,14 +31,15 @@ use crate::resource::Resource;
 // cross-provider routing) compare the string directly.
 
 /// Upstream API protocol family used for provider dispatch.
+///
+/// Route Arwaky ships the OpenAI adapter only: every ProviderKey
+/// resolves dispatch through it. Kept as an enum (rather than a unit
+/// struct) so the wire value — `"openai"` — stays the contract stored
+/// in resources and handed out as the `upstream_protocol` metric label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Adapter {
     Openai,
-    Anthropic,
-    Bedrock,
-    Vertex,
-    AzureOpenai,
 }
 
 impl Adapter {
@@ -47,13 +48,7 @@ impl Adapter {
     /// agreement test walks this against the registered bridges. Kept
     /// next to [`Adapter::wire_protocol`] so a new variant, which the
     /// match below refuses to compile without, is added to both.
-    pub const ALL: [Adapter; 5] = [
-        Self::Openai,
-        Self::Anthropic,
-        Self::Bedrock,
-        Self::Vertex,
-        Self::AzureOpenai,
-    ];
+    pub const ALL: [Adapter; 1] = [Self::Openai];
 
     /// The adapter's wire value — the serde representation, spelled out
     /// so it can be used where a `&'static str` is needed (Prometheus
@@ -61,10 +56,6 @@ impl Adapter {
     pub fn wire_protocol(self) -> &'static str {
         match self {
             Self::Openai => "openai",
-            Self::Anthropic => "anthropic",
-            Self::Bedrock => "bedrock",
-            Self::Vertex => "vertex",
-            Self::AzureOpenai => "azure-openai",
         }
     }
 }
@@ -181,47 +172,6 @@ impl CooldownConfig {
     }
 }
 
-/// Cache lifetime for gateway-injected prompt-cache breakpoints.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub enum CacheTtl {
-    #[serde(rename = "5m")]
-    FiveMinutes,
-    #[serde(rename = "1h")]
-    OneHour,
-}
-
-impl CacheTtl {
-    /// The value emitted on the upstream `cache_control.ttl` field.
-    pub fn as_wire_str(self) -> &'static str {
-        match self {
-            CacheTtl::FiveMinutes => "5m",
-            CacheTtl::OneHour => "1h",
-        }
-    }
-}
-
-/// Automatic prompt-cache breakpoint injection for a Claude model — on the
-/// Anthropic API, on Amazon Bedrock, or on Vertex AI. When enabled, the gateway adds cache-control
-/// markers to chat completions and responses requests that carry none of
-/// their own, so callers get provider-side prompt-cache discounts without
-/// changing their requests. Requests that already set their own
-/// cache-control markers are forwarded unchanged. Other models ignore it.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-pub struct AutoPromptCaching {
-    /// Whether automatic prompt-cache injection is active for this model.
-    pub enabled: bool,
-    /// Cache lifetime for injected breakpoints: `5m` (default when omitted) or `1h`. A `1h` cache write costs 2x the base input rate versus 1.25x for `5m`, so it pays off only when the cached prefix is reused across a longer session. Some Claude models on Amazon Bedrock accept only the 5-minute cache, and Bedrock rejects a request to such a model that asks for `1h`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ttl: Option<CacheTtl>,
-}
-
-impl AutoPromptCaching {
-    /// Effective TTL — operator override or the built-in 5-minute default.
-    pub fn ttl_or_default(&self) -> CacheTtl {
-        self.ttl.unwrap_or(CacheTtl::FiveMinutes)
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Model {
     /// Operator-facing unique label. Surfaces on `/v1/models`,
@@ -281,12 +231,10 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ensemble: Option<EnsembleConfig>,
 
-    /// Semantic-routing configuration. With `classifier`, a hosted decision
-    /// model uses each route's `description` to pick a route. When `classifier`
-    /// is omitted, the gateway compares the request embedding with route
-    /// `examples` and picks the best match that meets its similarity threshold.
-    /// The router can fall back to its default target when the selected route's
-    /// target is unavailable.
+    /// Semantic-routing configuration. The gateway compares the request
+    /// embedding with route `examples` and picks the best match that meets
+    /// its similarity threshold. The router can fall back to its default
+    /// target when the selected route's target is unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic: Option<Semantic>,
 
@@ -313,17 +261,10 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooldown: Option<CooldownConfig>,
 
-    /// Automatic prompt-cache breakpoint injection for Claude models on the Anthropic API, Amazon Bedrock and Vertex AI. Omit to leave injection off.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auto_prompt_caching: Option<AutoPromptCaching>,
-
     /// Direct-model-only mapping from a client-requested reasoning effort to the value sent upstream. After resolving the final target the gateway looks the requested effort up once — the exact entry first, then the `*` entry — and never looks the result up again. A requested value that matches neither is sent unchanged.
     ///
     /// Three entries are reserved. The empty-string key matches a request that sets no effort at all, meaning the effort field is absent, `null`, or empty, and its value is added to the outbound request. The `*` key matches any other present value that has no entry of its own, and never matches a request that sets no effort. A `null` value removes the effort field from the outbound request so the provider's own default applies; mapping `*` to `null` therefore strips the effort from every request whose value has no entry of its own. The empty-string key may not be mapped to `null`, because a request that sets no effort has nothing to remove, and no entry may be mapped to an empty value.
     ///
-    /// On the Anthropic messages and token-counting endpoints only `output_config.effort` is read and rewritten. A `thinking` block is not an effort setting for this mapping, so a request that carries `thinking` but no `output_config.effort` sets no effort and the empty-string entry applies to it. When such a request is dispatched to a provider that does not accept the Anthropic protocol, the upstream reasoning effort is derived from the mapped `output_config.effort` when one is present and from `thinking` otherwise, except that an entry that removed the effort sends no effort at all. A request that sets `thinking.type: disabled` is never given an effort by this mapping: on the Anthropic protocol no entry writes a tier to it, though an entry that removes the effort still removes it, and on any other protocol it always sends the `none` effort.
-    ///
-    /// Claude families that reject `output_config.effort` (Haiku 4.5, Sonnet 4.5 and earlier) are the exception on those two endpoints when the model speaks the Anthropic protocol: an effort the empty-string entry would add to a request that sets none becomes `thinking: {type: enabled, budget_tokens}` instead (minimal and low 1024, medium 2048, high 4096, xhigh 8192, max 16384). The budget stays below the request's `max_tokens`, a request on the messages endpoint without `max_tokens` is sent the budget plus 4096, and a `max_tokens` of 1024 or less gets no thinking. A request that already carries a `thinking` block is sent as written, so the empty-string entry has no effect on it for these families, and a value with no budget is not sent at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_mapping: Option<BTreeMap<String, Option<String>>>,
 
@@ -408,9 +349,6 @@ impl Model {
         }
         if !(self.is_routing() || self.is_ensemble() || self.is_semantic()) {
             return stripped;
-        }
-        if self.auto_prompt_caching.take().is_some() {
-            stripped.push("auto_prompt_caching");
         }
         if self.cost.take().is_some() {
             stripped.push("cost");
@@ -530,8 +468,7 @@ pub fn model_one_of() -> Value {
 /// [`Model::strip_kind_inapplicable`]). Kind policy (project decision):
 /// generic call knobs (`timeout`/`stream_timeout`/`retries`) resolve
 /// member → group → deployment default wherever a group slot exists;
-/// model-specific knobs (`auto_prompt_caching`, `cost`, `pricing_key`) are
-/// direct-only.
+/// model-specific knobs (`cost`, `pricing_key`) are direct-only.
 pub fn model_one_of_strict() -> Value {
     model_one_of_variant(true)
 }
@@ -553,7 +490,6 @@ fn model_one_of_variant(strict: bool) -> Value {
             &mut arr[0],
             &[
                 "retries",
-                "auto_prompt_caching",
                 "cost",
                 "pricing_key",
                 "effort_mapping",
@@ -574,7 +510,6 @@ fn model_one_of_variant(strict: bool) -> Value {
                 "timeout",
                 "stream_timeout",
                 "retries",
-                "auto_prompt_caching",
                 "cost",
                 "pricing_key",
                 "effort_mapping",
@@ -586,7 +521,6 @@ fn model_one_of_variant(strict: bool) -> Value {
         extend(
             &mut arr[3],
             &[
-                "auto_prompt_caching",
                 "cost",
                 "pricing_key",
                 "effort_mapping",
@@ -758,12 +692,11 @@ mod tests {
             "routing": {"targets": [{"model": "m"}]},
             "retries": 2,
             "timeout": 1000,
-            "cost": {"input_per_1k": 0.0, "output_per_1k": 0.0},
-            "auto_prompt_caching": {"enabled": true}
+            "cost": {"input_per_1k": 0.0, "output_per_1k": 0.0}
         }));
         let mut stripped = group.strip_kind_inapplicable();
         stripped.sort_unstable();
-        assert_eq!(stripped, ["auto_prompt_caching", "cost", "retries"]);
+        assert_eq!(stripped, ["cost", "retries"]);
         assert!(group.retries.is_none() && group.cost.is_none());
         assert_eq!(group.timeout, Some(1000));
         // Semantic parent: timeout/retries are the group slots and stay.
@@ -1104,29 +1037,12 @@ mod tests {
 
     #[test]
     fn adapter_serializes_to_kebab_case_wire_strings() {
-        // Pin each Adapter's wire form. AzureOpenai → "azure-openai"
-        // is the load-bearing case for the kebab-case choice; the
-        // others are pinned to lock the contract so a future
-        // rename_all change is surfaced as a test failure.
+        // Route Arwaky ships the OpenAI adapter only; the wire form is
+        // pinned to lock the contract so a future rename_all change is
+        // surfaced as a test failure.
         assert_eq!(
             serde_json::to_string(&Adapter::Openai).unwrap(),
             "\"openai\""
-        );
-        assert_eq!(
-            serde_json::to_string(&Adapter::Anthropic).unwrap(),
-            "\"anthropic\""
-        );
-        assert_eq!(
-            serde_json::to_string(&Adapter::Bedrock).unwrap(),
-            "\"bedrock\""
-        );
-        assert_eq!(
-            serde_json::to_string(&Adapter::Vertex).unwrap(),
-            "\"vertex\""
-        );
-        assert_eq!(
-            serde_json::to_string(&Adapter::AzureOpenai).unwrap(),
-            "\"azure-openai\""
         );
     }
 
@@ -1153,22 +1069,6 @@ mod tests {
             serde_json::from_str::<Adapter>("\"openai\"").unwrap(),
             Adapter::Openai
         );
-        assert_eq!(
-            serde_json::from_str::<Adapter>("\"anthropic\"").unwrap(),
-            Adapter::Anthropic
-        );
-        assert_eq!(
-            serde_json::from_str::<Adapter>("\"bedrock\"").unwrap(),
-            Adapter::Bedrock
-        );
-        assert_eq!(
-            serde_json::from_str::<Adapter>("\"vertex\"").unwrap(),
-            Adapter::Vertex
-        );
-        assert_eq!(
-            serde_json::from_str::<Adapter>("\"azure-openai\"").unwrap(),
-            Adapter::AzureOpenai
-        );
     }
 
     #[test]
@@ -1177,8 +1077,11 @@ mod tests {
         // must fail to deserialize so callers can't silently smuggle
         // in a typo or a legacy provider name.
         assert!(serde_json::from_str::<Adapter>("\"gemini\"").is_err());
-        assert!(serde_json::from_str::<Adapter>("\"azureopenai\"").is_err());
-        assert!(serde_json::from_str::<Adapter>("\"azure_openai\"").is_err());
+        assert!(serde_json::from_str::<Adapter>("\"azure\"").is_err());
+        assert!(serde_json::from_str::<Adapter>("\"anthropic\"").is_err());
+        assert!(serde_json::from_str::<Adapter>("\"bedrock\"").is_err());
+        assert!(serde_json::from_str::<Adapter>("\"vertex\"").is_err());
+        assert!(serde_json::from_str::<Adapter>("\"azure-openai\"").is_err());
     }
 
     // `every_provider_variant_has_as_str_and_adapter` removed —

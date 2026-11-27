@@ -109,16 +109,14 @@ That is the tolerance the split exists for: an optional field a newer
 control plane adds inside a nested config object is ignored and reported,
 instead of taking the whole row down.
 
-For **eleven** resources the read contract relaxes a requirement as well,
+For **nine** resources the read contract relaxes a requirement as well,
 so a consumer that models the lenient set as "the strict set with
 `additionalProperties` stripped" is wrong about them:
 
 | resource | additionally relaxed on read |
 | --- | --- |
-| `api_key` | `McpAccess.allow` is not required; an `McpToolRef` entry needs neither half, and neither has to be non-empty; the write-path guards requiring `deny` beside `deny_ids` and `mcp_rate_limits` beside `mcp_rate_limits_by_id` are absent; the `tags` limits are absent (see `team`) |
+| `api_key` | the `tags` limits are absent (see `team`) |
 | `guardrail` | the `semantic` kind does not require an embedding model (under either spelling); Bedrock `aws_credentials` may carry `external_id` or `role_session_name` without `role_arn` (unused without it) |
-| `mcp_policy` | `allow` is not required; the `McpToolRef` relaxations above apply here too, as does the absent `deny`-beside-`deny_ids` guard (its team-scope guard is on both sets) |
-| `mcp_server` | the label pattern (`name`) still forbids `__` and a trailing `_`, but not a `*` |
 | `observability_exporter` | `request_headers` / `upstream_response_headers` names are not checked (pattern, duplicates, refused credential and `set-cookie` names) — the gateway drops a refused name when capturing rather than the whole exporter |
 | `oidc_provider` | `tag_claims` is any object of strings, or `null` read as none: the key pattern, the non-empty path and the 32-entry cap are write-path limits, for the reason given under `team` — a row lost to one would stop the provider authenticating its callers |
 | `team`, `user` | `tags` is any object of strings, or `null` read as no tags: the key pattern, the 1–128-character value length and the 32-entry cap are write-path limits, so a stored row stays loadable if a later release relaxes them — for an `api_key` a row lost to one would stop the key authenticating |
@@ -126,43 +124,40 @@ so a consumer that models the lenient set as "the strict set with
 | `usage_accounting` | `exclude_estimated_usage` is not required: a stored row without it loads with the switch off, which is the behaviour without the row |
 | `model` | the per-kind `not`/`anyOf` lists that forbid a knob a kind never resolves are shorter — a stored row keeps loading and `Model::strip_kind_inapplicable` drops the dead knob; and an `effort_mapping` target value may be empty, which the write path refuses |
 
-Three of those are worth spelling out. A half-written `McpToolRef` entry
-has to keep DESERIALIZING, not merely validating: the loader skips a row
-it cannot deserialize whole, and for an `api_key` that stops the key
-authenticating every kind of traffic rather than costing it MCP access.
-The malformed entry matches no server and no tool instead. And the
-name-form guards are a write contract only — a stored row that carries
-just the id spelling still loads, it is only new writes that must carry
-both, so that a gateway one release behind the control plane can still
-read the restriction. `mcp_server`'s label pattern is the same kind of
-write-only tightening: a `*` in a server name makes the `<server>__*`
-glob patterns every name-form grant, deny and anonymous ceiling is
-written as reach servers nobody named, so new names may not carry one —
-but a row that already does must keep loading, and closing the read
-pattern would drop the row rather than the character.
+Two of those are worth spelling out. The `tags` limits are write-path
+only everywhere they appear — `api_key`, `team`, `user` and
+`oidc_provider`'s `tag_claims` — because a stored row lost to a key
+pattern, a value length or a 32-entry cap would stop the credential or
+the identity it belongs to from authenticating anything at all, and the
+loader cannot know the row is unusable until it reads it; the limits are
+what the dashboard enforces on write instead. And `model`'s shorter
+per-kind `not`/`anyOf` lists exist because a kind this release stopped
+resolving a knob for must not strand a stored row that already carries
+one — `Model::strip_kind_inapplicable` drops the dead knob at load
+instead.
 
 Note what is NOT in that table: the `custom` guardrail's `script` is
 required on **both** sets. A scriptless `custom` row screens nothing
 either way, so rejecting it is what makes it visible in
 `GET /status/config`'s `rejected[]`.
 
-These come from the eleven producers that take a `strict` flag in
+These come from the nine producers that take a `strict` flag in
 `crates/aisix-core/src/models/schema.rs` and are deliberate.
 
 One consequence is registered rather than fixed: the gateway's own Admin
 API embeds the **strict** files as its response schemas, so a resource
 whose stored row is legal on the read path but not on the write path —
-today an `mcp_server` whose name carries a `*`, and an `api_key` whose
-`mcp_access` omits `allow` — validates as non-conforming against the
-schema its own `GET` response is published under. Generate strict
-validators from `resources/` for what you SEND; read responses against
-`resources-lenient/`.
+today a `team` whose `tags` carry a value longer than 128 characters, or
+a `model` whose `effort_mapping` carries an empty target — validates as
+non-conforming against the schema its own `GET` response is published
+under. Generate strict validators from `resources/` for what you SEND;
+read responses against `resources-lenient/`.
 
-Separately, the lenient files keep five `default` annotations the
+Separately, the lenient files keep three `default` annotations the
 strict producer strips on purpose — `default: 0.75` on the `semantic`
 guardrail's `allow_threshold`/`deny_threshold`, and `default: ""` on the
-`custom` kind's `script` and on both halves of `McpToolRef`, each of
-which sits beside `minLength: 1`. They change
+`custom` kind's `script`, each of which sits beside `minLength: 1`. They
+change
 nothing about what validates, but a form generator that honours them
 pre-fills a threshold the operator was deliberately asked to choose, or
 a script value the same branch refuses. Generate forms from

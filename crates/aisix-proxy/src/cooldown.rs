@@ -2,16 +2,14 @@
 //!
 //! The proxy exposes more than one upstream endpoint family:
 //!  - `/v1/chat/completions` (chat.rs)
-//!  - `/v1/messages` (messages.rs — Anthropic-shape)
 //!  - `/v1/responses` (responses.rs — OpenAI Responses API passthrough)
 //!  - `/v1/audio/{speech,transcriptions,translations}` (audio.rs)
 //!  - `/v1/rerank` (rerank.rs)
-//!  - `/v1/systemone`, `/v1/decisions` (decisions.rs)
 //!
 //! Every one of those paths surfaces upstream failures as
 //! [`BridgeError`]. The runtime-status layer (see [`crate::health`])
 //! and the cross-request cooldown contract pinned by issue #264 apply
-//! to **all** of them: a 401 from Anthropic via `/v1/messages` should
+//! to **all** of them: a 401 from Anthropic via `/v1/responses` should
 //! take that direct model out of rotation for the next request just
 //! as a 401 via `/v1/chat/completions` does.
 //!

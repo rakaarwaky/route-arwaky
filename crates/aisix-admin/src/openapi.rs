@@ -38,7 +38,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
   "info": {
     "title": "AISIX OSS Admin API",
     "version": "dev",
-    "description": "The AISIX OSS Admin API is an optional operational interface for inspecting a directly operated open-source AISIX gateway. Its resource-management routes are read-only: they list loaded models, caller API keys, provider credentials, guardrails, MCP servers, A2A agents, cache policies, and observability exporters, and report per-model upstream health. The same listener provides a playground that forwards test completion requests through the gateway.\n\nConfigure resources declaratively through a `resources_file` (`resources.yaml`, reloaded on SIGHUP) or direct etcd writes. The API does not create, update, or delete resources. See the resources file reference at https://docs.api7.ai/ai-gateway/reference/resources-file.\n\nGateways connected to AISIX Enterprise or AISIX Cloud do not expose this listener. Configure them through the corresponding control plane."
+    "description": "The AISIX OSS Admin API is an optional operational interface for inspecting a directly operated open-source AISIX gateway. Its resource-management routes are read-only: they list loaded models, caller API keys, provider credentials, guardrails, cache policies, and observability exporters, and report per-model upstream health. The same listener provides a playground that forwards test completion requests through the gateway.\n\nConfigure resources declaratively through a `resources_file` (`resources.yaml`, reloaded on SIGHUP) or direct etcd writes. The API does not create, update, or delete resources. See the resources file reference at https://docs.api7.ai/ai-gateway/reference/resources-file.\n\nGateways connected to AISIX Enterprise or AISIX Cloud do not expose this listener. Configure them through the corresponding control plane."
   },
   "paths": {
     "/livez": {
@@ -527,220 +527,6 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "Provider Keys"
         ],
         "description": "Get a provider key resource by ID."
-      }
-    },
-    "/admin/v1/mcp_servers": {
-      "get": {
-        "summary": "List MCP Servers",
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/McpServerEntry"
-                  }
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "MCP Servers"
-        ],
-        "description": "List registered upstream MCP server resources."
-      }
-    },
-    "/admin/v1/mcp_servers/{id}": {
-      "parameters": [
-        {
-          "name": "id",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          },
-          "description": "MCP server resource ID, the ID segment of its etcd key, or the entry's `id` in a resources file.",
-          "example": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12"
-        }
-      ],
-      "get": {
-        "summary": "Get MCP Server by ID",
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/McpServerEntry"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Resource not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "MCP Servers"
-        ],
-        "description": "Get an upstream MCP server resource by ID."
-      }
-    },
-    "/admin/v1/a2a_agents": {
-      "get": {
-        "summary": "List A2A Agents",
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/A2aAgentEntry"
-                  }
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "A2A Agents"
-        ],
-        "description": "List registered upstream A2A agent resources."
-      }
-    },
-    "/admin/v1/a2a_agents/{id}": {
-      "parameters": [
-        {
-          "name": "id",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          },
-          "description": "A2A agent resource ID, the ID segment of its etcd key, or the entry's `id` in a resources file.",
-          "example": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12"
-        }
-      ],
-      "get": {
-        "summary": "Get A2A Agent by ID",
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/A2aAgentEntry"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Resource not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "A2A Agents"
-        ],
-        "description": "Get an upstream A2A agent resource by ID."
       }
     },
     "/admin/v1/passthrough_routes": {
@@ -1512,28 +1298,6 @@ const OPENAPI_JSON_BASE: &str = r##"{
         },
         "description": "Admin API error response envelope."
       },
-      "McpToolRef": {
-        "type": "object",
-        "required": [
-          "server_id",
-          "tool"
-        ],
-        "properties": {
-          "server_id": {
-            "type": "string",
-            "minLength": 1,
-            "description": "Resource id of the registered MCP server this entry refers to. An id matching no registered server refers to nothing: the entry never matches, and the other entries are unaffected.",
-            "example": "9b1b6d9c-1f5e-4c1e-9f8f-2f5f5b9d1c11"
-          },
-          "tool": {
-            "type": "string",
-            "minLength": 1,
-            "description": "Tool on that server, matched as a single-`*` glob against the bare tool name \u2014 the part after the `<server>__` namespace prefix. `\"*\"` covers every tool the server exposes.",
-            "example": "create_issue"
-          }
-        },
-        "description": "One tool on one MCP server, the server named by its resource id and the tool by name. The server half is compared as an exact id, never glob-matched."
-      },
       "PublicApiKey": {
         "type": "object",
         "required": [
@@ -1575,62 +1339,6 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "rate_limit": {
             "$ref": "#/components/schemas/RateLimit",
             "description": "Request, token, and concurrency limits for this key."
-          },
-          "mcp_access": {
-            "type": [
-              "object",
-              "null"
-            ],
-            "properties": {
-              "allow": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                },
-                "description": "Namespaced `<server>__<tool>` glob patterns this key allows, intersected with the environment and team layers. Read only when `allow_ids` is omitted or null; an array there, `[]` included, takes over entirely."
-              },
-              "allow_ids": {
-                "type": [
-                  "array",
-                  "null"
-                ],
-                "items": {
-                  "$ref": "#/components/schemas/McpToolRef"
-                },
-                "description": "The same allow side written by MCP server resource id instead of by server name, so renaming a server does not change what the key may reach. An array here, `[]` included, is authoritative and `allow` is ignored. Omitted or null falls back to `allow`. Cannot express \"every server\": each entry names one server exactly and `server_id` is never a glob, so an enumeration of the servers registered today silently fails to cover one registered tomorrow — to cover every server, present and future, omit this and use the name form's `\"*\"`."
-              },
-              "deny": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                },
-                "description": "Namespaced `<server>__<tool>` glob patterns subtracted from this key's effective grant. Deny always wins. Read only when `deny_ids` is omitted or null."
-              },
-              "deny_ids": {
-                "type": [
-                  "array",
-                  "null"
-                ],
-                "items": {
-                  "$ref": "#/components/schemas/McpToolRef"
-                },
-                "description": "The same deny side written by MCP server resource id instead of by server name. An array here, `[]` included, is authoritative and `deny` is ignored. Omitted or null falls back to `deny`. Writing it requires `deny` beside it, so a gateway one release behind the control plane still reads the denial. Cannot express \"every server\": each entry names one server exactly and `server_id` is never a glob, so an enumeration of the servers registered today silently fails to cover one registered tomorrow — to cover every server, present and future, omit this and use the name form's `\"*\"`."
-              }
-            },
-            "required": [
-              "allow"
-            ],
-            "description": "This key's own layer of the MCP tool ACL, as namespaced `<server>__<tool>` glob patterns or as `allow_ids` / `deny_ids` entries naming the server by resource id. Intersected with the environment and team MCP access policies: every present layer must allow a tool and no layer may deny it. When omitted the key adds no constraint of its own; with no layer present anywhere the grant is empty."
-          },
-          "allowed_agents": {
-            "type": [
-              "array",
-              "null"
-            ],
-            "items": {
-              "type": "string"
-            },
-            "description": "A2A agents this key may reach, named by their registered names. Entries are matched as single-`*` globs: `\"*\"` grants every agent and an entry without a `*` matches one agent exactly. When omitted, set to `null`, or set to an empty list, the key has no A2A agent access \u2014 access is granted explicitly."
           },
           "expires_at": {
             "type": [
@@ -1699,31 +1407,6 @@ const OPENAPI_JSON_BASE: &str = r##"{
         },
         "description": "Stored Admin API resource entry."
       },
-      "McpServerEntry": {
-        "type": "object",
-        "required": [
-          "id",
-          "value",
-          "revision"
-        ],
-        "properties": {
-          "id": {
-            "type": "string",
-            "description": "Resource ID, as assigned by the active resource source.",
-            "example": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12"
-          },
-          "value": {
-            "$ref": "#/components/schemas/McpServer",
-            "description": "Stored upstream MCP server configuration."
-          },
-          "revision": {
-            "type": "integer",
-            "description": "Monotonic resource revision: the etcd mod_revision of the entry, or the load generation in file mode.",
-            "example": 1845
-          }
-        },
-        "description": "Stored Admin API resource entry."
-      },
       "PassthroughRouteEntry": {
         "type": "object",
         "required": [
@@ -1748,42 +1431,6 @@ const OPENAPI_JSON_BASE: &str = r##"{
           }
         },
         "description": "Stored Admin API resource entry."
-      },
-      "A2aAgentEntry": {
-        "type": "object",
-        "required": [
-          "id",
-          "value",
-          "revision"
-        ],
-        "properties": {
-          "id": {
-            "type": "string",
-            "description": "Resource ID, as assigned by the active resource source.",
-            "example": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12"
-          },
-          "value": {
-            "$ref": "#/components/schemas/A2aAgent",
-            "description": "Stored upstream A2A agent configuration."
-          },
-          "revision": {
-            "type": "integer",
-            "description": "Monotonic resource revision: the etcd mod_revision of the entry, or the load generation in file mode.",
-            "example": 1845
-          }
-        },
-        "description": "Stored Admin API resource entry.",
-        "example": {
-          "id": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12",
-          "value": {
-            "name": "invoice-processor",
-            "url": "https://agents.example.com/invoice",
-            "protocol_version": "0.3",
-            "auth_type": "none",
-            "enabled": true
-          },
-          "revision": 1
-        }
       },
       "GuardrailEntry": {
         "type": "object",
@@ -1969,14 +1616,6 @@ const OPENAPI_JSON_BASE: &str = r##"{
       "description": "Upstream provider credentials referenced by models."
     },
     {
-      "name": "MCP Servers",
-      "description": "Upstream MCP servers exposed through the gateway MCP endpoint."
-    },
-    {
-      "name": "A2A Agents",
-      "description": "Upstream A2A agents exposed through the gateway Agent Gateway endpoint."
-    },
-    {
       "name": "Passthrough Routes",
       "description": "Explicit passthrough routes that forward matching requests to one upstream target."
     },
@@ -2032,14 +1671,6 @@ const RESOURCE_SCHEMAS: &[(&str, &str)] = &[
     (
         "ProviderKey",
         include_str!("../../../schemas/resources/provider_key.schema.json"),
-    ),
-    (
-        "McpServer",
-        include_str!("../../../schemas/resources/mcp_server.schema.json"),
-    ),
-    (
-        "A2aAgent",
-        include_str!("../../../schemas/resources/a2a_agent.schema.json"),
     ),
     (
         "PassthroughRoute",
@@ -2120,7 +1751,6 @@ pub(crate) fn merged_openapi() -> &'static str {
         add_variant_titles(&mut doc);
         add_missing_property_descriptions(&mut doc);
         add_schema_defaults(&mut doc);
-        add_schema_examples(&mut doc);
         document_former_apikeys_paths(&mut doc);
         wrap_ref_siblings_for_redoc(&mut doc);
 
@@ -2174,29 +1804,6 @@ fn document_former_apikeys_paths(doc: &mut Value) {
     }
 }
 
-fn add_schema_examples(doc: &mut Value) {
-    doc["components"]["schemas"]["A2aAgent"]["example"] = json!({
-        "name": "invoice-processor",
-        "url": "https://agents.example.com/invoice",
-        "protocol_version": "0.3",
-        "auth_type": "none"
-    });
-    doc["components"]["schemas"]["A2aAgentEntry"]["example"] = json!({
-        "id": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12",
-        "value": {
-            "name": "invoice-processor",
-            "url": "https://agents.example.com/invoice",
-            "protocol_version": "0.3",
-            "auth_type": "none",
-            "enabled": true
-        },
-        "revision": 1
-    });
-    if let Some(obj) = doc["components"]["schemas"]["McpServerEntry"].as_object_mut() {
-        obj.remove("example");
-    }
-}
-
 /// ReDoc uses `title` for `oneOf` tab labels. Schemars does not title generated
 /// enum variants, so add stable labels after schema generation and ref rewriting.
 fn add_variant_titles(doc: &mut Value) {
@@ -2247,10 +1854,6 @@ fn add_variant_titles(doc: &mut Value) {
             &["Literal", "Regex"],
         ),
         (
-            "/components/schemas/McpProtocolVersion/oneOf",
-            &["MCP 2026-07-28"],
-        ),
-        (
             // Model's top-level direct/routing/ensemble/semantic
             // mutual-exclusion `oneOf` (injected by
             // `aisix_core::models::schema::model_root_schema`). Order must
@@ -2265,10 +1868,6 @@ fn add_variant_titles(doc: &mut Value) {
         ),
         ("/components/schemas/DistanceMetric/oneOf", &["Cosine"]),
         ("/components/schemas/Aggregation/oneOf", &["Max"]),
-        (
-            "/components/schemas/ClassifierType/oneOf",
-            &["Jev", "Gemini Decision 1"],
-        ),
         (
             "/components/schemas/EmbeddingFailureMode/oneOf",
             &["Default", "Fail"],
@@ -2652,10 +2251,6 @@ mod tests {
             "/admin/v1/apikeys/{id}",
             "/admin/v1/provider_keys",
             "/admin/v1/provider_keys/{id}",
-            "/admin/v1/mcp_servers",
-            "/admin/v1/mcp_servers/{id}",
-            "/admin/v1/a2a_agents",
-            "/admin/v1/a2a_agents/{id}",
             "/admin/v1/passthrough_routes",
             "/admin/v1/passthrough_routes/{id}",
             "/admin/v1/guardrails",
@@ -2686,10 +2281,6 @@ mod tests {
             "PublicApiKeyEntry",
             "ProviderKey",
             "ProviderKeyEntry",
-            "McpServer",
-            "McpServerEntry",
-            "A2aAgent",
-            "A2aAgentEntry",
             "PassthroughRoute",
             "PassthroughRouteEntry",
             "Guardrail",
@@ -2739,10 +2330,6 @@ mod tests {
             "/admin/v1/apikeys/{id}",
             "/admin/v1/provider_keys",
             "/admin/v1/provider_keys/{id}",
-            "/admin/v1/mcp_servers",
-            "/admin/v1/mcp_servers/{id}",
-            "/admin/v1/a2a_agents",
-            "/admin/v1/a2a_agents/{id}",
             "/admin/v1/passthrough_routes",
             "/admin/v1/passthrough_routes/{id}",
             "/admin/v1/guardrails",

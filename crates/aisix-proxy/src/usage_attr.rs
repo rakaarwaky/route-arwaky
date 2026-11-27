@@ -141,7 +141,7 @@ pub(crate) fn terminal_enforced_hits(
 /// from an entry's anonymous configuration is marked, so a key that
 /// doubles as an anonymous principal can still be told apart in the
 /// usage record. Every handler that can serve an anonymous caller —
-/// today `/mcp` and the passthrough routes — calls this on its emitter.
+/// today the passthrough routes — calls this on its emitter.
 pub(crate) fn apply_auth_type(event: &mut UsageEvent, auth: &crate::auth::AuthenticatedKey) {
     if auth.anonymous {
         event.auth_type = "anonymous".to_string();
@@ -451,13 +451,10 @@ pub(crate) fn metric_model_label<'a>(snap: &AisixSnapshot, model_name: &'a str) 
 /// byte-identical: rewriting any of these would silently split every
 /// series that carries it (the `unknown` note below) and merge distinct
 /// surfaces into the `unresolved` bucket. Also an O(1) short-circuit so
-/// the tunnel hot paths (passthrough / MCP / A2A / jobs) never pay the
-/// wildcard scan.
+/// the tunnel hot paths (passthrough / jobs) never pay the wildcard scan.
 const FIXED_SURFACE_MODEL_LABELS: &[&str] = &[
     UNRESOLVED_MODEL_LABEL,
     "passthrough",
-    "mcp",
-    "a2a",
     "unknown",
     "files",
     "batches",
@@ -1004,8 +1001,8 @@ pub(crate) fn build_error_usage_event(
 
 /// The `model` label for the usage-event counters (AISIX-Cloud#1317).
 ///
-/// `unknown` when the request carried no model at all — the MCP, A2A and
-/// passthrough tunnels, and every path that failed before resolution —
+/// `unknown` when the request carried no model at all — the passthrough
+/// tunnel, and every path that failed before resolution —
 /// otherwise collapsed to the configured set exactly like the request
 /// families do, because `UsageEvent::requested_model` is caller-controlled
 /// text and would otherwise mint one series per made-up name (#451).
@@ -1746,9 +1743,9 @@ mod tests {
         let (m, u) = metric_model_label_pair(&snap, "openai/*", "somemodel");
         assert_eq!((m.as_ref(), u.as_ref()), ("openai/*", "somemodel"));
         // …and fixed surface sentinels and unresolvable values are NEVER
-        // rewritten (rewriting `mcp`/`passthrough`/`unknown` would split
+        // rewritten (rewriting `passthrough`/`unknown` would split
         // every series that carries them).
-        for sentinel in ["passthrough", "mcp", "a2a", "unknown"] {
+        for sentinel in ["passthrough", "unknown"] {
             let (m, u) = metric_model_label_pair(&snap, sentinel, "x");
             assert_eq!((m.as_ref(), u.as_ref()), (sentinel, "x"));
         }

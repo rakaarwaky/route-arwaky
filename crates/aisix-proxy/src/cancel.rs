@@ -115,9 +115,9 @@ impl Phase {
 ///
 /// It is deliberately not "and named a model". The row exists so that every
 /// request the guard writes a `499` access-log line for can be found in the
-/// usage log by the same `request_id`, with the same picture — and three of
-/// the metering families never name a model at all (`/mcp`, `/a2a`,
-/// passthrough), while a fourth can auto-select one (the jobs surface). A
+/// usage log by the same `request_id`, with the same picture — and one of
+/// the metering families never names a model at all (passthrough), while
+/// another can auto-select one (the jobs surface). A
 /// caller that hangs up mid-upload therefore does file a row, with the model
 /// fields empty; what it cannot do is file an UNATTRIBUTABLE one, because
 /// the api_key is resolved before the body is read. An unauthenticated path
@@ -151,9 +151,10 @@ pub(crate) fn emit(
     if ctx.api_key_id.is_empty() || ctx.unmetered {
         return;
     }
-    // `/mcp` and `/a2a` resolve their principal without this extractor, so
-    // they reach here with none — and their own events carry no source IP
-    // or user agent either, which is exactly what the default renders.
+    // The passthrough routes resolve their principal without this
+    // extractor, so they reach here with none — and their own events carry
+    // no source IP or user agent either, which is exactly what the
+    // default renders.
     let client = ctx.client.clone().unwrap_or_default();
     let snap = state.snapshot.load();
     // Same reason: this family's own events state their protocol outright,
@@ -375,16 +376,12 @@ fn base_event(
         // Empty everywhere else, exactly as those families' own events
         // leave the fields they do not fill.
         passthrough_route_name: ctx.route.passthrough_route.clone(),
-        mcp_server_name: ctx.route.mcp_server.clone(),
-        mcp_tool_name: ctx.route.mcp_tool.clone(),
-        a2a_agent_name: ctx.route.a2a_agent.clone(),
-        a2a_method: ctx.route.a2a_method.clone(),
-        a2a_operation: ctx.route.a2a_operation.clone(),
         ..Default::default()
     };
     // The caller's identity, from the [`ClientContext`] the client-facing
-    // families resolve, or from the auth extractor alone on `/mcp` and
-    // `/a2a`, which never build one. Both read the same `api_key` row.
+    // families resolve, or from the auth extractor alone on the
+    // passthrough routes, which never build one. Both read the same
+    // `api_key` row.
     match ctx.client.as_ref() {
         Some(client) => {
             usage_attr::apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller)

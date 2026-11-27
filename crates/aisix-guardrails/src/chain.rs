@@ -1493,7 +1493,7 @@ fn fold_redactions<'a>(
         // The sync per-field redactors bypass `record_execution` entirely
         // (they are not verdicts), so this is the ONLY place an in-process
         // mask can be attributed to the row that applied it — the
-        // `kind: "pii"` MCP path the audit chain exists for. Recorded only
+        // `kind: "pii"` tool-result path the audit chain exists for. Recorded only
         // when this member actually rewrote something.
         if let (Some(audit), Some(r)) = (audit, next.as_ref()) {
             audit.record(

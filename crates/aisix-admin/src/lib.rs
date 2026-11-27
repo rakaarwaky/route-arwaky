@@ -18,8 +18,6 @@
 //! - `GET /admin/v1/cache_policies` and `GET /admin/v1/cache_policies/:id`
 //! - `GET /admin/v1/observability_exporters` and
 //!   `GET /admin/v1/observability_exporters/:id`
-//! - `GET /admin/v1/mcp_servers` and `GET /admin/v1/mcp_servers/:id`
-//! - `GET /admin/v1/a2a_agents` and `GET /admin/v1/a2a_agents/:id`
 //! - `GET /admin/v1/passthrough_routes` and
 //!   `GET /admin/v1/passthrough_routes/:id`
 //! - `GET /admin/v1/models/status`, `GET /admin/v1/health`
@@ -38,7 +36,6 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
-mod a2a_agents_handlers;
 mod apikeys_handlers;
 mod auth;
 mod cache_policies_handlers;
@@ -47,7 +44,6 @@ pub mod etcd_store;
 pub mod file_store;
 mod guardrails_handlers;
 mod health_handler;
-mod mcp_servers_handlers;
 mod models_handlers;
 mod models_status_handler;
 mod observability_exporters_handlers;
@@ -149,22 +145,6 @@ pub fn build_router(state: AdminState) -> Router {
         .route(
             "/admin/v1/provider_keys/:id",
             get(provider_keys_handlers::get_provider_key),
-        )
-        .route(
-            "/admin/v1/mcp_servers",
-            get(mcp_servers_handlers::list_mcp_servers),
-        )
-        .route(
-            "/admin/v1/mcp_servers/:id",
-            get(mcp_servers_handlers::get_mcp_server),
-        )
-        .route(
-            "/admin/v1/a2a_agents",
-            get(a2a_agents_handlers::list_a2a_agents),
-        )
-        .route(
-            "/admin/v1/a2a_agents/:id",
-            get(a2a_agents_handlers::get_a2a_agent),
         )
         .route(
             "/admin/v1/passthrough_routes",
@@ -1088,7 +1068,7 @@ mod tests {
     async fn status_models_store_failure_never_leaks_backend_detail() {
         use aisix_core::resource::ResourceEntry;
         use aisix_core::{
-            A2aAgent, ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter,
+            ApiKey, CachePolicy, Guardrail, Model, ObservabilityExporter,
             PassthroughRoute, ProviderKey,
         };
 
@@ -1123,8 +1103,6 @@ mod tests {
             { Guardrail, get_guardrail, list_guardrails }
             { CachePolicy, get_cache_policy, list_cache_policies }
             { ObservabilityExporter, get_observability_exporter, list_observability_exporters }
-            { McpServer, get_mcp_server, list_mcp_servers }
-            { A2aAgent, get_a2a_agent, list_a2a_agents }
             { PassthroughRoute, get_passthrough_route, list_passthrough_routes }
         }
 
@@ -1163,7 +1141,7 @@ mod tests {
     async fn status_models_answers_the_fixed_500_when_the_store_hangs() {
         use aisix_core::resource::ResourceEntry;
         use aisix_core::{
-            A2aAgent, ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter,
+            ApiKey, CachePolicy, Guardrail, Model, ObservabilityExporter,
             PassthroughRoute, ProviderKey,
         };
 
@@ -1198,8 +1176,6 @@ mod tests {
             { Guardrail, get_guardrail, list_guardrails }
             { CachePolicy, get_cache_policy, list_cache_policies }
             { ObservabilityExporter, get_observability_exporter, list_observability_exporters }
-            { McpServer, get_mcp_server, list_mcp_servers }
-            { A2aAgent, get_a2a_agent, list_a2a_agents }
             { PassthroughRoute, get_passthrough_route, list_passthrough_routes }
         }
 
@@ -1362,8 +1338,6 @@ mod tests {
         // Non-default optional fields, so the PublicApiKey projection is
         // pinned field-by-field — a projection that dropped one of these
         // would still pass an id-only check.
-        payload["mcp_access"] = json!({"allow": ["github__create_issue"]});
-        payload["allowed_agents"] = json!(["invoice-agent"]);
         payload["rate_limit"] = json!({"rpm": 60});
         payload["disabled"] = json!(true);
         payload["expires_at"] = json!("2099-01-01T00:00:00Z");
@@ -1384,16 +1358,6 @@ mod tests {
             assert_eq!(v["id"], "k-1", "{base}");
             assert_eq!(v["value"]["key_hash"], expected_hash.as_str(), "{base}");
             assert_eq!(v["value"]["allowed_models"], json!(["my-model"]), "{base}");
-            assert_eq!(
-                v["value"]["mcp_access"],
-                json!({"allow": ["github__create_issue"]}),
-                "{base}"
-            );
-            assert_eq!(
-                v["value"]["allowed_agents"],
-                json!(["invoice-agent"]),
-                "{base}"
-            );
             assert_eq!(v["value"]["rate_limit"]["rpm"], 60, "{base}");
             assert_eq!(v["value"]["disabled"], true, "{base}");
             assert_eq!(v["value"]["expires_at"], "2099-01-01T00:00:00Z", "{base}");
@@ -1604,7 +1568,7 @@ mod tests {
         // The FULL matrix — every route spelling × every write method.
         // A partial revert (say, PUT re-added on one {id} route) must
         // fail here; a sampled subset would let it through.
-        const ROUTE_SPELLINGS: [&str; 9] = [
+        const ROUTE_SPELLINGS: [&str; 7] = [
             "models",
             "api_keys",
             "apikeys", // former spelling: same removed write path
@@ -1612,8 +1576,6 @@ mod tests {
             "guardrails",
             "cache_policies",
             "observability_exporters",
-            "mcp_servers",
-            "a2a_agents",
         ];
         let mut writes: Vec<(&str, String, Option<Value>)> = Vec::new();
         for kind in ROUTE_SPELLINGS {

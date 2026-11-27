@@ -716,9 +716,8 @@ pub(crate) async fn authenticate_jwt(
 
     // ── Provider claim requirements ──────────────────────────────────
     // Scope and bound-claim failures map to distinct errors: a scope
-    // failure may carry the `/mcp` `insufficient_scope` challenge
-    // (AISIX-Cloud#1143), a policy denial never does. Both render the
-    // same 403 on the wire.
+    // failure carries the `insufficient_scope` challenge (AISIX-Cloud#1143),
+    // a policy denial never does. Both render the same 403 on the wire.
     if let Err(rejection) = check_provider_claims(&claims, prov) {
         let (reason, err) = claims_rejection_error(rejection, prov);
         return Err(deny(d, reason, &iss, kid.as_deref(), None, None, err));
@@ -959,8 +958,8 @@ fn validate_with_keys(
 
 /// Which provider requirement a verified token failed. The two map to
 /// different [`ProxyError`]s: a missing scope is curable by requesting
-/// a broader grant (so the `/mcp` surface may challenge for it), a
-/// `bound_claims` mismatch is an operator policy denial.
+/// a broader grant, a `bound_claims` mismatch is an operator policy
+/// denial.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClaimsRejection {
     Scope,
@@ -970,7 +969,7 @@ enum ClaimsRejection {
 /// Map a claims-rejection class onto its deny-reason string and
 /// caller-visible error. Split out of `authenticate_jwt` so the single
 /// construction site of [`ProxyError::JwtInsufficientScope`] — the
-/// error that carries the `/mcp` `insufficient_scope` challenge — is
+/// error that carries the `insufficient_scope` challenge — is
 /// unit-testable (audit finding on #859).
 fn claims_rejection_error(
     rejection: ClaimsRejection,
@@ -1947,7 +1946,7 @@ jyxumGxNpoIV8LlzsMsaWQ==
               "name": "test-idp",
               "issuer": "https://idp.test/realms/agents",
               "audiences": ["aisix"],
-              "required_scopes": ["ai.access", "mcp:tools"]
+              "required_scopes": ["ai.access", "ai.tools"]
             }"#,
         );
 
@@ -1957,7 +1956,7 @@ jyxumGxNpoIV8LlzsMsaWQ==
             ProxyError::JwtInsufficientScope { required_scopes } => {
                 assert_eq!(
                     required_scopes,
-                    vec!["ai.access".to_string(), "mcp:tools".to_string()],
+                    vec!["ai.access".to_string(), "ai.tools".to_string()],
                     "the challenge must name the provider's required scopes",
                 );
             }
@@ -2229,7 +2228,7 @@ jyxumGxNpoIV8LlzsMsaWQ==
     fn claim_match_ops_are_strictly_typed() {
         let claims = serde_json::json!({
             "department": "finance",
-            "groups": ["dev", "mcp-admin", 42],
+            "groups": ["dev", "ai-admin", 42],
             "realm_access": {"roles": ["agent"]},
             "count": 7,
         });
@@ -2252,13 +2251,13 @@ jyxumGxNpoIV8LlzsMsaWQ==
         // exact never matches an array claim, even one containing the value.
         assert!(!claim_match_holds(
             &claims,
-            &m("groups", "exact", serde_json::json!(["mcp-admin"]))
+            &m("groups", "exact", serde_json::json!(["ai-admin"]))
         ));
 
         // contains: array membership; non-string items are ignored.
         assert!(claim_match_holds(
             &claims,
-            &m("groups", "contains", serde_json::json!(["mcp-admin"]))
+            &m("groups", "contains", serde_json::json!(["ai-admin"]))
         ));
         assert!(!claim_match_holds(
             &claims,
@@ -2373,13 +2372,13 @@ jyxumGxNpoIV8LlzsMsaWQ==
                 "name": "and-rule", "jwt_provider": "corp",
                 "match": [
                     {"claim": "department", "op": "exact", "values": ["finance"]},
-                    {"claim": "groups", "op": "contains", "values": ["mcp-admin"]},
+                    {"claim": "groups", "op": "contains", "values": ["ai-admin"]},
                 ],
                 "resolve": {"api_key_id": "k-and"},
             })),
             1,
         ));
-        let both = serde_json::json!({"department": "finance", "groups": ["mcp-admin"]});
+        let both = serde_json::json!({"department": "finance", "groups": ["ai-admin"]});
         let one = serde_json::json!({"department": "finance", "groups": ["dev"]});
         assert!(matching_claim_mapping(&snapshot, "corp", &both).is_some());
         assert!(matching_claim_mapping(&snapshot, "corp", &one).is_none());

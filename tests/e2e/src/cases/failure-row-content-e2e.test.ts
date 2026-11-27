@@ -306,7 +306,6 @@ describe("failure rows carry request and response bodies", () => {
       adapter: "openai",
       model_name: "rerank-v3.5",
     });
-    await modelAt("row-count-400", any400, { provider: "anthropic", model_name: "claude-sonnet-4-5" });
     await modelAt("row-bedrock-400", await fixedUpstream(
       400,
       JSON.stringify({ message: "sentinel-bedrock-answer" }),
@@ -408,7 +407,6 @@ describe("failure rows carry request and response bodies", () => {
         "row-truncated-empty",
         "row-any-400",
         "row-rerank-400",
-        "row-count-400",
         "row-bedrock-400",
         "row-video-text",
         "row-video-empty",
@@ -790,7 +788,6 @@ describe("failure rows carry request and response bodies", () => {
     ["responses", "/v1/responses", { model: "row-truncated", input: "cut-prompt" }, STATUS_FALLBACK],
     ["rerank", "/v1/rerank", { model: "row-truncated-rerank", query: "cut-prompt", documents: ["a"] }, STATUS_FALLBACK],
     ["speech", "/v1/audio/speech", { model: "row-truncated", input: "cut-prompt", voice: "alloy" }, STATUS_FALLBACK],
-    ["decisions", "/v1/decisions", { model: "row-truncated", input: "cut-prompt", questions: [{ type: "predicate", name: "q", instructions: "i" }] }, STATUS_FALLBACK],
   ] as const)(
     "%s: a body cut off leaves the caller answer as it was and the row naming the read failure",
     async (_what, path, payload, expected) => {
@@ -887,10 +884,7 @@ describe("failure rows carry request and response bodies", () => {
     ["completions", "/v1/completions", { model: "row-any-400", prompt: "path-prompt" }, ANY_400],
     ["images", "/v1/images/generations", { model: "row-any-400", prompt: "path-prompt" }, ANY_400],
     ["rerank", "/v1/rerank", { model: "row-rerank-400", query: "path-prompt", documents: ["a"] }, ANY_400],
-    ["decisions", "/v1/decisions", { model: "row-any-400", input: "path-prompt", questions: [{ type: "predicate", name: "q", instructions: "i" }] }, ANY_400],
     ["jobs", "/v1/batches?model=row-any-400", { input_file_id: "path-prompt" }, ANY_400],
-    ["messages", "/v1/messages", { model: "row-any-400", max_tokens: 5, messages: [{ role: "user", content: "path-prompt" }] }, ANY_400],
-    ["count_tokens", "/v1/messages/count_tokens", { model: "row-count-400", messages: [{ role: "user", content: "path-prompt" }] }, ANY_400],
     ["bedrock converse", "/v1/chat/completions", { model: "row-bedrock-400", messages: [{ role: "user", content: "path-prompt" }] }, '{"message":"sentinel-bedrock-answer"}'],
     ["a2a", "/a2a/row-agent", { jsonrpc: "2.0", id: "1", method: "message/send", params: { message: { role: "user", parts: [{ kind: "text", text: "path-prompt" }], messageId: "m-1" } } }, "sentinel-a2a-answer"],
   ] as const)("%s: an upstream failure carries both bodies", async (_what, path, payload, answer) => {

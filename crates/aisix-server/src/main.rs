@@ -91,11 +91,7 @@ use aisix_core::{
 use aisix_etcd::{EtcdConfigProvider, SnapshotCache, Supervisor, WatchedPrefix};
 use aisix_gateway::{Hub, UpstreamHttpConfig};
 use aisix_obs::{init_tracing, Metrics};
-use aisix_provider_anthropic::AnthropicBridge;
-use aisix_provider_azure_openai::AzureOpenAiBridge;
-use aisix_provider_bedrock::BedrockBridge;
 use aisix_provider_openai::OpenAiBridge;
-use aisix_provider_vertex::VertexBridge;
 use aisix_proxy::background::run_background_model_check_once;
 use aisix_proxy::{CacheBackends, ProxyState};
 use aisix_ratelimit::{Limiter, RedisStore};
@@ -290,7 +286,6 @@ async fn async_main(cfg: Config) -> anyhow::Result<()> {
             &cfg.upstream.media_fetch,
             cfg.proxy.request_body_limit_bytes,
         );
-        aisix_provider_bedrock::init_mantle_endpoint(cfg.upstream.bedrock.mantle_endpoint.clone());
         run(cfg).await
     }
     .await;
@@ -378,17 +373,6 @@ fn run_validate(resources: &Path) -> anyhow::Result<()> {
             );
         }
     }
-    // Operations whose ids collide after tool-name sanitization load and
-    // stay callable under a `_2` / `_3` … suffix, so this is not an error —
-    // but the suffixed names are not the ones the spec's author wrote.
-    for (name, duplicates) in openapi_tool_name_collisions(&snapshot.mcp_servers) {
-        eprintln!(
-            "resources file {}: warning: mcp_servers ({name:?}): operations share a tool name \
-             after sanitization and are served with a _2, _3 … suffix: {}",
-            resources.display(),
-            duplicates.join(", "),
-        );
-    }
     println!(
         "OK: {} loaded {} resource(s)",
         resources.display(),
@@ -397,24 +381,6 @@ fn run_validate(resources: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `(server name, colliding base tool names)` for each `type: openapi`
-/// server whose operations collide after tool-name sanitization.
-fn openapi_tool_name_collisions(
-    servers: &aisix_core::ResourceTable<aisix_core::McpServer>,
-) -> Vec<(String, Vec<String>)> {
-    let mut out: Vec<(String, Vec<String>)> = servers
-        .entries()
-        .into_iter()
-        .filter(|e| e.value.server_type == aisix_core::McpServerType::Openapi)
-        .filter_map(|e| {
-            let spec = e.value.spec.as_ref()?;
-            let duplicates = aisix_core::mcp_openapi::generate(spec).ok()?.duplicates;
-            (!duplicates.is_empty()).then(|| (e.value.name.clone(), duplicates))
-        })
-        .collect();
-    out.sort();
-    out
-}
 
 /// Is this gauge label set still describing something the configuration
 /// contains?
@@ -1218,7 +1184,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // so a real DP scrape surfaces UsageEvent throughput without
     // needing cp-api or an OTLP receiver in the loop.
     proxy_state = proxy_state.with_usage_sink(usage_sink.with_metrics((*metrics).clone()));
-    // With no dp-manager, per-user MCP tokens and semantic session pins stay in
+    // With no dp-manager, per-user tokens and semantic session pins stay in
     // this process and do not survive a restart.
     if let Some(h) = heartbeat_cfg.as_ref() {
         proxy_state = proxy_state.with_shared_store(Arc::new(dp_store::DpManagerStore::new(
@@ -2309,33 +2275,19 @@ fn upstream_http_config(
 fn build_hub() -> Hub {
     let hub = Hub::new();
 
-    // ─── Family bridges (closed 5-value Adapter enum) ────────────────
+    // ─── Family bridge ────────────────────────────────────────────────
     //
-    // Catches every catalog vendor whose `ProviderKey.adapter` matches
-    // one of these. Any new long-tail OpenAI-compat vendor cp-api
-    // admits (xai, openrouter, cerebras, moonshotai, …) routes here
-    // through `Hub::dispatch_two_tier` without a DP code change.
-    //
-    // CUTOVER CAUTION (non-openai families): cp-api admits
-    // `google-vertex`, `azure`, `amazon-bedrock` Provider Keys via
-    // its adapter_map (#302 Phase B). The Vertex / Azure / Bedrock
-    // bridges below are functional implementations (Phases E/F/G).
+    // Route Arwaky ships the OpenAI adapter only. Every ProviderKey
+    // carries `adapter: openai` and resolves here through
+    // `Hub::dispatch_two_tier`; any long-tail OpenAI-compat vendor
+    // (xai, openrouter, groq, …) needs no DP code change.
     hub.register_family(Adapter::Openai, Arc::new(OpenAiBridge::new()));
-    hub.register_family(Adapter::Anthropic, Arc::new(AnthropicBridge::new()));
-    hub.register_family(Adapter::Vertex, Arc::new(VertexBridge::new()));
-    hub.register_family(Adapter::AzureOpenai, Arc::new(AzureOpenAiBridge::new()));
-    hub.register_family(Adapter::Bedrock, Arc::new(BedrockBridge::new()));
 
-    // ─── Specialized vendor bridges ─────────────────────────────────
+    // ─── Specialized vendor bridge ────────────────────────────────────
     //
-    // `openai` and `anthropic` are the two canonical vendors with a
-    // dedicated specialized bridge, so a ProviderKey whose `provider`
-    // is exactly `"openai"`/`"anthropic"` resolves through the
-    // specialized tier of `dispatch_two_tier`. Long-tail OpenAI-compat
-    // vendors (xai, openrouter, groq, deepseek, …) carry `adapter:
-    // openai` and resolve through the family tier above instead.
+    // A ProviderKey whose `provider` is exactly `"openai"` resolves
+    // through the specialized tier of `dispatch_two_tier`.
     hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
-    hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
 
     hub
 }
@@ -3465,7 +3417,7 @@ fn run_tpc_worker(
         let served = join_listeners(serving, label).await;
         // An upstream connection is driven by a task on the runtime of
         // the worker that opened it, and every process-wide client pool
-        // (Provider Key overrides, the shared fallback, guardrail, MCP,
+        // (Provider Key overrides, the shared fallback, guardrail,
         // ...) hands that connection to whichever worker checks it out
         // next. Dropping this runtime would kill those tasks under a
         // sibling's request still in flight on them, which then fails
@@ -3936,37 +3888,6 @@ models:
         // Success path returns Ok; the failure path exits the process,
         // which is covered end-to-end by the e2e fail-fast case.
         run_validate(f.path()).unwrap();
-    }
-
-    #[test]
-    fn validate_reports_colliding_openapi_tool_names_without_failing() {
-        use std::io::Write as _;
-        let mut f = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
-        f.write_all(
-            br#"
-_format_version: "2"
-mcp_servers:
-  - id: 7c1d0a52-4b8e-4f3a-9a61-1f0e2d3c4b5a
-    name: erp
-    type: openapi
-    url: https://erp.test
-    spec: {"paths": {"/a": {"get": {"operationId": "foo/list"}}, "/b": {"get": {"operationId": "foo.list"}}}}
-  - id: 8d2e1b63-5c9f-4a4b-8b72-2a1f3e4d5c6b
-    name: clean
-    type: openapi
-    url: https://clean.test
-    spec: {"paths": {"/a": {"get": {"operationId": "one"}}, "/b": {"get": {"operationId": "two"}}}}
-"#,
-        )
-        .unwrap();
-        run_validate(f.path()).unwrap();
-        let entries = aisix_etcd::file_source::read_file(f.path(), 1).unwrap();
-        let (snapshot, _) =
-            aisix_etcd::build_snapshot(&aisix_etcd::file_source::prefixes(), &entries);
-        assert_eq!(
-            openapi_tool_name_collisions(&snapshot.mcp_servers),
-            vec![("erp".to_string(), vec!["foo_list".to_string()])]
-        );
     }
 
     #[test]
