@@ -1,0 +1,113 @@
+//! Typed entities persisted in etcd and loaded into the gateway snapshot.
+//!
+//! Each entity is paired with a JSON Schema (spec §3): a strict one
+//! published as the write contract, and a lenient one the loader compiles
+//! once and runs on every configuration source and on watch events.
+//!
+//! Entities landing across the live PR series:
+//! - [`Model`] — routing target (§3)
+//! - [`ApiKey`] — caller credential (§3)
+//! - [`RateLimit`] — shared rate-limit config (§3.4 / §8)
+//! - [`Routing`] — virtual-router strategy + targets (§3.5, PR #17)
+//! - [`ProviderKey`] — managed upstream secret (§3.6)
+//!
+//! [`Team`] and [`User`] carry only the display names telemetry labels
+//! resolve from an API key's `team_id` / `user_id`; team membership and
+//! limits stay owned by the control plane.
+
+pub mod apikey;
+pub mod budget;
+pub mod cache_policy;
+pub mod claim_mapping;
+pub mod embedding;
+pub mod ensemble;
+pub mod guardrail;
+pub mod model;
+pub mod model_ref;
+pub mod observability_exporter;
+pub mod oidc_provider;
+pub mod passthrough_route;
+pub mod policy_conditions;
+pub mod pricing;
+pub mod provider_key;
+pub mod rate_limit;
+pub mod rate_limit_policy;
+pub mod routing;
+pub mod schema;
+pub mod semantic;
+pub mod snapshot;
+pub mod tags;
+pub mod team;
+pub mod usage_accounting;
+pub mod user;
+
+pub use apikey::ApiKey;
+pub use budget::{
+    budget_next_period_start, budget_period_start, parse_budget_timezone, Budget, BudgetExhausted,
+    BudgetFailMode, BudgetMemberExhausted, BudgetPeriod, BudgetPolicy, BudgetReason, BudgetScope,
+    BudgetTag,
+};
+pub use cache_policy::{AppliesTo, CacheBackend, CachePolicy, CacheScope, SemanticCacheConfig};
+pub use claim_mapping::{ClaimMapping, ClaimMatch, ClaimMatchOp, ClaimResolve};
+pub use embedding::EmbeddingConfig;
+pub use ensemble::{EnsembleConfig, Judge, PanelMember};
+pub use guardrail::{
+    AppliedGuardrail, CustomConfig, Guardrail, GuardrailAttachment, GuardrailEnforcedHit,
+    GuardrailExecution, GuardrailHookPoint, GuardrailInputMessages, GuardrailKind,
+    GuardrailMetricsSink, GuardrailMonitorHit, GuardrailScopeType, GuardrailScore,
+    KeywordConfig, KeywordPattern, LakeraConfig, OpenaiModerationConfig, PiiConfig,
+    PiiCustomPattern, PiiDetectorConfig, PresidioConfig, PresidioEntityConfig, SemanticConfig,
+};
+pub use model::{
+    Adapter, BackgroundModelCheck, CooldownConfig, EffortAction, MappedEffort, Model,
+    DEFAULT_COOLDOWN_TRIGGER_STATUSES,
+};
+pub use model_ref::resolve_model_ref;
+pub use observability_exporter::{
+    AliyunSlsConfig, DatadogConfig, ExporterKind, ObjectStoreCompression, ObjectStoreConfig,
+    ObjectStoreProvider, ObservabilityExporter, OtlpHttpConfig, SlsContentMode,
+};
+pub use oidc_provider::{
+    BoundClaimExpect, HmacSecret, OidcProvider, HMAC_SECRET_MIN_BYTES,
+};
+pub use passthrough_route::{PassthroughAuthMode, PassthroughCredentialMode, PassthroughRoute};
+pub use policy_conditions::{
+    eval_condition_nodes, eval_condition_nodes_for_any_member, validate_condition_nodes,
+    ConditionGroup, ConditionInput, ConditionLogic, ConditionNode, ConditionOperator,
+    ConditionValue, GroupByDimension, PolicyAction, PolicyCondition, PolicyDimension,
+};
+pub use pricing::{LivePricingIndex, Pricing, PricingIndex};
+pub use provider_key::{
+    ApiEndpoint, ApiSurface, ParamConstraints, ProviderApis, ProviderKey, RequestOverrides,
+    ResponseOverrides, StreamDoneMarker, TelemetryKind, TelemetryTags,
+};
+pub use rate_limit::{RateLimit, RateLimitWindowType};
+pub use rate_limit_policy::{PolicyScope, PolicyWindow, RateLimitPolicy};
+pub use routing::{
+    default_hash_on, HashOnSource, HashOnType, Routing, RoutingStrategy, RoutingTarget,
+    WhenAllUnavailablePolicy,
+};
+pub use schema::{
+    unknown_field_paths, validate_apikey,
+    validate_apikey_lenient, validate_budget, validate_budget_lenient, validate_budget_policy,
+    validate_budget_policy_lenient, validate_cache_policy, validate_cache_policy_lenient,
+    validate_claim_mapping, validate_claim_mapping_lenient, validate_guardrail,
+    validate_guardrail_attachment, validate_guardrail_attachment_lenient,
+    validate_guardrail_lenient, validate_model, validate_model_lenient,
+    validate_observability_exporter, validate_observability_exporter_lenient,
+    validate_oidc_provider, validate_oidc_provider_lenient, validate_passthrough_route,
+    validate_passthrough_route_lenient, validate_pricing, validate_pricing_lenient,
+    validate_provider_key, validate_provider_key_lenient, validate_rate_limit_policy,
+    validate_rate_limit_policy_lenient, validate_team, validate_team_lenient,
+    validate_usage_accounting, validate_usage_accounting_lenient, validate_user,
+    validate_user_lenient, SchemaError,
+};
+pub use semantic::{
+    Aggregation, DistanceMetric, EmbeddingFailureMode, OnEmbeddingFailure, Semantic, SemanticMatch,
+    SemanticRoute, SemanticSessionAffinity,
+};
+pub use snapshot::{AisixSnapshot, KeyOwnerNames};
+pub use tags::{effective_tags, is_valid_tag_key, tag_value_from_claim, Tags, TAG_KEY_PATTERN};
+pub use team::Team;
+pub use usage_accounting::UsageAccounting;
+pub use user::User;

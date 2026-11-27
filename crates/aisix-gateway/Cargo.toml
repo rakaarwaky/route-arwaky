@@ -1,0 +1,45 @@
+[package]
+name = "aisix-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aisix: Hub-and-Bridge gateway core (ChatFormat, BridgeContext, SSE parser)"
+
+[dependencies]
+aisix-core = { path = "../aisix-core" }
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+http.workspace = true
+dashmap.workspace = true
+tracing.workspace = true
+base64.workspace = true
+url.workspace = true
+# The environment-proxy matcher reqwest itself uses, so `ssrf` knows which
+# caller-supplied URLs a proxy will take, and the CONNECT tunnel reqwest
+# itself uses, for the outbound paths that dial without reqwest.
+hyper-util = { version = "0.1", default-features = false, features = ["client-proxy", "client-legacy", "tokio"] }
+# `upstream_dial`: the CONNECT tunnel above is a tower `Service`, and an
+# `https://` proxy is reached over rustls directly.
+tower-service = "0.3"
+tokio-rustls.workspace = true
+# Outbound TLS trust (upstream_tls): the non-reqwest outbound stacks need
+# the root store assembled directly, so the rustls side is a direct dep.
+rustls.workspace = true
+rustls-native-certs.workspace = true
+rustls-pemfile.workspace = true
+webpki-roots.workspace = true
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+rcgen.workspace = true
+tracing-subscriber.workspace = true
+tempfile.workspace = true

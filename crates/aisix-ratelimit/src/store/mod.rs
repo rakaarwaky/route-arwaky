@@ -1,0 +1,231 @@
+//! Pluggable counter backend behind the [`crate::Limiter`].
+//!
+//! The limiter itself only knows about *buckets* (an opaque key) and a
+//! [`RateLimit`]; where the counters actually live is a [`RateStore`].
+//!
+//! - [`local::LocalStore`] keeps the historical per-process in-memory
+//!   counters (a `DashMap` of fixed-window counters). This is the default
+//!   and is behaviour-identical to the pre-#798 limiter.
+//! - [`redis::RedisStore`] keeps the counters in a shared Redis so every
+//!   DP replica in a cluster enforces ONE global window — the fix for
+//!   api7/AISIX-Cloud#798, where N replicas multiplied every limit by N.
+//!
+//! Two phases mirror the limiter's contract:
+//! - **acquire** (request path, async): concurrency gate + token
+//!   check-only + request check-and-increment, all-or-nothing per bucket.
+//! - **commit** (request path success, async): post-deduct token add +
+//!   concurrency release.
+//! - **refund** (request path refusal, async): give back exactly the
+//!   request-window increments one acquire made, plus its concurrency
+//!   slot — for a reservation the gateway's own limiter refused further
+//!   down the same request, which therefore consumed nothing.
+//! - **release** / **add_tokens** (after-the-fact, sync): concurrency
+//!   release on drop, and the streaming post-stream token add. These are
+//!   sync because they run from `Drop` and from the synchronous SSE
+//!   completion callback; the Redis impl makes them fire-and-forget.
+
+use std::time::Duration;
+
+use aisix_core::{RateLimit, RateLimitWindowType};
+use async_trait::async_trait;
+
+use crate::error::RateLimitError;
+use crate::limiter::RateLimitStatus;
+
+pub mod local;
+pub mod redis;
+
+pub(crate) const SECOND_SECS: u64 = 1;
+pub(crate) const MINUTE_SECS: u64 = 60;
+pub(crate) const HOUR_SECS: u64 = 60 * 60;
+pub(crate) const DAY_SECS: u64 = 24 * 60 * 60;
+
+/// Dimension names. Both stores name the same window identically —
+/// they are the Redis key segment AND the `x-ratelimit-scope` value a
+/// 429 reports, so a client cannot be told `rpm` by one backend and
+/// `RPM` by the other.
+pub(crate) const DIM_RPS: &str = "rps";
+pub(crate) const DIM_RPM: &str = "rpm";
+pub(crate) const DIM_RPH: &str = "rph";
+pub(crate) const DIM_RPD: &str = "rpd";
+pub(crate) const DIM_TPM: &str = "tpm";
+pub(crate) const DIM_TPD: &str = "tpd";
+
+/// Result of trying to renew a distributed streaming concurrency lease.
+///
+/// Only [`StreamLeaseRefresh::Missing`] is definitive: the member was no
+/// longer present in the shared semaphore. The passthrough SSE relay uses
+/// that signal to end an already-headed response rather than continue outside
+/// its configured concurrency limit. `Unavailable` includes backends that
+/// cannot report an outcome and Redis transport failures; those retain the
+/// rate limiter's established fail-open behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamLeaseRefresh {
+    Renewed,
+    Missing,
+    Unavailable,
+}
+
+/// A windowed request/token dimension active on a [`RateLimit`]. Shared
+/// by both stores so the Redis key layout and the local counter set never
+/// drift.
+pub(crate) struct Dim {
+    pub name: &'static str,
+    pub window_secs: u64,
+    pub limit: u64,
+    /// Sub-bucket length when the dimension counts as a sliding window;
+    /// `None` for a fixed window.
+    pub step_secs: Option<u64>,
+}
+
+/// Sub-bucket length of a sliding window. Each is a whole fraction of its
+/// window so sub-buckets tile it exactly.
+pub(crate) const fn sliding_step_secs(window_secs: u64) -> u64 {
+    match window_secs {
+        MINUTE_SECS => 10,
+        HOUR_SECS => 300,
+        _ => HOUR_SECS,
+    }
+}
+
+fn dims(limits: &RateLimit, candidates: &[(&'static str, u64, Option<u64>)]) -> Vec<Dim> {
+    let sliding = limits.window_type.is_sliding();
+    candidates
+        .iter()
+        .filter_map(|&(name, window_secs, limit)| {
+            limit.map(|limit| Dim {
+                name,
+                window_secs,
+                limit,
+                // A one-second window has no useful sub-division, so `rps`
+                // stays fixed whatever `window_type` says.
+                step_secs: (sliding && window_secs != SECOND_SECS)
+                    .then(|| sliding_step_secs(window_secs)),
+            })
+        })
+        .collect()
+}
+
+/// Request-count dimensions (rps/rpm/rph/rpd) that carry a limit.
+pub(crate) fn request_dims(limits: &RateLimit) -> Vec<Dim> {
+    dims(
+        limits,
+        &[
+            (DIM_RPS, SECOND_SECS, limits.rps),
+            (DIM_RPM, MINUTE_SECS, limits.rpm),
+            (DIM_RPH, HOUR_SECS, limits.rph),
+            (DIM_RPD, DAY_SECS, limits.rpd),
+        ],
+    )
+}
+
+/// Token-count dimensions (tpm/tpd) that carry a limit.
+pub(crate) fn token_dims(limits: &RateLimit) -> Vec<Dim> {
+    dims(
+        limits,
+        &[
+            (DIM_TPM, MINUTE_SECS, limits.tpm),
+            (DIM_TPD, DAY_SECS, limits.tpd),
+        ],
+    )
+}
+
+/// Where and when one successful [`RateStore::acquire`] counted, so a
+/// [`RateStore::refund`] can decrement exactly the windows (fixed) or
+/// sub-buckets (sliding) that acquire incremented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcquireStamp {
+    /// The clock reading (unix seconds) the acquire counted under — the
+    /// store's own clock, which for Redis is the server's `TIME`.
+    pub at_secs: u64,
+    /// Whether the shared backend counted it. `false` for the local store
+    /// and for a Redis store's fail-open fallback, whose count lives in
+    /// the per-process store.
+    pub shared: bool,
+}
+
+impl AcquireStamp {
+    pub fn local(at_secs: u64) -> Self {
+        Self {
+            at_secs,
+            shared: false,
+        }
+    }
+}
+
+/// Backend that holds the rate-limit counters for a bucket.
+///
+/// `member` is a process-unique reservation id (`<instance>:<seq>`) used
+/// by distributed backends to track exactly one in-flight slot in the
+/// concurrency set; the local backend ignores it (its `in_flight` is a
+/// plain counter).
+#[async_trait]
+pub trait RateStore: Send + Sync + 'static {
+    /// Pre-commit acquire for a single bucket. Atomically (per bucket):
+    /// gate concurrency, check (but do not increment) token windows, then
+    /// check-and-increment every request window. All-or-nothing: on
+    /// rejection nothing is incremented and the concurrency slot is not
+    /// taken.
+    async fn acquire(
+        &self,
+        key: &str,
+        limits: &RateLimit,
+        member: &str,
+    ) -> Result<AcquireStamp, RateLimitError>;
+
+    /// Undo one successful acquire: decrement by one every request window
+    /// `limits` counts, in the window / sub-bucket `stamp` names, and
+    /// release `member`'s concurrency slot. A window that has rolled since
+    /// is left alone — its count was already wiped, and decrementing the
+    /// fresh one would take back a sibling request's increment.
+    async fn refund(&self, key: &str, limits: &RateLimit, member: &str, stamp: AcquireStamp);
+
+    /// Post-deduct: add `tokens` to the tpm/tpd windows AND release the
+    /// concurrency slot held by `member`. Like the local backend this
+    /// always touches both token windows; the tpd counter is harmless
+    /// when no tpd limit is configured (it simply expires unread).
+    /// `window_type` is the one the bucket was acquired under, which
+    /// selects the counters the tokens land in.
+    async fn commit(&self, key: &str, tokens: u64, member: &str, window_type: RateLimitWindowType);
+
+    /// Release the concurrency slot held by `member` without recording
+    /// tokens. Sync so it can run from `Drop`; the Redis impl spawns a
+    /// detached release (the concurrency set self-heals via TTL pruning
+    /// even if the spawn is lost).
+    fn release(&self, key: &str, member: &str);
+
+    /// Post-stream token accounting: add `tokens` to tpm/tpd only (no
+    /// concurrency change). Sync so it can run from the synchronous SSE
+    /// completion callback; the Redis impl makes it fire-and-forget.
+    fn add_tokens(&self, key: &str, tokens: u64, window_type: RateLimitWindowType);
+
+    /// How often a live streaming reservation should renew its distributed
+    /// concurrency lease. Local counters have no lease, so they opt out.
+    fn stream_lease_refresh_interval(&self) -> Option<Duration> {
+        None
+    }
+
+    /// Refresh a live streaming reservation's distributed concurrency lease.
+    /// Implementations must never recreate a member that has already been
+    /// released: a final refresh racing with stream teardown must be a no-op.
+    async fn refresh_stream_lease(&self, _key: &str, _member: &str) {}
+
+    /// Refresh a streaming lease while reporting whether its member still
+    /// exists. This preserves the legacy [`RateStore::refresh_stream_lease`]
+    /// hook for external stores: an implementation that only provides that
+    /// hook remains fail-open because it cannot prove that its member vanished.
+    async fn refresh_stream_lease_outcome(&self, key: &str, member: &str) -> StreamLeaseRefresh {
+        self.refresh_stream_lease(key, member).await;
+        StreamLeaseRefresh::Unavailable
+    }
+
+    /// Read-only snapshot for the `x-ratelimit-*` headers. Returns `None`
+    /// when there is nothing meaningful to report for the bucket.
+    async fn peek(&self, key: &str, limits: &RateLimit) -> Option<RateLimitStatus>;
+
+    /// Keys this process holds counters for; `None` for a shared store
+    /// whose counters live elsewhere.
+    fn local_key_count(&self) -> Option<u64> {
+        None
+    }
+}

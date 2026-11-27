@@ -1,0 +1,363 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "allOf": [
+    {
+      "anyOf": [
+        {
+          "properties": {
+            "default": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "default"
+          ]
+        },
+        {
+          "properties": {
+            "default_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "default_id"
+          ]
+        }
+      ]
+    },
+    {
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "embedding_model": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "embedding_model"
+              ]
+            },
+            {
+              "properties": {
+                "embedding_model_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "embedding_model_id"
+              ]
+            }
+          ]
+        }
+      ],
+      "properties": {
+        "match": {
+          "type": "object"
+        },
+        "routes": {
+          "items": {
+            "required": [
+              "examples"
+            ]
+          }
+        }
+      },
+      "required": [
+        "match"
+      ]
+    }
+  ],
+  "definitions": {
+    "Aggregation": {
+      "description": "How a request's per-example similarity scores collapse into one score for the route. v1 uses `max` (the single best-matching example), chosen for explainability — the UI surfaces \"the top matching example\" — over semantic-router's default sum/mean-over-top_k.",
+      "oneOf": [
+        {
+          "description": "Route score = the highest cosine across its examples.",
+          "enum": [
+            "max"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "DistanceMetric": {
+      "description": "Distance metric used to compare the request embedding against route example embeddings. v1 supports cosine only.",
+      "oneOf": [
+        {
+          "description": "Cosine similarity — higher is more similar.",
+          "enum": [
+            "cosine"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "EmbeddingFailureMode": {
+      "description": "Mode for an enum-only failure policy: route to the router's `default`, or fail the request with `503`.",
+      "oneOf": [
+        {
+          "description": "Route to the semantic router's `default` model.",
+          "enum": [
+            "default"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Reject the request with `503`.",
+          "enum": [
+            "fail"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "OnEmbeddingFailure": {
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/EmbeddingFailureMode"
+            }
+          ],
+          "description": "`\"default\"` or `\"fail\"`."
+        },
+        {
+          "description": "`{ \"target\": \"<alias>\" }` (or `{ \"target_id\": \"<id>\" }`) — route to a specific safe direct model or model group.",
+          "properties": {
+            "target": {
+              "description": "Alias of the direct model or model group to route to when embedding fails. Read only when `target_id` is absent.",
+              "minLength": 1,
+              "type": "string"
+            },
+            "target_id": {
+              "description": "Resource id of the direct model or model group to route to when embedding fails. Present, it is authoritative and `target` is ignored, so renaming that model keeps this fallback pointing at it with no edit to this document.",
+              "minLength": 1,
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        }
+      ],
+      "description": "What the router does when the embedding call errors or times out. Use `\"default\"` to route to the router's default model, `\"fail\"` to reject the request with `503`, or `{ \"target\": \"<alias>\" }` to route to a specific fallback direct model or model group."
+    },
+    "SemanticMatch": {
+      "description": "Matching parameters shared across the routes of an embedding-based router.",
+      "properties": {
+        "aggregation": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Aggregation"
+            }
+          ],
+          "default": "max",
+          "description": "Per-example score aggregation. v1: max."
+        },
+        "distance_metric": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/DistanceMetric"
+            }
+          ],
+          "default": "cosine",
+          "description": "Similarity metric. v1: cosine."
+        },
+        "threshold": {
+          "description": "Default similarity threshold for routes that do not set their own `threshold`. Higher is stricter.",
+          "format": "float",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": "number"
+        }
+      },
+      "required": [
+        "threshold"
+      ],
+      "type": "object"
+    },
+    "SemanticRoute": {
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "target": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "target"
+              ]
+            },
+            {
+              "properties": {
+                "target_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "target_id"
+              ]
+            }
+          ]
+        }
+      ],
+      "description": "A named route and its target model or model group. Matching is on the route's `examples`.",
+      "properties": {
+        "description": {
+          "description": "What requests this route handles. Documentation only: routes are matched on `examples`.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "examples": {
+          "description": "Example utterances that define this route. AISIX caches their vectors lazily. A cold route request passes its prompt and every distinct uncached example text as one logical embedding batch. Providers without batch support may issue multiple upstream calls. Required, with at least one example.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "name": {
+          "description": "Operator-facing route label. Surfaced in access logs (e.g. `prod-chat -> route:legal`), and in the `x-aisix-route` response header only when `proxy.expose_debug_headers` is enabled.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "target": {
+          "description": "Alias of the direct model or model group that receives traffic matching this route. A model group dispatches the traffic the way it does when addressed directly. Read only when `target_id` is absent.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "target_id": {
+          "description": "Resource id of the direct model or model group that receives traffic matching this route. Present, it is authoritative and `target` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps this route pointing at it with no edit to this document. An id resolving to no model is a route target that does not exist, exactly as a `target` naming no model is.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "threshold": {
+          "description": "Per-route similarity threshold. A request matches this route only when its aggregated score is `>=` this value. When omitted, the router-level threshold applies.",
+          "format": "float",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "SemanticSessionAffinity": {
+      "description": "Keep a session on the model its first matched request was routed to.\n\nA request's session id is read from, in order: the `x-aisix-session-id` header; any `x-<vendor>-session-id` header (such as `x-claude-code-session-id`) whose value is at least 8 letters, digits, `-` or `_`; for Codex clients, the `session-id`, `session_id`, `thread-id` or `conversation_id` header; the `x-session-id` header; the session in the body's `metadata.user_id`; the body's `metadata.session_id`; and the `session.id` entry of the `baggage` header. A request without one is routed normally.\n\nWhen a request with a session id matches a route and is sent to that route's target, the session is pinned to that route. Later requests of the session with the same API key go to the pinned route without being classified, for as long as that route's target is still a route target of this router. A request that falls back to `default` or to a failure target pins nothing. Token-counting requests use a pin but never create one.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Whether sessions are pinned. While off, existing pins are ignored.",
+          "type": "boolean"
+        },
+        "ttl_seconds": {
+          "default": 3600,
+          "description": "How long a pin lasts after the last request that used it, in seconds.",
+          "format": "uint64",
+          "maximum": 604800.0,
+          "minimum": 60.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "description": "Semantic-routing config: pick a target by request meaning.",
+  "properties": {
+    "default": {
+      "description": "Alias of the direct model or model group used when no route meets its embedding similarity threshold. The router can also use this target when the selected route's target is unavailable. Read only when `default_id` is absent.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "default_id": {
+      "description": "Resource id of the direct model or model group used when no route meets its embedding similarity threshold. The router can also use this target when the selected route's target is unavailable. Present, it is authoritative and `default` is ignored, so renaming that model keeps this router pointing at it with no edit to this document.",
+      "minLength": 1,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "embedding_model": {
+      "description": "Alias of an `embedding`-modality Model used to embed the request and, lazily on the first request that needs them, the route examples. Read only when `embedding_model_id` is absent.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "embedding_model_id": {
+      "description": "Resource id of the `embedding`-modality Model used to embed the request and the route examples. Present, it is authoritative and `embedding_model` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps this router pointing at it with no edit to this document. An id resolving to no model is an embedding model that does not exist, exactly as an `embedding_model` naming no model is — the router applies `on_embedding_failure`.",
+      "minLength": 1,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "embedding_timeout_ms": {
+      "description": "Per-call deadline for the embedding request in milliseconds. `0` or absent disables the embedding-specific deadline.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "match": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SemanticMatch"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Shared matching parameters (metric, aggregation, default threshold)."
+    },
+    "on_embedding_failure": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/OnEmbeddingFailure"
+        }
+      ],
+      "description": "Behavior when the embedding call fails or times out. Defaults to routing to `default`."
+    },
+    "routes": {
+      "description": "Routes evaluated for each request. At least one is required.",
+      "items": {
+        "$ref": "#/definitions/SemanticRoute"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "session_affinity": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SemanticSessionAffinity"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Session affinity. When omitted, every request is scored."
+    }
+  },
+  "required": [
+    "routes"
+  ],
+  "title": "Semantic",
+  "type": "object"
+}

@@ -1,0 +1,328 @@
+import { createHash } from "node:crypto";
+import OpenAI from "openai";
+import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import {
+  EtcdClient,
+  SeedClient,
+  spawnApp,
+  startOpenAiUpstream,
+  waitConfigPropagation,
+  type OpenAiUpstream,
+  type SpawnedApp,
+} from "../harness/index.js";
+
+// E2E client-compatibility check: drive the gateway through the
+// official `openai` npm SDK rather than the harness's hand-rolled
+// `ProxyClient`. This catches wire mismatches that bypass the internal
+// shim — header normalization, retry shape, streaming chunk parsing on
+// the client side, async client lifecycle. The harness's `proxy.ts`
+// header comment explicitly invites this pattern; this test makes it
+// real.
+//
+// Reference: OpenAI Node SDK source for chat completions parsing
+// (https://github.com/openai/openai-node/blob/master/src/resources/chat/completions.ts)
+// and the OpenAI Chat Completions API spec
+// (https://platform.openai.com/docs/api-reference/chat/create).
+
+const CALLER_PLAINTEXT = "sk-sdk-compat-caller";
+const CALLER_KEY_HASH = createHash("sha256")
+  .update(CALLER_PLAINTEXT)
+  .digest("hex");
+
+describe("openai SDK compat: drive gateway through real client", () => {
+  let app: SpawnedApp | undefined;
+  let nonStreamUpstream: OpenAiUpstream | undefined;
+  let streamUpstream: OpenAiUpstream | undefined;
+  let compatUpstream: OpenAiUpstream | undefined;
+  let etcdReachable = false;
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+
+    nonStreamUpstream = await startOpenAiUpstream();
+    streamUpstream = await startOpenAiUpstream({
+      streamEvents: [
+        '{"id":"u-1","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}',
+        '{"id":"u-1","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}',
+        '{"id":"u-1","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":null}]}',
+        '{"id":"u-1","model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ],
+    });
+
+    compatUpstream = await startOpenAiUpstream();
+
+    app = await spawnApp({});
+    const seed = new SeedClient(etcd, app.etcdPrefix);
+
+    // Two ProviderKeys → two Models — keeps `receivedRequests` on each
+    // mock unambiguous so the assertion below proves the SDK hit the
+    // expected upstream rather than leaking across.
+    const pkSync = await seed.createProviderKey({
+      display_name: "sdk-compat-sync-pk",
+      api_key: "sk-mock",
+      api_base: `${nonStreamUpstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: "sdk-compat-sync",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: pkSync.id,
+    });
+
+    const pkStream = await seed.createProviderKey({
+      display_name: "sdk-compat-stream-pk",
+      api_key: "sk-mock",
+      api_base: `${streamUpstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: "sdk-compat-stream",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: pkStream.id,
+    });
+
+    // An OpenAI-compatible vendor other than OpenAI itself: its Chat
+    // Completions contract has no `developer` role.
+    const pkCompat = await seed.createProviderKey({
+      display_name: "sdk-compat-deepseek-pk",
+      api_key: "sk-mock",
+      api_base: `${compatUpstream.baseUrl}/v1`,
+      provider: "deepseek",
+      adapter: "openai",
+    });
+    await seed.createModel({
+      display_name: "sdk-compat-deepseek",
+      provider: "deepseek",
+      model_name: "deepseek-chat",
+      provider_key_id: pkCompat.id,
+    });
+
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: [
+        "sdk-compat-sync",
+        "sdk-compat-stream",
+        "sdk-compat-deepseek",
+      ],
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await nonStreamUpstream?.close();
+    await streamUpstream?.close();
+    await compatUpstream?.close();
+  });
+
+  /** Readiness gate per the harness rules: the caller key is seeded
+   * last, so it authenticating `GET /v1/models` (200) implies the whole
+   * seed set has propagated — without exercising the SDK chat path this
+   * suite is testing. */
+  async function seedsPropagated(): Promise<boolean> {
+    const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+      headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+    });
+    await res.text();
+    return res.status === 200;
+  }
+
+  test("openai.chat.completions.create() — non-streaming", async (ctx) => {
+    if (!etcdReachable || !app || !nonStreamUpstream) {
+      ctx.skip();
+      return;
+    }
+
+    const client = new OpenAI({
+      apiKey: CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+    });
+
+    await waitConfigPropagation(seedsPropagated);
+
+    // Baseline-isolate anything earlier tests sent so the assertion
+    // below measures only the effect of the actual test call.
+    const baseline = nonStreamUpstream.receivedRequests.length;
+
+    const completion = await client.chat.completions.create({
+      model: "sdk-compat-sync",
+      messages: [{ role: "user", content: "hello" }],
+    });
+
+    expect(completion.object).toBe("chat.completion");
+    expect(completion.choices[0]?.message.role).toBe("assistant");
+    expect(typeof completion.choices[0]?.message.content).toBe("string");
+    expect(completion.usage?.total_tokens).toBeGreaterThan(0);
+
+    // Belt-and-suspenders: the test call hit the upstream exactly once
+    // (delta from baseline) and that hit landed on the chat-completions
+    // path. The absolute-count form rejects regressions that double-fire
+    // or short-circuit and silently fall through to a stray route.
+    expect(nonStreamUpstream.receivedRequests.length - baseline).toBe(1);
+    expect(nonStreamUpstream.receivedRequests[baseline]?.path).toBe(
+      "/v1/chat/completions",
+    );
+  });
+
+  test("openai.chat.completions.create() — developer role", async (ctx) => {
+    if (!etcdReachable || !app || !nonStreamUpstream) {
+      ctx.skip();
+      return;
+    }
+
+    const client = new OpenAI({
+      apiKey: CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+    });
+
+    await waitConfigPropagation(seedsPropagated);
+    const baseline = nonStreamUpstream.receivedRequests.length;
+
+    const completion = await client.chat.completions.create({
+      model: "sdk-compat-sync",
+      messages: [
+        // The harness pins openai 4.65.0, whose message union predates
+        // this role; the runtime request path forwards the JSON unchanged.
+        { role: "developer", content: "Follow application instructions" },
+        { role: "user", content: "hello" },
+      ] as unknown as OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+    });
+
+    expect(completion.object).toBe("chat.completion");
+    expect(nonStreamUpstream.receivedRequests.length - baseline).toBe(1);
+    const request = nonStreamUpstream.receivedRequests[baseline];
+    expect(request?.path).toBe("/v1/chat/completions");
+    const body = JSON.parse(request!.body) as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    expect(body.messages).toEqual([
+      { role: "developer", content: "Follow application instructions" },
+      { role: "user", content: "hello" },
+    ]);
+  });
+
+  test("developer role reaches a non-OpenAI compatible vendor as system", async (ctx) => {
+    if (!etcdReachable || !app || !compatUpstream) {
+      ctx.skip();
+      return;
+    }
+
+    const client = new OpenAI({
+      apiKey: CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+    });
+
+    await waitConfigPropagation(seedsPropagated);
+    const baseline = compatUpstream.receivedRequests.length;
+
+    const completion = await client.chat.completions.create({
+      model: "sdk-compat-deepseek",
+      messages: [
+        { role: "developer", content: "Follow application instructions" },
+        { role: "user", content: "hello" },
+      ] as unknown as OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+    });
+
+    expect(completion.object).toBe("chat.completion");
+    expect(compatUpstream.receivedRequests.length - baseline).toBe(1);
+    const request = compatUpstream.receivedRequests[baseline];
+    expect(request?.path).toBe("/v1/chat/completions");
+    const body = JSON.parse(request!.body) as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    expect(body.messages).toEqual([
+      { role: "system", content: "Follow application instructions" },
+      { role: "user", content: "hello" },
+    ]);
+  });
+
+  test("mis-cased developer role is rejected before upstream", async (ctx) => {
+    if (!etcdReachable || !app || !nonStreamUpstream) {
+      ctx.skip();
+      return;
+    }
+
+    await waitConfigPropagation(seedsPropagated);
+    const baseline = nonStreamUpstream.receivedRequests.length;
+    const response = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "sdk-compat-sync",
+        messages: [
+          { role: "Developer", content: "Follow application instructions" },
+          { role: "user", content: "hello" },
+        ],
+      }),
+    });
+    await response.text();
+
+    expect(response.status).toBe(400);
+    expect(nonStreamUpstream.receivedRequests.length - baseline).toBe(0);
+  });
+
+  test("openai.chat.completions.create({stream:true}) — streaming", async (ctx) => {
+    if (!etcdReachable || !app || !streamUpstream) {
+      ctx.skip();
+      return;
+    }
+
+    const client = new OpenAI({
+      apiKey: CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+    });
+
+    await waitConfigPropagation(seedsPropagated);
+
+    // Baseline-isolate anything earlier tests sent so the count + path
+    // assertions below measure only the test call's effect.
+    const baseline = streamUpstream.receivedRequests.length;
+    const stream = await client.chat.completions.create({
+      model: "sdk-compat-stream",
+      messages: [
+        { role: "developer", content: "Follow application instructions" },
+        { role: "user", content: "say hello" },
+      ] as unknown as OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+      stream: true,
+    });
+
+    // Capture chunks in arrival order so a regression that reordered
+    // SSE events (e.g. finish_reason landing mid-stream) is visible.
+    const chunks: Array<{ content: string; finish: string | null }> = [];
+    for await (const chunk of stream) {
+      const choice = chunk.choices[0];
+      chunks.push({
+        content: choice?.delta?.content ?? "",
+        finish: choice?.finish_reason ?? null,
+      });
+    }
+
+    // The SDK must reconstruct the streamed text correctly — wire
+    // mismatches (chunked encoding, content-type, SSE framing, [DONE]
+    // sentinel handling) would surface here with truncated content
+    // or a missing / mid-stream finish_reason.
+    const collected = chunks.map((c) => c.content).join("");
+    expect(collected).toBe("hello world");
+    const finishIdx = chunks.findIndex((c) => c.finish === "stop");
+    expect(finishIdx).toBeGreaterThanOrEqual(0);
+    expect(finishIdx).toBe(chunks.length - 1);
+
+    const testCalls = streamUpstream.receivedRequests
+      .slice(baseline)
+      .filter((r) => r.path === "/v1/chat/completions");
+    expect(testCalls).toHaveLength(1);
+    expect(testCalls[0]?.method).toBe("POST");
+    const requestBody = JSON.parse(testCalls[0]!.body) as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    expect(requestBody.messages).toEqual([
+      { role: "developer", content: "Follow application instructions" },
+      { role: "user", content: "say hello" },
+    ]);
+  });
+});

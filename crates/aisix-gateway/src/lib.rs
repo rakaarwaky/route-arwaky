@@ -1,0 +1,88 @@
+//! aisix-gateway — the Hub-and-Bridge core.
+//!
+//! This crate holds the provider-agnostic primitives shared by every
+//! `aisix-provider-*` crate and by the proxy router:
+//!
+//! - [`chat`] — normalised `ChatFormat`, `ChatMessage`, `ChatResponse`,
+//!   streaming `ChatChunk`, and the usage/finish-reason taxonomy.
+//! - [`bridge`] — the `Bridge` trait every provider implements, plus
+//!   `BridgeContext` and typed `BridgeError` with stable HTTP status
+//!   mapping.
+//! - [`hub`] — a small registry keyed on [`aisix_core::models::Provider`]
+//!   that dispatches `ChatFormat` to the right `Bridge`.
+//! - [`sse`] — a provider-agnostic SSE line decoder. Bridges that stream
+//!   over SSE feed it raw bytes and pull typed events back out.
+//! - [`structured_output`] — the `response_format` translation pieces
+//!   every bridge shares: the synthetic JSON tool and its reverse
+//!   translation, the fake stream that carries it, and the two schema
+//!   normalisations.
+//! - [`credential`] — cache keys for credential-derived upstream tokens.
+//! - [`upstream_http`] — connection-layer settings every provider client
+//!   shares (connect timeout, TCP keepalive, pool expiry) plus the
+//!   cause-chain rendering for transport errors.
+//!
+//! Request/response translation lives in the provider crates; this crate
+//! owns only what all of them must agree on.
+
+#![forbid(unsafe_code)]
+#![deny(rust_2018_idioms)]
+
+#[cfg(feature = "aws")]
+pub mod aws_auth;
+pub mod bridge;
+pub mod chat;
+pub mod content_part;
+pub mod credential;
+pub mod dns_cache;
+pub mod gemini;
+pub mod hub;
+pub mod media_fetch;
+pub mod response_tap;
+pub mod sse;
+pub mod ssrf;
+pub mod structured_output;
+pub mod tool_calls;
+pub mod upstream_dial;
+pub mod upstream_headers;
+pub mod upstream_http;
+pub mod upstream_tls;
+pub mod url_cache;
+
+pub use bridge::{
+    capture_in_band_error, capture_in_band_error_value, capture_upstream_error_http,
+    content_type_is_json, decode_success_body, in_band_error_body, in_band_error_in_body,
+    in_band_error_reported, parse_retry_after, read_body_capped, response_is_json, truncate_lossy,
+    upstream_error_message, upstream_error_within, upstream_status_of_body,
+    upstream_status_parsed_from_response, Bridge, BridgeCapability, BridgeContext, BridgeError,
+    ChatChunkStream, NativeMessages, UpstreamErrorBody, UpstreamErrorView, UpstreamWire,
+    MAX_UPSTREAM_ERROR_BODY_BYTES, MAX_UPSTREAM_ERROR_MESSAGE_BYTES,
+};
+pub use chat::{
+    CacheCreationTtl, ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, EmbeddingObject,
+    EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingUsageSource, EmbeddingVector,
+    FinishReason, ModalityTokens, OpenAiUsageDetails, ReportedCounts, Role, ServiceTier,
+    UsageStats,
+};
+pub use credential::credential_fingerprint;
+pub use hub::{upstream_protocol, Hub, UPSTREAM_PROTOCOL_UNKNOWN};
+pub use response_tap::{
+    capture_header_values, note_upstream_error_body, note_upstream_response, provider_request_id,
+    wants_upstream_error_body, warn_error_body_unread, ResponseHeaderTap, UpstreamResponseCapture,
+    PROVIDER_REQUEST_ID_HEADERS,
+};
+pub use sse::{SseDecoder, SseEvent, SseFrameTooLarge};
+pub use structured_output::{
+    apply_schema_limits, close_object_schemas, json_schema_from_response_format,
+    response_into_fake_stream_chunks, seal_object_schemas, unwrap_json_tool_call, SchemaLimits,
+    ANTHROPIC_SCHEMA_LIMITS, GEMINI_OPENAPI_SCHEMA_LIMITS, JSON_TOOL_DESCRIPTION, JSON_TOOL_NAME,
+};
+pub use upstream_headers::{
+    apply_request_headers, client_header_forwardable, header_forward_blocked,
+    resolve_default_headers, resolve_extra_headers, CallerIdentity, ForwardedClientHeaders,
+    UpstreamHeaderContext,
+};
+pub use upstream_http::{
+    client_builder, error_with_causes, json_body, log_body_read_causes, send_error,
+    transport_error_message, upstream_body_read_error, UpstreamHttpConfig,
+};
+pub use upstream_tls::TlsSettings;

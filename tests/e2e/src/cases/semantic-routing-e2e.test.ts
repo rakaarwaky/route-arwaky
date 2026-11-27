@@ -1,0 +1,474 @@
+import { createHash } from "node:crypto";
+import { createServer, type Server } from "node:http";
+import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import {
+  EtcdClient,
+  ProxyClient,
+  SeedClient,
+  spawnApp,
+  startOpenAiUpstream,
+  waitConfigPropagation,
+  type OpenAiUpstream,
+  type SpawnedApp,
+} from "../harness/index.js";
+import { pickFreePort } from "../harness/ports.js";
+
+// E2E: semantic routing (#641). A request to a `semantic` virtual model
+// embeds the latest user message, scores it against each route's example
+// embeddings, and dispatches to the best route's target — or to `default`
+// when none clears its threshold. No CP involved: real `aisix` binary +
+// etcd + a deterministic local OpenAI-compatible embedding upstream + local
+// chat upstreams.
+//
+// The local embedding upstream maps each input string to a one-hot vector
+// by keyword, so routing decisions are fully deterministic and asserted:
+//   contains "contract"/"legal"/"nda" -> [0,0,1,0]  (legal route)
+//   contains "python"/"code"          -> [0,1,0,0]  (code route)
+//   contains "translate"              -> [1,0,0,0]  (translate route)
+//   anything else                     -> [0,0,0,1]  (orthogonal -> default)
+// A route example sharing a keyword with the prompt yields cosine 1.0;
+// an unrelated prompt yields cosine 0 against every example -> default.
+
+const CALLER_PLAINTEXT = "sk-semantic-e2e-caller";
+const CALLER_KEY_HASH = createHash("sha256")
+  .update(CALLER_PLAINTEXT)
+  .digest("hex");
+const COLD_ROUTER = "cold-batch-router";
+const COLD_FIRST_PROMPT = "please review this contract in the cold batch";
+const COLD_LATER_PROMPT = "please review this NDA after the batch is warm";
+const COLD_LEGAL_EXAMPLE = "analyze a contract for legal risk";
+const COLD_CODE_EXAMPLE = "write a Python code review";
+const COLD_TRANSLATE_EXAMPLE = "translate this document";
+
+function keywordVector(text: string): number[] {
+  const t = text.toLowerCase();
+  if (t.includes("translate")) return [1, 0, 0, 0];
+  if (t.includes("python") || t.includes("code")) return [0, 1, 0, 0];
+  if (t.includes("contract") || t.includes("legal") || t.includes("nda"))
+    return [0, 0, 1, 0];
+  return [0, 0, 0, 1];
+}
+
+interface EmbeddingMock {
+  baseUrl: string;
+  receivedInputs(): string[][];
+  close(): Promise<void>;
+}
+
+/**
+ * A minimal local OpenAI-compatible `/v1/embeddings` upstream that returns a
+ * deterministic keyword vector per input. When `fail` is set, every
+ * embeddings call returns 500 (to exercise `on_embedding_failure`).
+ */
+async function startEmbeddingMock(opts: { fail?: boolean } = {}): Promise<EmbeddingMock> {
+  const receivedInputs: string[][] = [];
+  const server: Server = createServer((req, res) => {
+    res.on("error", () => {});
+    let raw = "";
+    req.on("data", (c: Buffer) => (raw += c.toString("utf8")));
+    req.on("end", () => {
+      if (!req.url?.includes("/embeddings")) {
+        res.statusCode = 404;
+        res.end("{}");
+        return;
+      }
+      if (opts.fail) {
+        res.statusCode = 500;
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ error: { message: "embedding upstream down" } }));
+        return;
+      }
+      let body: { input?: string | string[] };
+      try {
+        body = JSON.parse(raw || "{}") as { input?: string | string[] };
+      } catch {
+        res.statusCode = 400;
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ error: { message: "invalid JSON payload" } }));
+        return;
+      }
+      const inputs = Array.isArray(body.input)
+        ? body.input
+        : [body.input ?? ""];
+      receivedInputs.push([...inputs]);
+      const data = inputs.map((text, index) => ({
+        object: "embedding",
+        index,
+        embedding: keywordVector(text),
+      }));
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          object: "list",
+          model: "embed-mock",
+          data,
+          usage: { prompt_tokens: inputs.length, total_tokens: inputs.length },
+        }),
+      );
+    });
+  });
+  const port = await pickFreePort();
+  await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
+  return {
+    baseUrl: `http://127.0.0.1:${port}`,
+    receivedInputs: () => receivedInputs.map((inputs) => [...inputs]),
+    async close() {
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
+    },
+  };
+}
+
+function chatUpstreamReplying(content: string): Promise<OpenAiUpstream> {
+  return startOpenAiUpstream({
+    nonStreamBody: {
+      id: `cmpl-${content}`,
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: "gpt-4o-mini",
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content },
+          finish_reason: "stop",
+        },
+      ],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    },
+  });
+}
+
+describe("semantic routing e2e", () => {
+  let app: SpawnedApp | undefined;
+  let seed: SeedClient | undefined;
+  let etcdReachable = false;
+  const upstreams: OpenAiUpstream[] = [];
+  const embedMocks: EmbeddingMock[] = [];
+  let coldEmbeddingMock: EmbeddingMock | undefined;
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+
+    app = await spawnApp({ exposeDebugHeaders: true });
+    seed = new SeedClient(etcd, app.etcdPrefix);
+
+    // Shared `prod-chat` fixture for the matched + default-fallthrough
+    // tests, so neither depends on the other's execution order.
+    const embed = await startEmbeddingMock();
+    const legal = await chatUpstreamReplying("served-by-legal");
+    const fallback = await chatUpstreamReplying("served-by-default");
+    embedMocks.push(embed);
+    upstreams.push(legal, fallback);
+
+    await createEmbeddingModel("bge-mock", embed);
+    await createDirectModel("legal-model", legal);
+    await createDirectModel("default-model", fallback);
+    const anthropic = await seed.createProviderKey({
+      display_name: "semantic-anthropic", provider: "anthropic", adapter: "anthropic",
+      api_key: "mock-key", api_base: legal.baseUrl,
+    });
+    await seed.createModel({
+      display_name: "anthropic-legal", provider: "anthropic", model_name: "legal", provider_key_id: anthropic.id,
+    });
+    await seed.createModel({
+      display_name: "gemini-semantic",
+      semantic: {
+        embedding_model: "bge-mock", default: "default-model", match: { threshold: 0.5 },
+        routes: [{ name: "legal", target: "anthropic-legal", examples: ["legal risk"] }],
+      },
+    });
+    await seed.createModel({
+      display_name: "prod-chat",
+      semantic: {
+        embedding_model: "bge-mock",
+        routes: [
+          {
+            name: "legal",
+            target: "legal-model",
+            examples: ["analyze this contract for legal risk"],
+            threshold: 0.5,
+          },
+        ],
+        default: "default-model",
+        match: { threshold: 0.5 },
+      },
+    });
+
+    // Keep a separate router and local protocol embedding upstream cold until
+    // its regression test. Repeated examples prove the cold logical batch is
+    // deduplicated within and across routes; the translate example proves
+    // every route contributes. Both routes use the same target so their tied
+    // score cannot make the observed response nondeterministic.
+    const coldEmbed = await startEmbeddingMock();
+    coldEmbeddingMock = coldEmbed;
+    embedMocks.push(coldEmbed);
+    await createEmbeddingModel("cold-batch-embed", coldEmbed);
+    await seed.createModel({
+      display_name: COLD_ROUTER,
+      semantic: {
+        embedding_model: "cold-batch-embed",
+        routes: [
+          {
+            name: "legal",
+            target: "legal-model",
+            examples: [COLD_LEGAL_EXAMPLE, COLD_LEGAL_EXAMPLE, COLD_CODE_EXAMPLE],
+          },
+          {
+            name: "legal-shared-examples",
+            target: "legal-model",
+            examples: [COLD_LEGAL_EXAMPLE, COLD_CODE_EXAMPLE, COLD_TRANSLATE_EXAMPLE],
+          },
+        ],
+        default: "default-model",
+        match: { threshold: 0.5 },
+      },
+    });
+
+    // Seed the caller key last: authenticating it proves every resource above
+    // has reached this DP snapshot, without exercising semantic routing.
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["*"],
+    });
+    const probe = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(async () => (await probe.listModels()).status === 200);
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await Promise.all(upstreams.map((u) => u.close()));
+    await Promise.all(embedMocks.map((m) => m.close()));
+  });
+
+  async function createDirectModel(
+    displayName: string,
+    upstream: OpenAiUpstream,
+  ): Promise<void> {
+    if (!seed) throw new Error("seed not ready");
+    const pk = await seed.createProviderKey({
+      display_name: `${displayName}-pk`,
+      api_key: "sk-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: displayName,
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: pk.id,
+    });
+  }
+
+  async function createEmbeddingModel(
+    displayName: string,
+    mock: EmbeddingMock,
+  ): Promise<void> {
+    if (!seed) throw new Error("seed not ready");
+    const pk = await seed.createProviderKey({
+      display_name: `${displayName}-pk`,
+      api_key: "sk-mock",
+      api_base: `${mock.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: displayName,
+      provider: "openai",
+      model_name: "embed-mock",
+      provider_key_id: pk.id,
+      embedding: { dimensions: 4, normalize: true },
+    });
+  }
+
+  interface ChatResult {
+    status: number;
+    content: string | undefined;
+    route: string | null;
+    servedBy: string | null;
+  }
+
+  async function chat(model: string, prompt: string): Promise<ChatResult> {
+    const res = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    let content: string | undefined;
+    if (res.status === 200) {
+      const json = (await res.json()) as {
+        choices?: { message?: { content?: string } }[];
+      };
+      content = json.choices?.[0]?.message?.content;
+    } else {
+      await res.text();
+    }
+    return {
+      status: res.status,
+      content,
+      route: res.headers.get("x-aisix-route"),
+      servedBy: res.headers.get("x-aisix-served-by"),
+    };
+  }
+
+  async function waitForModel(model: string): Promise<void> {
+    if (!app) throw new Error("app not ready");
+    const probe = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(async () => {
+      const response = await probe.listModels();
+      if (response.status !== 200) return false;
+      const models = (response.body as { data?: Array<{ id?: string }> }).data ?? [];
+      return models.some((candidate) => candidate.id === model);
+    });
+  }
+
+  test("lazily batches a cold prompt with distinct examples and later reuses them", async (ctx) => {
+    if (!etcdReachable || !app || !seed || !coldEmbeddingMock) {
+      ctx.skip();
+      return;
+    }
+
+    // `/v1/models` was the readiness gate, so applying the router has not
+    // called its embedding upstream.
+    expect(coldEmbeddingMock.receivedInputs()).toEqual([]);
+
+    const first = await chat(COLD_ROUTER, COLD_FIRST_PROMPT);
+    expect(first.status).toBe(200);
+    expect(first.content).toBe("served-by-legal");
+    expect(first.route).toBe("legal");
+    // This local OpenAI-compatible upstream supports an input array, making
+    // the logical batch observable as one protocol request.
+    expect(coldEmbeddingMock.receivedInputs()).toEqual([
+      [COLD_FIRST_PROMPT, COLD_LEGAL_EXAMPLE, COLD_CODE_EXAMPLE, COLD_TRANSLATE_EXAMPLE],
+    ]);
+
+    const later = await chat(COLD_ROUTER, COLD_LATER_PROMPT);
+    expect(later.status).toBe(200);
+    expect(later.content).toBe("served-by-legal");
+    expect(later.route).toBe("legal");
+    expect(coldEmbeddingMock.receivedInputs()).toEqual([
+      [COLD_FIRST_PROMPT, COLD_LEGAL_EXAMPLE, COLD_CODE_EXAMPLE, COLD_TRANSLATE_EXAMPLE],
+      [COLD_LATER_PROMPT],
+    ]);
+  });
+
+  test("routes a matching prompt to its route target and sets x-aisix-route", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+    // `prod-chat` is provisioned in beforeAll (shared, order-independent).
+
+    const r = await chat("prod-chat", "please review the contract for risk");
+    expect(r.status).toBe(200);
+    expect(r.content).toBe("served-by-legal");
+    expect(r.route).toBe("legal");
+    expect(r.servedBy).toBe("legal-model");
+  });
+
+  test("Gemini requests use the semantic default when the matching target cannot serve them", async (ctx) => {
+    if (!app) return ctx.skip();
+    const res = await fetch(app.proxyUrl + "/v1beta/models/gemini-semantic:generateContent", {
+      method: "POST", headers: { "content-type": "application/json", authorization: "Bearer " + CALLER_PLAINTEXT },
+      body: JSON.stringify({ contents: [{ parts: [{ text: "please review the contract for risk" }] }] }),
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-aisix-route")).toBeNull();
+    expect((await res.json()).candidates[0].content.parts).toEqual([{ text: "served-by-default" }]);
+  });
+
+  test("falls through to default when no route clears its threshold (no x-aisix-route)", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+    // Reuses the prod-chat router from the previous test. A prompt with no
+    // route keyword embeds orthogonal to every example -> default.
+    const r = await chat("prod-chat", "what time is the meeting tomorrow");
+    expect(r.status).toBe(200);
+    expect(r.content).toBe("served-by-default");
+    // No route matched -> the header is absent.
+    expect(r.route).toBeNull();
+  });
+
+  test("on_embedding_failure: default routes to the default model when embedding errors", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+    const brokenEmbed = await startEmbeddingMock({ fail: true });
+    const fallback = await chatUpstreamReplying("served-by-safe-default");
+    embedMocks.push(brokenEmbed);
+    upstreams.push(fallback);
+
+    await createEmbeddingModel("broken-embed", brokenEmbed);
+    await createDirectModel("safe-default-model", fallback);
+    await seed.createModel({
+      display_name: "degrading-router",
+      semantic: {
+        embedding_model: "broken-embed",
+        routes: [
+          {
+            name: "legal",
+            target: "safe-default-model",
+            examples: ["analyze this contract"],
+            threshold: 0.5,
+          },
+        ],
+        default: "safe-default-model",
+        match: { threshold: 0.5 },
+        on_embedding_failure: "default",
+      },
+    });
+
+    await waitForModel("degrading-router");
+
+    const r = await chat("degrading-router", "contract review please");
+    expect(r.status).toBe(200);
+    expect(r.content).toBe("served-by-safe-default");
+    // Embedding failed, so no route matched -> no route header.
+    expect(r.route).toBeNull();
+  });
+
+  test("on_embedding_failure: fail returns 503 when embedding errors", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+    const brokenEmbed = await startEmbeddingMock({ fail: true });
+    const target = await chatUpstreamReplying("should-not-be-reached");
+    embedMocks.push(brokenEmbed);
+    upstreams.push(target);
+
+    await createEmbeddingModel("broken-embed-2", brokenEmbed);
+    await createDirectModel("unreached-model", target);
+    await seed.createModel({
+      display_name: "strict-router",
+      semantic: {
+        embedding_model: "broken-embed-2",
+        routes: [
+          {
+            name: "legal",
+            target: "unreached-model",
+            examples: ["analyze this contract"],
+            threshold: 0.5,
+          },
+        ],
+        default: "unreached-model",
+        match: { threshold: 0.5 },
+        on_embedding_failure: "fail",
+      },
+    });
+
+    await waitForModel("strict-router");
+
+    const r = await chat("strict-router", "contract review please");
+    expect(r.status).toBe(503);
+  });
+});
