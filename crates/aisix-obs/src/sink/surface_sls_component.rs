@@ -1,0 +1,992 @@
+//! Aliyun SLS (Simple Log Service) sink — the `http_batch` family's first
+//! concrete vendor (AISIX-Cloud#687, the pre-sales deliverable on
+//! ai-gateway#432).
+//!
+//! A batch becomes one SLS **PutLogs** request: every [`SinkRecord`] maps to
+//! one protobuf `Log` (the canonical usage metadata flattened into key/value
+//! contents, plus opt-in captured prompt/response), the `LogGroup` is
+//! lz4-block compressed, signed with SLS signature v1 (HMAC-SHA1), and POSTed
+//! to `/logstores/<logstore>/shards/lb` over the crate's shared rustls client.
+//!
+//! Wire details are taken from the official Aliyun SLS sub-crates
+//! (`aliyun-log-sdk-protobuf`, `aliyun-log-sdk-sign`) rather than re-derived.
+//! In particular the signer sets `Date` / `Content-MD5` / `Content-Length` /
+//! `x-log-apiversion` / `x-log-signaturemethod` / `Authorization` itself and
+//! signs over *every* `x-log-*` header, so `Content-Type` plus
+//! `x-log-bodyrawsize` and `x-log-compresstype` are populated before the call.
+
+use aliyun_log_sdk_protobuf::{Log, LogGroup};
+use aliyun_log_sdk_sign::{sign_v1, QueryParams};
+use async_trait::async_trait;
+use http::header::CONTENT_TYPE;
+use http::{HeaderMap, HeaderName, HeaderValue, Method};
+use serde::Deserialize;
+
+use super::{
+    BatchUnit, ErrorRedactor, EventBatch, IdempotencyMarker, IdempotencyScheme, ObservabilitySink,
+    OrderingScope, SinkAck, SinkCapabilities, SinkError, SinkHealth, SinkRecord, SinkResult,
+};
+
+/// `x-log-bodyrawsize`: the *uncompressed* protobuf size. SLS uses it to size
+/// the lz4 decompression buffer (the block format carries no length itself).
+const X_LOG_BODYRAWSIZE: HeaderName = HeaderName::from_static("x-log-bodyrawsize");
+/// `x-log-compresstype`: the body compression. This sink always lz4-block-
+/// compresses, so the value is constant.
+const X_LOG_COMPRESSTYPE: HeaderName = HeaderName::from_static("x-log-compresstype");
+
+/// Cap on a masked error-detail string surfaced to logs / health.
+const DETAIL_MAX_CHARS: usize = 200;
+
+/// A delivery target for one Aliyun SLS logstore.
+pub struct AliyunSlsSink {
+    name: String,
+    /// Full POST target — `https://<project>.<endpoint>/logstores/<ls>/shards/lb`.
+    endpoint_url: String,
+    /// The request path used for the SLS signature (no scheme/host/query).
+    path: String,
+    access_key_id: String,
+    access_key_secret: String,
+    client: reqwest::Client,
+}
+
+impl AliyunSlsSink {
+    /// Build a sink for one `<project>/<logstore>` in an SLS region.
+    ///
+    /// `endpoint` is the bare region host, e.g.
+    /// `ap-southeast-3.log.aliyuncs.com`; the request host is
+    /// `<project>.<endpoint>`. An endpoint that already carries a scheme
+    /// (the e2e's `http://mock-sls:9000`) is used verbatim so a local mock
+    /// needs no `<project>.` DNS or TLS. The `client` is shared across sinks
+    /// so connection pools and TLS sessions are reused.
+    pub fn new(
+        name: impl Into<String>,
+        endpoint: &str,
+        project: &str,
+        logstore: &str,
+        access_key_id: impl Into<String>,
+        access_key_secret: impl Into<String>,
+        client: reqwest::Client,
+    ) -> Self {
+        Self::from_base_url(
+            name,
+            base_url_for(endpoint, project),
+            logstore,
+            access_key_id,
+            access_key_secret,
+            client,
+        )
+    }
+
+    /// Construct from an explicit `scheme://host[:port]` base. Production goes
+    /// through [`AliyunSlsSink::new`]; tests point this at a mock server.
+    fn from_base_url(
+        name: impl Into<String>,
+        base_url: impl Into<String>,
+        logstore: &str,
+        access_key_id: impl Into<String>,
+        access_key_secret: impl Into<String>,
+        client: reqwest::Client,
+    ) -> Self {
+        let path = format!("/logstores/{logstore}/shards/lb");
+        let endpoint_url = format!("{}{}", base_url.into(), path);
+        Self {
+            name: name.into(),
+            endpoint_url,
+            path,
+            access_key_id: access_key_id.into(),
+            access_key_secret: access_key_secret.into(),
+            client,
+        }
+    }
+}
+
+#[async_trait]
+impl ObservabilitySink for AliyunSlsSink {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn capabilities(&self) -> SinkCapabilities {
+        SinkCapabilities {
+            // SLS PutLogs is at-least-once: no server-side dedup token.
+            idempotency: IdempotencyScheme::None,
+            // Independent posts; SLS does not require cross-record ordering.
+            ordering: OrderingScope::None,
+            // Count-bounded today (parity with OtlpSink). SLS does cap the
+            // PutLogs body (low single-digit MB), but byte-aware chunking is
+            // only needed once full prompt/response content rides these
+            // records; on the metadata-only path the pipeline's per-batch
+            // record cap keeps bodies far under the limit. Declaring a byte
+            // ceiling the sink does not yet self-enforce would be a false
+            // promise (and a silent-drop bug under content) — so it stays
+            // `None` until the chunking lands. Tracked in #529.
+            batch_unit: BatchUnit::Records,
+            max_batch_bytes: None,
+            // PutLogs accepts or rejects the whole LogGroup.
+            supports_partial_batch: false,
+            supports_streaming_ingest: false,
+        }
+    }
+
+    async fn append_batch(&self, batch: &EventBatch, _marker: &IdempotencyMarker) -> SinkResult {
+        if batch.is_empty() {
+            return Ok(SinkAck::default());
+        }
+
+        // 1. One protobuf `Log` per record → a single `LogGroup`.
+        let mut group = LogGroup::new();
+        for record in &batch.records {
+            group.add_log(to_log(record)?);
+        }
+        let raw = group
+            .encode()
+            .map_err(|e| SinkError::Permanent(format!("sls: protobuf encode: {e}")))?;
+        let raw_size = raw.len();
+
+        // 2. lz4 *block* compression (bare block; the size lives in the header).
+        let compressed = lz4_flex::block::compress(&raw);
+
+        // 3. Headers SLS signs over. The signer adds Date / Content-MD5 /
+        //    Content-Length / apiversion / signaturemethod / Authorization and
+        //    signs every `x-log-*`, so these three are set beforehand.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/x-protobuf"),
+        );
+        headers.insert(X_LOG_BODYRAWSIZE, HeaderValue::from(raw_size as u64));
+        headers.insert(X_LOG_COMPRESSTYPE, HeaderValue::from_static("lz4"));
+        sign_v1(
+            &self.access_key_id,
+            &self.access_key_secret,
+            None,
+            Method::POST,
+            &self.path,
+            &mut headers,
+            QueryParams::empty(),
+            Some(&compressed),
+        )
+        .map_err(|e| SinkError::Permanent(format!("sls: sign request: {e}")))?;
+
+        // 4. Deliver. The exact `compressed` bytes were signed (Content-MD5).
+        let resp = match self
+            .client
+            .post(&self.endpoint_url)
+            .headers(headers)
+            .body(compressed)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            // Connect / DNS / timeout — transient by nature. reqwest's
+            // Display hides the cause in `source()` — chain it.
+            Err(e) => {
+                return Err(SinkError::Transient(format!(
+                    "sls: POST {}: {}",
+                    self.endpoint_url,
+                    super::error_chain(&e)
+                )))
+            }
+        };
+
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(SinkAck {
+                accepted: batch.len(),
+                ..SinkAck::default()
+            });
+        }
+
+        let retry_after = super::retry_after_of(status, resp.headers());
+        let body = resp.text().await.unwrap_or_default();
+        let (error_code, detail) = parse_sls_error(status, &body);
+        // 5xx / 408 / 429 are always worth retrying; SLS also signals back-
+        // pressure (quota / busy / clock skew) on a 4xx with a code whose plain
+        // meaning is transient, so promote those rather than drop a log batch.
+        Err(
+            match super::http_status_error(status, retry_after, detail) {
+                SinkError::Permanent(detail) if is_transient_error_code(&error_code) => {
+                    SinkError::Transient(detail)
+                }
+                err => err,
+            },
+        )
+    }
+
+    async fn healthcheck(&self) -> SinkHealth {
+        // A real connectivity probe (and the control-plane "test connection"
+        // affordance) lands with the health/metrics surface; until then a sink
+        // reports healthy and its delivery errors surface via
+        // `SinkStats::last_error`. (Mirrors `OtlpSink`.)
+        SinkHealth::healthy()
+    }
+
+    fn error_redactor(&self) -> ErrorRedactor {
+        ErrorRedactor::default().secret(&self.access_key_secret)
+    }
+}
+
+/// Map one canonical record to an SLS protobuf `Log`.
+///
+/// Metadata is produced by *serializing* [`crate::surface_usage_controller::UsageEvent`] rather
+/// than hand-listing its 30-plus fields: that single-sources the schema and
+/// inherits the exact `skip_serializing_if` emptiness rules the cp-api wire
+/// already uses (empty strings / zero counters are omitted). The SLS log time
+/// is ingest time (now); the event's own `occurred_at` is preserved as a
+/// content field.
+fn to_log(record: &SinkRecord) -> Result<Log, SinkError> {
+    let mut log = Log::from_unixtime(now_unix_secs());
+    log.add_content_kv("schema_version", record.schema_version);
+
+    let usage = aisix_core::utility_json_helper::to_value(&record.usage)
+        .map_err(|e| SinkError::Permanent(format!("sls: serialize usage: {e}")))?;
+    if let serde_json::Value::Object(fields) = usage {
+        for (key, value) in fields {
+            // One field per cost-attribution tag, so each is a column an
+            // SLS query can filter on without parsing JSON.
+            if key == "tags" {
+                continue;
+            }
+            if let Some(rendered) = render_scalar(&value) {
+                log.add_content_kv(key, rendered);
+            }
+        }
+    }
+    for (key, value) in &record.usage.tags {
+        log.add_content_kv(format!("tags.{key}"), value.as_str());
+    }
+    for (key, headers) in [
+        ("request_headers", &record.request_headers),
+        (
+            "upstream_response_headers",
+            &record.upstream_response_headers,
+        ),
+    ] {
+        if !headers.is_empty() {
+            let rendered = serde_json::to_value(headers).unwrap_or_default();
+            if let Some(rendered) = render_scalar(&rendered) {
+                log.add_content_kv(key, rendered);
+            }
+        }
+    }
+
+    // Opt-in captured content, one field per piece: the GenAI conventions'
+    // structured messages as compact JSON strings, and a side that could not
+    // be structured as flat `prompt` / `response` text. Absent on the
+    // default metadata-only path, so prompts never leak there.
+    if let Some(content) = &record.content {
+        let enc = content.encode(&record.usage);
+        for (key, value) in [
+            ("input_messages", enc.structured.input_messages.as_deref()),
+            (
+                "system_instructions",
+                enc.structured.system_instructions.as_deref(),
+            ),
+            (
+                "tool_definitions",
+                enc.structured.tool_definitions.as_deref(),
+            ),
+            ("output_messages", enc.structured.output_messages.as_deref()),
+            ("prompt", enc.flat_prompt()),
+            ("response", enc.flat_response()),
+        ] {
+            if let Some(value) = value {
+                log.add_content_kv(key, value);
+            }
+        }
+        if content.truncated {
+            log.add_content_kv("content_truncated", "true");
+        }
+    }
+
+    Ok(log)
+}
+
+/// Render a JSON scalar as an SLS content value; `None` skips the field.
+///
+/// Empty strings are skipped so the SLS log omits blank columns uniformly:
+/// most optional `UsageEvent` fields already drop out via
+/// `skip_serializing_if`, but a few (`model_id`, `api_key_id`) carry only
+/// `#[serde(default)]` and would otherwise serialize as `""`. Numeric `0` and
+/// `false` are kept — a zero token count or status code is real data.
+fn render_scalar(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) if s.is_empty() => None,
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        // Nested fields (e.g. routing_attempts) round-trip as compact JSON in
+        // a single content value.
+        other => Some(other.to_string()),
+    }
+}
+
+/// The SLS JSON error envelope — `{"errorCode": ..., "errorMessage": ...}`.
+#[derive(Deserialize)]
+struct SlsErrorBody {
+    #[serde(rename = "errorCode", default)]
+    error_code: String,
+    #[serde(rename = "errorMessage", default)]
+    error_message: String,
+}
+
+/// Parse the SLS error body into `(errorCode, masked detail)`, falling back to
+/// the raw (truncated) body when it isn't the JSON envelope. The detail never
+/// contains the access key — SLS error messages echo neither id nor secret.
+fn parse_sls_error(status: reqwest::StatusCode, body: &str) -> (String, String) {
+    if let Ok(parsed) = serde_json::from_str::<SlsErrorBody>(body) {
+        if !parsed.error_code.is_empty() {
+            let detail = truncate(&format!(
+                "HTTP {status}: {} {}",
+                parsed.error_code, parsed.error_message
+            ));
+            return (parsed.error_code, detail);
+        }
+    }
+    (String::new(), truncate(&format!("HTTP {status}: {body}")))
+}
+
+/// Whether an SLS `errorCode` means "retry with backoff", keyed on the plain
+/// semantics of the code string. SLS returns throttling / overload / clock
+/// skew on a 4xx in some configurations, which a status-only check would
+/// mis-classify as permanent and silently drop a log batch. See the SLS error
+/// code reference:
+/// <https://www.alibabacloud.com/help/en/sls/developer-reference/api-error-codes>.
+fn is_transient_error_code(code: &str) -> bool {
+    const TRANSIENT_TOKENS: [&str; 6] = [
+        "QuotaExceed",          // Write/Read/ShardWriteQuotaExceed — throttle
+        "Busy",                 // ServerBusy — transient overload
+        "InternalServerError",  // server-side, retryable
+        "Unavailable",          // ServiceUnavailable
+        "RequestTimeExpired",   // stale Date — a fresh re-sign on retry fixes it
+        "RequestTimeTooSkewed", // clock skew — likewise
+    ];
+    TRANSIENT_TOKENS.iter().any(|token| code.contains(token))
+}
+
+/// Truncate a masked detail string to a bounded length for logs / health.
+fn truncate(s: &str) -> String {
+    s.chars().take(DETAIL_MAX_CHARS).collect()
+}
+
+/// Compute the base URL (`scheme://host[:port]`) the sink posts to.
+///
+/// A bare SLS region host becomes `https://<project>.<host>` — the real
+/// PutLogs target. An endpoint that already carries a scheme (the e2e's
+/// `http://mock-sls:9000`) is used verbatim, so a local mock receiver needs
+/// no `<project>.` DNS or TLS. The exporter schema only admits a
+/// scheme-qualified endpoint for vetted loopback hosts, so this branch can't
+/// be used to redirect real traffic.
+fn base_url_for(endpoint: &str, project: &str) -> String {
+    let endpoint = endpoint.trim().trim_end_matches('/');
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else {
+        format!("https://{project}.{endpoint}")
+    }
+}
+
+/// Resolve an exporter's `credential_ref` to `(access_key_id,
+/// access_key_secret)` from the DP's local environment.
+///
+/// The AccessKey never travels on the kine path (the control plane stores
+/// only the reference), so the DP looks it up where it actually runs. The
+/// reference is upper-cased with non-alphanumerics folded to `_`, then read
+/// from `SLS_CRED_<REF>_AK_ID` / `SLS_CRED_<REF>_AK_SECRET`. The prefix is
+/// deliberately NOT `AISIX_`: that namespace is owned by the config loader
+/// (`Environment::with_prefix("AISIX")`), which reads such a name as a
+/// configuration override or warns about it on every boot. Returns `None` when either half is
+/// unset or blank — the caller then lets the misconfiguration surface as a
+/// delivery-health auth error rather than signing with an empty key. BYOK
+/// variants (customer KMS / uploaded key) plug in here as alternative
+/// resolution paths keyed off the same reference.
+pub fn resolve_sls_credential(credential_ref: &str) -> Option<(String, String)> {
+    resolve_sls_credential_with(credential_ref, |key| std::env::var(key).ok())
+}
+
+/// Reference-resolution core, parameterized over the variable source so it is
+/// testable without mutating the process environment.
+fn resolve_sls_credential_with(
+    credential_ref: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<(String, String)> {
+    let slug: String = credential_ref
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let id = lookup(&format!("SLS_CRED_{slug}_AK_ID"))?;
+    let secret = lookup(&format!("SLS_CRED_{slug}_AK_SECRET"))?;
+    if id.is_empty() || secret.is_empty() {
+        return None;
+    }
+    Some((id, secret))
+}
+
+/// Unix seconds (UTC) for the SLS log time. SLS expects a `u32` (valid until
+/// 2106); falls back to 0 only if the clock predates the epoch.
+fn now_unix_secs() -> u32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        base_url_for, is_transient_error_code, parse_sls_error, resolve_sls_credential_with,
+        AliyunSlsSink,
+    };
+    use crate::sink::{EventBatch, IdempotencyMarker, ObservabilitySink, SinkContent, SinkRecord};
+    use crate::surface_usage_controller::UsageEvent;
+    use aliyun_log_sdk_protobuf::LogGroupList;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const LOGSTORE: &str = "request-events";
+    const POST_PATH: &str = "/logstores/request-events/shards/lb";
+
+    /// Wrap a bare `LogGroup` message as the single element of a `LogGroupList`
+    /// (protobuf field #1, length-delimited) so the SDK decoder reads it back.
+    fn wrap_as_log_group_list(group: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x0A]; // tag: field 1, wire type 2 (length-delimited)
+        let mut len = group.len();
+        loop {
+            let mut byte = (len & 0x7F) as u8;
+            len >>= 7;
+            if len != 0 {
+                byte |= 0x80; // continuation bit
+            }
+            out.push(byte);
+            if len == 0 {
+                break;
+            }
+        }
+        out.extend_from_slice(group);
+        out
+    }
+
+    /// Decode the request body a mock server captured back into the flat
+    /// key→value content map of its single log (lz4-decompress using the
+    /// raw-size header, then protobuf-decode).
+    fn decode_single_log(req: &wiremock::Request) -> HashMap<String, String> {
+        let raw_size: usize = req
+            .headers
+            .get("x-log-bodyrawsize")
+            .expect("x-log-bodyrawsize header")
+            .to_str()
+            .unwrap()
+            .parse()
+            .expect("raw size is a number");
+        let raw = lz4_flex::block::decompress(&req.body, raw_size).expect("lz4 decompress");
+        let list = LogGroupList::decode(&wrap_as_log_group_list(&raw)).expect("protobuf decode");
+        let groups = list.log_groups();
+        assert_eq!(groups.len(), 1, "exactly one LogGroup");
+        let logs = groups[0].logs();
+        assert_eq!(logs.len(), 1, "exactly one Log");
+        logs[0]
+            .contents()
+            .iter()
+            .map(|c| (c.key().clone(), c.value().clone()))
+            .collect()
+    }
+
+    fn sink_for(server: &MockServer) -> AliyunSlsSink {
+        AliyunSlsSink::from_base_url(
+            "sls-test",
+            server.uri(),
+            LOGSTORE,
+            "test-akid",
+            "test-secret",
+            reqwest::Client::new(),
+        )
+    }
+
+    fn batch_of(records: Vec<SinkRecord>) -> EventBatch {
+        EventBatch::new(records.into_iter().map(Arc::new).collect())
+    }
+
+    /// An `f32` field reaches the log as the number it holds, not widened to
+    /// `f64` (`0.9` as `0.8999999761581421`).
+    #[test]
+    fn f32_fields_are_written_as_they_read() {
+        let log = super::to_log(&SinkRecord::metadata_only(UsageEvent {
+            cache_similarity: Some(0.9123),
+            guardrail_scores: vec![aisix_core::GuardrailScore {
+                score: 0.812,
+                threshold: 0.9,
+                ..Default::default()
+            }],
+            ..UsageEvent::default()
+        }))
+        .unwrap();
+        let contents: HashMap<String, String> = log
+            .contents()
+            .iter()
+            .map(|c| (c.key().clone(), c.value().clone()))
+            .collect();
+        assert_eq!(contents["cache_similarity"], "0.9123");
+        let scores = &contents["guardrail_scores"];
+        assert!(scores.contains(r#""score":0.812,"#), "{scores}");
+        assert!(scores.contains(r#""threshold":0.9,"#), "{scores}");
+    }
+
+    #[tokio::test]
+    async fn appends_batch_posts_signed_lz4_protobuf() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let sink = sink_for(&server);
+        let event = UsageEvent {
+            request_id: "req-42".into(),
+            occurred_at: "2026-05-01T12:00:00Z".into(),
+            model_id: "gpt-4o".into(),
+            requested_model_id: "group-uuid".into(),
+            service_tier: Some("flex".into()),
+            status_code: 200,
+            prompt_tokens: 5,
+            completion_tokens: 7,
+            upstream_latency_ms: 123,
+            operation: "image_generation".into(),
+            ..UsageEvent::default()
+        };
+        let ack = sink
+            .append_batch(
+                &batch_of(vec![SinkRecord::metadata_only(event)]),
+                &IdempotencyMarker::None,
+            )
+            .await
+            .expect("delivery succeeds");
+        assert_eq!(ack.accepted, 1);
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let req = &requests[0];
+
+        // Wire shape: signed PutLogs over lz4 protobuf.
+        assert_eq!(req.method.as_str(), "POST");
+        assert_eq!(req.url.path(), POST_PATH);
+        assert_eq!(
+            req.headers.get("content-type").unwrap().to_str().unwrap(),
+            "application/x-protobuf"
+        );
+        assert_eq!(
+            req.headers
+                .get("x-log-compresstype")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "lz4"
+        );
+        assert_eq!(
+            req.headers
+                .get("x-log-apiversion")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "0.6.0"
+        );
+        let auth = req.headers.get("authorization").unwrap().to_str().unwrap();
+        assert!(
+            auth.starts_with("LOG test-akid:"),
+            "signature carries the access-key id, not the secret: {auth}"
+        );
+        assert!(
+            !auth.contains("test-secret"),
+            "secret must never be on the wire"
+        );
+        assert!(req.headers.contains_key("date"));
+        assert!(req.headers.contains_key("content-md5"));
+
+        // Body round-trips: the mapped fields land as flat contents.
+        let contents = decode_single_log(req);
+        assert_eq!(
+            contents.get("schema_version").map(String::as_str),
+            Some("1.0")
+        );
+        assert_eq!(
+            contents.get("request_id").map(String::as_str),
+            Some("req-42")
+        );
+        assert_eq!(
+            contents.get("occurred_at").map(String::as_str),
+            Some("2026-05-01T12:00:00Z")
+        );
+        assert_eq!(contents.get("model_id").map(String::as_str), Some("gpt-4o"));
+        // The addressed entry's id rides beside the dispatched target's.
+        assert_eq!(
+            contents.get("requested_model_id").map(String::as_str),
+            Some("group-uuid")
+        );
+        assert_eq!(
+            contents.get("service_tier").map(String::as_str),
+            Some("flex")
+        );
+        assert_eq!(contents.get("status_code").map(String::as_str), Some("200"));
+        assert_eq!(contents.get("prompt_tokens").map(String::as_str), Some("5"));
+        assert_eq!(
+            contents.get("completion_tokens").map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            contents.get("upstream_latency_ms").map(String::as_str),
+            Some("123")
+        );
+        // Empty metadata is omitted uniformly: `api_key_id` (serde `default`
+        // only, would serialize as "") and `finish_reason` (`skip_serializing_if`)
+        // both drop out, so the SLS log carries no blank columns.
+        assert!(!contents.contains_key("api_key_id"));
+        assert!(!contents.contains_key("finish_reason"));
+        // Metadata-only path never carries a prompt.
+        assert!(!contents.contains_key("prompt"));
+        // …which is precisely why the request classification has to ride the
+        // metadata (AISIX-Cloud#1461): with no prompt to inspect, `operation`
+        // is the only thing on this record that says what kind of call it
+        // was, and it must arrive as its own indexable column rather than
+        // buried in some composite value.
+        assert_eq!(
+            contents.get("operation").map(String::as_str),
+            Some("image_generation")
+        );
+    }
+
+    /// The exporter's selected headers ride beside the usage fields, and a
+    /// complete chat capture is reported as the GenAI conventions'
+    /// structured messages, each a compact JSON string, with no flat
+    /// prompt/response.
+    #[tokio::test]
+    async fn selected_headers_ride_the_log_and_content_is_structured() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let sink = sink_for(&server);
+        let output = crate::surface_output_view::OutputCollector::from_body(
+            crate::surface_output_view::OutputWire::OpenAiChat,
+            4096,
+            &serde_json::json!({"choices": [{"index": 0, "message": {
+                "reasoning_content": "pondering", "content": "4"}}]}),
+        );
+        let record = SinkRecord::metadata_only(UsageEvent {
+            request_id: "req-headers".into(),
+            status_code: 200,
+            operation: "chat".into(),
+            finish_reason: "stop".into(),
+            api_key_name: "key-a".into(),
+            team_id: "team-1".into(),
+            tags: [
+                ("department".to_string(), "rnd".to_string()),
+                ("bg".to_string(), "cloud".to_string()),
+            ]
+            .into(),
+            request_headers: [
+                ("x-sub-user".to_string(), "alice".to_string()),
+                ("x-department".to_string(), "eng".to_string()),
+            ]
+            .into(),
+            upstream_response_headers: [("x-upstream-id".to_string(), "u-1".to_string())].into(),
+            ..UsageEvent::default()
+        })
+        .with_exporter_headers(&["x-sub-user".to_string()], &["x-upstream-id".to_string()])
+        .with_content(SinkContent {
+            prompt: serde_json::json!({"model": "m",
+                "messages": [{"role": "user", "content": "what is 2+2?"}],
+                "tools": [{"type": "function", "function": {"name": "add",
+                    "description": "Add", "parameters": {"type": "object"}}}]})
+            .to_string(),
+            response: "4".into(),
+            truncated: false,
+            prompt_truncated: false,
+            response_truncated: false,
+            max_bytes: None,
+            output: Some(output),
+        });
+        sink.append_batch(&batch_of(vec![record]), &IdempotencyMarker::None)
+            .await
+            .expect("delivery succeeds");
+
+        let requests = server.received_requests().await.unwrap();
+        let contents = decode_single_log(&requests[0]);
+        assert_eq!(
+            contents.get("request_headers").map(String::as_str),
+            Some(r#"{"x-sub-user":"alice"}"#)
+        );
+        assert_eq!(
+            contents
+                .get("upstream_response_headers")
+                .map(String::as_str),
+            Some(r#"{"x-upstream-id":"u-1"}"#)
+        );
+        assert_eq!(
+            contents.get("api_key_name").map(String::as_str),
+            Some("key-a")
+        );
+        assert_eq!(contents.get("team_id").map(String::as_str), Some("team-1"));
+        assert_eq!(
+            contents.get("tags.department").map(String::as_str),
+            Some("rnd")
+        );
+        assert_eq!(contents.get("tags.bg").map(String::as_str), Some("cloud"));
+        assert!(!contents.contains_key("tags"));
+        let json = |key: &str| -> serde_json::Value {
+            serde_json::from_str(contents.get(key).expect(key)).unwrap()
+        };
+        assert_eq!(
+            json("input_messages"),
+            serde_json::json!([{"role": "user",
+                "parts": [{"type": "text", "content": "what is 2+2?"}]}])
+        );
+        assert_eq!(
+            json("tool_definitions"),
+            serde_json::json!([{"type": "function", "name": "add",
+                "description": "Add", "parameters": {"type": "object"}}])
+        );
+        assert_eq!(
+            json("output_messages"),
+            serde_json::json!([{"role": "assistant", "finish_reason": "stop", "parts": [
+                {"type": "reasoning", "content": "pondering"},
+                {"type": "text", "content": "4"},
+            ]}])
+        );
+        // Chat keeps its system message inside `input_messages`.
+        assert!(!contents.contains_key("system_instructions"));
+        assert!(!contents.contains_key("prompt"));
+        assert!(!contents.contains_key("response"));
+        assert!(!contents.contains_key("content_truncated"));
+        assert!(!String::from_utf8_lossy(&requests[0].body).contains("x-department"));
+    }
+
+    /// A side the cap cut stays flat text with the truncated marker; the
+    /// other side is still structured.
+    #[tokio::test]
+    async fn truncated_side_falls_back_to_flat_text() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let sink = sink_for(&server);
+        let record = SinkRecord::metadata_only(UsageEvent {
+            request_id: "req-content".into(),
+            status_code: 200,
+            operation: "chat".into(),
+            finish_reason: "stop".into(),
+            ..UsageEvent::default()
+        })
+        .with_content(SinkContent {
+            prompt: r#"{"messages":[{"role":"user","content":"what is"#.into(),
+            response: "4".into(),
+            truncated: true,
+            prompt_truncated: true,
+            response_truncated: false,
+            max_bytes: None,
+            output: None,
+        });
+        sink.append_batch(&batch_of(vec![record]), &IdempotencyMarker::None)
+            .await
+            .expect("delivery succeeds");
+
+        let requests = server.received_requests().await.unwrap();
+        let contents = decode_single_log(&requests[0]);
+        assert_eq!(
+            contents.get("prompt").map(String::as_str),
+            Some(r#"{"messages":[{"role":"user","content":"what is"#)
+        );
+        assert!(!contents.contains_key("input_messages"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&contents["output_messages"]).unwrap(),
+            serde_json::json!([{"role": "assistant", "finish_reason": "stop",
+                "parts": [{"type": "text", "content": "4"}]}])
+        );
+        assert!(!contents.contains_key("response"));
+        assert_eq!(
+            contents.get("content_truncated").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn server_error_is_transient() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(ResponseTemplate::new(500).set_body_string(
+                r#"{"errorCode":"InternalServerError","errorMessage":"try again"}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let err = sink_for(&server)
+            .append_batch(
+                &batch_of(vec![SinkRecord::metadata_only(UsageEvent::default())]),
+                &IdempotencyMarker::None,
+            )
+            .await
+            .expect_err("5xx fails");
+        assert!(err.is_transient(), "5xx must be retried: {err}");
+    }
+
+    #[tokio::test]
+    async fn auth_error_is_permanent() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(ResponseTemplate::new(403).set_body_string(
+                r#"{"errorCode":"SignatureNotMatch","errorMessage":"signature mismatch"}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let err = sink_for(&server)
+            .append_batch(
+                &batch_of(vec![SinkRecord::metadata_only(UsageEvent::default())]),
+                &IdempotencyMarker::None,
+            )
+            .await
+            .expect_err("bad signature fails");
+        assert!(!err.is_transient(), "auth error must not be retried: {err}");
+    }
+
+    #[tokio::test]
+    async fn quota_exceeded_on_4xx_is_transient() {
+        // SLS signals shard write throttling with a 4xx + a quota code; a log
+        // sink must back off and retry, not drop the batch.
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(ResponseTemplate::new(403).set_body_string(
+                r#"{"errorCode":"WriteQuotaExceed","errorMessage":"shard write quota exceeded"}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let err = sink_for(&server)
+            .append_batch(
+                &batch_of(vec![SinkRecord::metadata_only(UsageEvent::default())]),
+                &IdempotencyMarker::None,
+            )
+            .await
+            .expect_err("quota exceeded fails this attempt");
+        assert!(
+            err.is_transient(),
+            "quota-exceed on a 4xx must be retried: {err}"
+        );
+    }
+
+    #[test]
+    fn transient_error_codes_are_recognised() {
+        for code in [
+            "WriteQuotaExceed",
+            "ShardWriteQuotaExceed",
+            "ReadQuotaExceed",
+            "ServerBusy",
+            "InternalServerError",
+            "ServiceUnavailable",
+            "RequestTimeExpired",
+            "RequestTimeTooSkewed",
+        ] {
+            assert!(is_transient_error_code(code), "{code} should be transient");
+        }
+        for code in [
+            "SignatureNotMatch",
+            "Unauthorized",
+            "ParameterInvalid",
+            "PostBodyInvalid",
+            "LogStoreNotExist",
+            "",
+        ] {
+            assert!(!is_transient_error_code(code), "{code} should be permanent");
+        }
+    }
+
+    #[test]
+    fn parse_sls_error_extracts_code_and_masks_body() {
+        let (code, detail) = parse_sls_error(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"errorCode":"SignatureNotMatch","errorMessage":"bad sig"}"#,
+        );
+        assert_eq!(code, "SignatureNotMatch");
+        assert!(detail.contains("SignatureNotMatch"));
+        assert!(detail.contains("403"));
+
+        // Non-envelope body falls back to the raw (truncated) text.
+        let (code, detail) = parse_sls_error(reqwest::StatusCode::BAD_GATEWAY, "<html>502</html>");
+        assert_eq!(code, "");
+        assert!(detail.contains("502"));
+    }
+
+    #[test]
+    fn base_url_prepends_project_for_a_region_host() {
+        assert_eq!(
+            base_url_for("ap-southeast-3.log.aliyuncs.com", "aisix-obs"),
+            "https://aisix-obs.ap-southeast-3.log.aliyuncs.com"
+        );
+        // Trailing slash trimmed.
+        assert_eq!(
+            base_url_for("cn-hangzhou.log.aliyuncs.com/", "p"),
+            "https://p.cn-hangzhou.log.aliyuncs.com"
+        );
+    }
+
+    #[test]
+    fn base_url_uses_a_scheme_qualified_endpoint_verbatim() {
+        // A loopback mock is posted to directly — no `<project>.` prefix.
+        assert_eq!(
+            base_url_for("http://mock-sls:9000", "aisix-obs"),
+            "http://mock-sls:9000"
+        );
+    }
+
+    #[test]
+    fn resolve_credential_maps_reference_to_env_keys() {
+        // The ref folds to an upper `_`-joined slug; both halves come from
+        // `SLS_CRED_<SLUG>_AK_{ID,SECRET}`.
+        let store = |key: &str| match key {
+            "SLS_CRED_SLS_PROD_AK_ID" => Some("akid-123".to_string()),
+            "SLS_CRED_SLS_PROD_AK_SECRET" => Some("secret-456".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_sls_credential_with("sls-prod", store),
+            Some(("akid-123".to_string(), "secret-456".to_string()))
+        );
+        // Case-insensitive: `SLS.Prod` folds to the same slug.
+        assert_eq!(
+            resolve_sls_credential_with("SLS.Prod", store),
+            Some(("akid-123".to_string(), "secret-456".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_credential_is_none_when_unset_or_blank() {
+        // Neither half present.
+        assert_eq!(resolve_sls_credential_with("missing", |_| None), None);
+        // Id present, secret missing → still None (never sign half-credentialed).
+        let id_only = |key: &str| (key == "SLS_CRED_X_AK_ID").then(|| "id".to_string());
+        assert_eq!(resolve_sls_credential_with("x", id_only), None);
+        // Blank value is treated as unset.
+        assert_eq!(
+            resolve_sls_credential_with("x", |_| Some(String::new())),
+            None
+        );
+    }
+}

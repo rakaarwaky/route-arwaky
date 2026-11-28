@@ -1,0 +1,695 @@
+//! `ApiKey` entity — the caller-facing credential presented in
+//! `Authorization: Bearer <plaintext>` (spec §3, §7).
+//!
+//! The control plane (prd-09a §9A.7B.4) stores a KV payload with
+//! **`key_hash`** (SHA-256 hex of the plaintext bearer) instead of
+//! the plaintext. cp-api stores only the hash and shows the
+//! plaintext to the user exactly once at create time. The DP proxy
+//! hashes incoming bearer tokens (`aisix-proxy/src/auth.rs`) and
+//! looks up by the hash. Net security win: no plaintext API key
+//! ever sits in the DB or KV.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use super::taxonomy_rate_limit_vo::RateLimit;
+use crate::taxonomy_resource_vo::Resource;
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ApiKey {
+    /// SHA-256 hexadecimal hash of the plaintext bearer. The proxy hashes
+    /// incoming bearer tokens before lookup.
+    #[schemars(length(min = 1))]
+    pub key_hash: String,
+
+    /// Operator-facing label for this key, as shown in the dashboard.
+    /// Read by the `${request.api_key.name}` header template
+    /// (AISIX-Cloud#1112) and as the `api_key_name` metric label; never
+    /// used for authentication or routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+
+    /// Model names this key may use, matched as single-`*` globs. Read only
+    /// when `allowed_model_ids` is absent; ignored entirely when it is
+    /// present. When both are omitted the key may use no model — model
+    /// access is granted explicitly. Not read at all when `allow_all_models`
+    /// is `true`.
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
+
+    /// Models this key may use, named by resource id rather than by name, so
+    /// renaming a model does not change what this key may reach. Present —
+    /// including as an empty array — it is authoritative and `allowed_models`
+    /// is ignored; each id is resolved against the current models in the
+    /// snapshot and the resolved name is matched with the same single-`*`
+    /// glob rule. An id naming a wildcard model therefore grants every name
+    /// that model's pattern covers — including a name an exact-match model
+    /// of its own serves, which is how the name form behaves too. An id
+    /// matching no model grants nothing.
+    ///
+    /// Set to `null` it means the same as omitted: the key falls back to
+    /// `allowed_models`. A producer must therefore write `[]`, never
+    /// `null`, for a key that is meant to grant no model — the two are
+    /// opposite grants, and an empty list is the one that is authoritative.
+    ///
+    /// Not read at all when `allow_all_models` is `true`, which grants every
+    /// model whatever this list holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_model_ids: Option<Vec<String>>,
+
+    /// Grants every model in the environment, of every kind, including
+    /// models created after this key. When `true` it takes precedence over
+    /// both `allowed_model_ids` and `allowed_models`, which are then not read
+    /// at all. Omitted or `false`, model access is decided by those two
+    /// fields alone. It grants models only: passthrough routes are still
+    /// governed by their own fields.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_all_models: bool,
+
+    /// Request, token, and concurrency limits for this key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<RateLimit>,
+
+    /// Team this API key belongs to. Used for matching team-scope
+    /// rate limit policies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub team_id: Option<String>,
+
+    /// Org member who owns this key. Used for matching member-scope
+    /// rate limit policies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub user_id: Option<String>,
+
+    /// Readable display name of the owning member. Used only for telemetry
+    /// labels alongside `user_id`; never used for authentication or routing.
+    /// Read only when no `users` document exists for `user_id`; when one
+    /// does, its name is used instead. When neither provides a name,
+    /// telemetry reports the user name as `"unknown"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
+
+    /// Cost-attribution tags, as tag key to tag value — for example
+    /// `{"department": "rnd", "subsidiary": "emea"}`. Every request this key
+    /// authenticates is attributed to one value per tag key, resolved when
+    /// the request is made with the nearest setting winning: this key's own
+    /// value, else the value in the `tags` of the team `team_id` names, else
+    /// the value in the `tags` of the member `user_id` names. Different keys
+    /// combine, so a request can carry tags from all three. A request
+    /// authenticated by a JWT takes the value its identity provider's
+    /// `tag_claims` reads from the verified token ahead of all three; nothing
+    /// else in a request sets a tag. Keys match `^[a-z][a-z0-9_]{0,62}$`,
+    /// values are 1 to 128 characters, and at most 32 entries are allowed.
+    /// Omitted or empty means the key adds no tags of its own.
+    #[serde(
+        default,
+        deserialize_with = "crate::models::taxonomy_tags_vo::null_as_empty",
+        skip_serializing_if = "crate::models::Tags::is_empty"
+    )]
+    #[schemars(schema_with = "crate::models::taxonomy_tags_vo::tags_schema")]
+    pub tags: crate::models::Tags,
+
+    /// External identity bound to this key for JWT authentication.
+    /// When a request presents a valid JWT issued by the
+    /// `oidc_providers` entry named in `jwt_provider`, the value of
+    /// that provider's `identity_claim` selects the key whose
+    /// `jwt_subject` equals it, and the request proceeds with this
+    /// key's permissions, rate limits, and budget. The `(jwt_provider,
+    /// jwt_subject)` pair is unique within the environment. When
+    /// omitted, the key is never selected by JWT authentication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub jwt_subject: Option<String>,
+
+    /// Name of the `oidc_providers` entry permitted to assert this
+    /// key's `jwt_subject`. A subject is only ever resolved for the
+    /// trust provider named here, so a second trusted provider cannot
+    /// mint a token impersonating this provider's identity of the same
+    /// name. Required whenever `jwt_subject` is set; ignored otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub jwt_provider: Option<String>,
+
+    /// Passthrough routes this key may use, named by their registered names.
+    /// Entries are matched as single-`*` globs, mirroring `allowed_models`:
+    /// `"*"` grants every route and an entry without a `*` matches one route
+    /// exactly. When omitted, set to `null`, or set to an empty list, the key
+    /// may use no passthrough route — access is granted explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_routes: Option<Vec<String>>,
+
+    /// RFC 3339 timestamp after which the key stops authenticating.
+    /// Requests presenting an expired key are rejected with `401`.
+    /// When omitted or set to `null`, the key never expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+
+    /// Administratively disabled. A disabled key is rejected with `401`
+    /// until it is enabled again; the key itself is preserved. Treated
+    /// as `false` when omitted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
+
+    /// etcd-key uuid. Filled by the loader and never included in the JSON payload.
+    #[serde(skip)]
+    pub(crate) runtime_id: String,
+}
+
+impl ApiKey {
+    /// The key's display name as the `api_key_name` telemetry label reads
+    /// it: `None` when absent or empty, so both report as `unknown`.
+    pub fn telemetry_name(&self) -> Option<&str> {
+        self.display_name.as_deref().filter(|n| !n.is_empty())
+    }
+
+    /// Canonical hash function for converting an `Authorization:
+    /// Bearer <plaintext>` value to the form persisted in the
+    /// snapshot (and on the cp-api side as `api_keys.key_hash`).
+    /// SHA-256, lowercase hex. Both sides MUST use this exact
+    /// function — test fixtures and the `aisix-proxy::auth`
+    /// extractor both call through here.
+    pub fn hash_bearer(plaintext: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(plaintext.as_bytes());
+        hex::encode(h.finalize())
+    }
+
+    /// True if the key's `expires_at` deadline has passed at `now`.
+    /// Keys without a deadline never expire. The comparison is strict
+    /// (`<`): the key is still valid at the deadline instant itself,
+    /// matching the established gateway-ecosystem semantics.
+    pub fn is_expired_at(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at.is_some_and(|deadline| deadline < now)
+    }
+
+    /// True if this key is allowed to call the model the caller addressed.
+    ///
+    /// **The single chokepoint for the key→model ACL.** Every request path
+    /// that gates on model access calls this and nothing else, so the two
+    /// grant shapes below can never diverge across the endpoint family. It
+    /// keys on the caller-addressed entry — the name the request names, or
+    /// the stored name of the entry it references — and never on whatever
+    /// target dispatch later picks, for every model kind.
+    ///
+    /// `allow_all_models` short-circuits everything below: such a key may
+    /// use any name, and neither list is read. Otherwise the key grants
+    /// models one of two ways:
+    ///
+    /// - `allowed_model_ids` present (an empty array included): each id is
+    ///   resolved to the current name of the model carrying it and that name
+    ///   is matched as a single-`*` glob, so an id naming a wildcard model
+    ///   still grants every name its pattern covers. An id resolving to no
+    ///   model grants nothing. `allowed_models` is not read at all.
+    /// - `allowed_model_ids` absent: `allowed_models` names are matched as
+    ///   single-`*` globs — `"*"` grants every model, `"openai/*"` every
+    ///   `openai/*` name, an entry without a `*` matches exactly.
+    ///
+    /// With neither present the key may use no model. Resolution is done per
+    /// request against the live table rather than cached, so a model rename
+    /// takes effect on the next request with no rewrite of any key document.
+    pub fn can_access(&self, snapshot: &super::AisixSnapshot, model_name: &str) -> bool {
+        if self.allow_all_models {
+            return true;
+        }
+        match &self.allowed_model_ids {
+            Some(ids) => ids.iter().any(|id| {
+                snapshot
+                    .models
+                    .get_by_id(id)
+                    .is_some_and(|m| crate::utility_wildcard_match::wildcard_matches(m.value.name(), model_name))
+            }),
+            None => self
+                .allowed_models
+                .iter()
+                .any(|n| crate::utility_wildcard_match::wildcard_matches(n, model_name)),
+        }
+    }
+
+    /// True if this key may use the given passthrough route, named by its
+    /// registered name.
+    ///
+    /// Semantics mirror [`ApiKey::can_access`]: entries are single-`*`
+    /// globs, so `"*"` grants every route; entries without a `*` match
+    /// exactly. A key with no `allowed_routes` (or an empty list) may use no
+    /// passthrough route — access is granted explicitly.
+    pub fn can_access_route(&self, route: &str) -> bool {
+        match &self.allowed_routes {
+            None => false,
+            Some(allowed) => allowed
+                .iter()
+                .any(|r| crate::utility_wildcard_match::wildcard_matches(r, route)),
+        }
+    }
+
+    /// Iterate over the names of models this key may access, filtering them
+    /// against a known universe of model names. Delegates to [`Self::can_access`]
+    /// so the listing can never advertise a name the request path would
+    /// reject, whichever grant shape the key carries.
+    pub fn accessible_models<'a>(
+        &'a self,
+        snapshot: &super::AisixSnapshot,
+        all_models: impl Iterator<Item = &'a str> + 'a,
+    ) -> Vec<&'a str> {
+        all_models
+            .filter(|name| self.can_access(snapshot, name))
+            .collect()
+    }
+}
+
+impl Resource for ApiKey {
+    fn id(&self) -> &str {
+        &self.runtime_id
+    }
+
+    /// For ApiKey the "secondary-indexed" field is `key_hash` — the
+    /// proxy hashes the incoming bearer once and uses that as the
+    /// lookup key. The name-index in the snapshot therefore points
+    /// from key_hash → id.
+    fn name(&self) -> &str {
+        &self.key_hash
+    }
+
+    /// Path segment under `/aisix/<env>/`. v3 (prd-09a §9A.7B.2) uses
+    /// the underscored form `api_keys` to align with cp-api migration
+    /// 008's table name. v2 used `apikeys` with no underscore. The v3
+    /// dp-manager only writes the underscored form.
+    fn kind() -> &'static str {
+        "api_keys"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SHA-256 hex of `"sk-my-api-key-123"`.
+    const SAMPLE_PLAINTEXT: &str = "sk-my-api-key-123";
+    const SAMPLE_HASH: &str = "91ed2dbc407561556f3e7be98ba0bd2a57986d6a868c482d867d19c6d40d201c";
+
+    /// A snapshot holding one model per `(id, display_name)` pair, so an
+    /// `allowed_model_ids` entry has something to resolve against.
+    fn snapshot_with_models(models: &[(&str, &str)]) -> super::super::AisixSnapshot {
+        let snap = super::super::AisixSnapshot::default();
+        for (id, display_name) in models {
+            let model: crate::models::Model = serde_json::from_str(&format!(
+                r#"{{
+                  "display_name": "{display_name}",
+                  "provider": "openai",
+                  "model_name": "gpt-4o",
+                  "provider_key_id": "11111111-1111-1111-1111-111111111111"
+                }}"#
+            ))
+            .unwrap();
+            snap.models
+                .insert(crate::taxonomy_resource_vo::ResourceEntry::new(*id, model, 1));
+        }
+        snap
+    }
+
+    fn empty_snapshot() -> super::super::AisixSnapshot {
+        super::super::AisixSnapshot::default()
+    }
+
+    fn sample() -> ApiKey {
+        serde_json::from_str(&format!(
+            r#"{{
+              "key_hash": "{SAMPLE_HASH}",
+              "allowed_models": ["my-gpt4", "my-claude"],
+              "rate_limit": {{"rpm": 60, "concurrency": 5}}
+            }}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn deserialises_spec_sample() {
+        let k = sample();
+        assert_eq!(k.key_hash, SAMPLE_HASH);
+        assert_eq!(k.allowed_models.len(), 2);
+        assert_eq!(k.rate_limit.as_ref().unwrap().concurrency, Some(5));
+    }
+
+    #[test]
+    fn key_hash_is_sha256_of_plaintext() {
+        // Pin the SAMPLE_HASH constant to its plaintext so future
+        // fixture rotations can't drift one without the other.
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(SAMPLE_PLAINTEXT.as_bytes());
+        let got = hex::encode(h.finalize());
+        assert_eq!(got, SAMPLE_HASH);
+    }
+
+    #[test]
+    fn empty_allowed_models_denies_everything() {
+        let k = ApiKey {
+            key_hash: "abc".into(),
+            display_name: None,
+            allowed_models: vec![],
+            allowed_model_ids: None,
+            allow_all_models: false,
+            rate_limit: None,
+            team_id: None,
+            user_id: None,
+            user_name: None,
+            tags: Default::default(),
+            jwt_subject: None,
+            jwt_provider: None,
+            allowed_routes: None,
+            expires_at: None,
+            disabled: false,
+            runtime_id: String::new(),
+        };
+        let snap = empty_snapshot();
+        assert!(!k.can_access(&snap, "my-gpt4"));
+        assert!(!k.can_access(&snap, "anything"));
+    }
+
+    #[test]
+    fn can_access_checks_whitelist() {
+        let k = sample();
+        let snap = empty_snapshot();
+        assert!(k.can_access(&snap, "my-gpt4"));
+        assert!(k.can_access(&snap, "my-claude"));
+        assert!(!k.can_access(&snap, "other"));
+    }
+
+    #[test]
+    fn wildcard_grants_access_to_any_model() {
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"abc","allowed_models":["*"]}"#).unwrap();
+        let snap = empty_snapshot();
+        assert!(k.can_access(&snap, "my-gpt4"));
+        assert!(k.can_access(&snap, "literally-anything"));
+    }
+
+    #[test]
+    fn glob_entry_grants_matching_names() {
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"abc","allowed_models":["openai/*"]}"#).unwrap();
+        let snap = empty_snapshot();
+        assert!(k.can_access(&snap, "openai/gpt-4o"));
+        assert!(k.can_access(&snap, "openai/gpt-4o-mini"));
+        assert!(!k.can_access(&snap, "anthropic/claude"));
+        assert!(!k.can_access(&snap, "openai")); // prefix must be followed by the glob
+    }
+
+    #[test]
+    fn accessible_models_honors_glob_entry() {
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"abc","allowed_models":["openai/*"]}"#).unwrap();
+        let universe = ["openai/gpt-4o", "openai/o1", "anthropic/claude"];
+        let mut accessible = k.accessible_models(&empty_snapshot(), universe.iter().copied());
+        accessible.sort_unstable();
+        assert_eq!(accessible, vec!["openai/gpt-4o", "openai/o1"]);
+    }
+
+    #[test]
+    fn accessible_models_expands_wildcard_to_full_universe() {
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"abc","allowed_models":["*"]}"#).unwrap();
+        let universe = ["a", "b", "c"];
+        let accessible = k.accessible_models(&empty_snapshot(), universe.iter().copied());
+        assert_eq!(accessible, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn accessible_models_filters_explicit_list() {
+        let k = sample(); // allowed: ["my-gpt4", "my-claude"]
+        let universe = ["my-gpt4", "my-claude", "other"];
+        let mut accessible = k.accessible_models(&empty_snapshot(), universe.iter().copied());
+        accessible.sort_unstable();
+        assert_eq!(accessible, vec!["my-claude", "my-gpt4"]);
+    }
+
+    #[test]
+    fn accessible_models_empty_list_returns_nothing() {
+        let k: ApiKey = serde_json::from_str(r#"{"key_hash":"abc","allowed_models":[]}"#).unwrap();
+        let universe = ["a", "b"];
+        assert!(k
+            .accessible_models(&empty_snapshot(), universe.iter().copied())
+            .is_empty());
+    }
+
+    #[test]
+    fn tolerates_unknown_fields_for_forward_compat() {
+        // cp-api may ship new fields ahead of the DP rolling out; serde
+        // must accept them (the write path still rejects them via
+        // `validate_apikey` in models/schema.rs).
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"x","allowed_models":[],"extra":1}"#).unwrap();
+        assert_eq!(k.key_hash, "x");
+    }
+
+    #[test]
+    fn resource_trait_points_at_key_and_kind() {
+        let mut k = sample();
+        k.runtime_id = "uuid-ak".into();
+        assert_eq!(<ApiKey as Resource>::kind(), "api_keys");
+        assert_eq!(k.id(), "uuid-ak");
+        // Resource::name now returns key_hash, not plaintext.
+        assert_eq!(k.name(), SAMPLE_HASH);
+    }
+
+    #[test]
+    fn deserialises_with_team_and_user_fields() {
+        let k: ApiKey = serde_json::from_str(&format!(
+            r#"{{
+              "key_hash": "{SAMPLE_HASH}",
+              "allowed_models": ["gpt-4o"],
+              "team_id": "team-uuid-1",
+              "user_id": "member-uuid-1",
+              "user_name": "Alice Example"
+            }}"#
+        ))
+        .unwrap();
+        assert_eq!(k.team_id.as_deref(), Some("team-uuid-1"));
+        assert_eq!(k.user_id.as_deref(), Some("member-uuid-1"));
+        assert_eq!(k.user_name.as_deref(), Some("Alice Example"));
+    }
+
+    #[test]
+    fn absent_team_user_fields_default_to_none() {
+        let k = sample();
+        assert!(k.team_id.is_none());
+        assert!(k.user_id.is_none());
+        assert!(k.user_name.is_none());
+    }
+
+    #[test]
+    fn jwt_subject_roundtrips_and_defaults_absent() {
+        // Every pre-existing key payload lacks `jwt_subject`; it must load
+        // as None and stay off the wire so mixed-fleet DPs keep accepting
+        // the row.
+        let legacy = sample();
+        assert!(legacy.jwt_subject.is_none());
+        let v = serde_json::to_value(&legacy).unwrap();
+        assert!(v.get("jwt_subject").is_none());
+
+        let k: ApiKey = serde_json::from_str(
+            r#"{"key_hash":"h","allowed_models":[],"jwt_subject":"agent-billing-01","jwt_provider":"corp-idp"}"#,
+        )
+        .unwrap();
+        assert_eq!(k.jwt_subject.as_deref(), Some("agent-billing-01"));
+        assert_eq!(k.jwt_provider.as_deref(), Some("corp-idp"));
+        let v = serde_json::to_value(&k).unwrap();
+        assert_eq!(v["jwt_subject"], "agent-billing-01");
+        assert_eq!(v["jwt_provider"], "corp-idp");
+    }
+
+    #[test]
+    fn absent_lifecycle_fields_mean_active_forever() {
+        // Every pre-existing key payload lacks `expires_at`/`disabled`;
+        // they must keep authenticating unchanged.
+        let k = sample();
+        assert!(k.expires_at.is_none());
+        assert!(!k.disabled);
+        assert!(!k.is_expired_at(chrono::Utc::now()));
+    }
+
+    #[test]
+    fn explicit_null_expires_at_means_never_expires() {
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_models":[],"expires_at":null}"#)
+                .unwrap();
+        assert!(k.expires_at.is_none());
+        assert!(!k.is_expired_at(chrono::Utc::now()));
+    }
+
+    #[test]
+    fn is_expired_at_honors_deadline() {
+        let k: ApiKey = serde_json::from_str(
+            r#"{"key_hash":"h","allowed_models":[],"expires_at":"2030-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let before = "2029-12-31T23:59:59Z".parse().unwrap();
+        let at = "2030-01-01T00:00:00Z".parse().unwrap();
+        let after = "2030-01-01T00:00:01Z".parse().unwrap();
+        assert!(!k.is_expired_at(before));
+        // Strict comparison: still valid at the deadline instant,
+        // expired strictly after it (ecosystem-aligned boundary).
+        assert!(!k.is_expired_at(at));
+        assert!(k.is_expired_at(after));
+    }
+
+    #[test]
+    fn rejects_malformed_expires_at() {
+        // A non-RFC3339 string must fail deserialization so the loader
+        // rejects the row instead of silently treating the key as
+        // never-expiring. Note the rejection is fail-closed on full
+        // loads/resyncs (the key is absent from the snapshot); on the
+        // incremental watch path a rejected UPDATE keeps the previous
+        // version serving until the next resync (pre-existing
+        // supervisor behavior shared by every resource kind).
+        let r: Result<ApiKey, _> =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_models":[],"expires_at":"tomorrow"}"#);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn disabled_roundtrips_and_defaults_false() {
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_models":[],"disabled":true}"#)
+                .unwrap();
+        assert!(k.disabled);
+        // `disabled: false` is the default and stays off the wire.
+        let v = serde_json::to_value(sample()).unwrap();
+        assert!(v.get("disabled").is_none());
+        assert!(v.get("expires_at").is_none());
+    }
+
+    #[test]
+    fn allowed_model_ids_grant_by_resource_id() {
+        let snap = snapshot_with_models(&[("m-1", "my-gpt4"), ("m-2", "my-claude")]);
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_model_ids":["m-1"]}"#).unwrap();
+        assert!(k.can_access(&snap, "my-gpt4"));
+        assert!(!k.can_access(&snap, "my-claude"));
+    }
+
+    #[test]
+    fn allowed_model_ids_follow_a_rename() {
+        let snap = snapshot_with_models(&[("m-1", "my-gpt4")]);
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_model_ids":["m-1"]}"#).unwrap();
+        assert!(k.can_access(&snap, "my-gpt4"));
+
+        // Same id, new name: the key document is untouched.
+        let renamed = snapshot_with_models(&[("m-1", "my-gpt4-v2")]);
+        assert!(renamed.models.get_by_name("my-gpt4").is_none());
+        assert!(k.can_access(&renamed, "my-gpt4-v2"));
+        assert!(!k.can_access(&renamed, "my-gpt4"));
+    }
+
+    #[test]
+    fn allowed_model_ids_naming_a_wildcard_model_keep_its_pattern() {
+        let snap = snapshot_with_models(&[("m-1", "gpt-*")]);
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_model_ids":["m-1"]}"#).unwrap();
+        assert!(k.can_access(&snap, "gpt-4o"));
+        assert!(!k.can_access(&snap, "claude-sonnet"));
+    }
+
+    #[test]
+    fn allowed_model_ids_win_over_allowed_models() {
+        let snap = snapshot_with_models(&[("m-1", "my-gpt4"), ("m-2", "my-claude")]);
+        let k: ApiKey = serde_json::from_str(
+            r#"{"key_hash":"h","allowed_models":["my-claude"],"allowed_model_ids":["m-1"]}"#,
+        )
+        .unwrap();
+        assert!(k.can_access(&snap, "my-gpt4"));
+        assert!(!k.can_access(&snap, "my-claude"));
+
+        // Even `allowed_models: ["*"]` is ignored once ids are present.
+        let widened: ApiKey = serde_json::from_str(
+            r#"{"key_hash":"h","allowed_models":["*"],"allowed_model_ids":[]}"#,
+        )
+        .unwrap();
+        assert!(!widened.can_access(&snap, "my-gpt4"));
+    }
+
+    #[test]
+    fn allow_all_models_wins_over_both_lists() {
+        let snap = snapshot_with_models(&[("m-1", "my-gpt4"), ("m-2", "my-claude")]);
+        for doc in [
+            r#"{"key_hash":"h","allow_all_models":true,"allowed_model_ids":[]}"#,
+            r#"{"key_hash":"h","allow_all_models":true,"allowed_model_ids":["m-1"]}"#,
+            r#"{"key_hash":"h","allow_all_models":true,"allowed_models":["my-gpt4"]}"#,
+        ] {
+            let k: ApiKey = serde_json::from_str(doc).unwrap();
+            assert!(k.can_access(&snap, "my-gpt4"), "{doc}");
+            assert!(k.can_access(&snap, "my-claude"), "{doc}");
+            // A name no model carries yet: the grant covers models added later.
+            assert!(k.can_access(&snap, "added-later"), "{doc}");
+            assert_eq!(
+                k.accessible_models(&snap, ["my-gpt4", "my-claude"].into_iter()),
+                ["my-gpt4", "my-claude"],
+                "{doc}"
+            );
+        }
+
+        let off: ApiKey = serde_json::from_str(
+            r#"{"key_hash":"h","allow_all_models":false,"allowed_model_ids":["m-1"]}"#,
+        )
+        .unwrap();
+        assert!(off.can_access(&snap, "my-gpt4"));
+        assert!(!off.can_access(&snap, "my-claude"));
+        let off_names: ApiKey = serde_json::from_str(
+            r#"{"key_hash":"h","allow_all_models":false,"allowed_models":["my-claude"]}"#,
+        )
+        .unwrap();
+        assert!(!off_names.can_access(&snap, "my-gpt4"));
+        assert!(off_names.can_access(&snap, "my-claude"));
+        // `false` is the default and stays off the wire.
+        assert!(serde_json::to_value(&off)
+            .unwrap()
+            .get("allow_all_models")
+            .is_none());
+    }
+
+    #[test]
+    fn unresolvable_id_grants_nothing_but_leaves_the_rest() {
+        let snap = snapshot_with_models(&[("m-1", "my-gpt4")]);
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_model_ids":["m-1","m-gone"]}"#)
+                .unwrap();
+        assert!(k.can_access(&snap, "my-gpt4"));
+        assert!(!k.can_access(&snap, "m-gone"));
+        assert!(!k.can_access(&snap, "anything-else"));
+    }
+
+    #[test]
+    fn neither_grant_field_loads_and_denies_everything() {
+        let snap = snapshot_with_models(&[("m-1", "my-gpt4")]);
+        let k: ApiKey = serde_json::from_str(r#"{"key_hash":"h"}"#).unwrap();
+        assert!(k.allowed_models.is_empty());
+        assert!(k.allowed_model_ids.is_none());
+        assert!(!k.can_access(&snap, "my-gpt4"));
+        assert!(!k.can_access(&snap, "*"));
+    }
+
+    #[test]
+    fn allowed_model_ids_stays_off_the_wire_when_absent() {
+        let v = serde_json::to_value(sample()).unwrap();
+        assert!(v.get("allowed_model_ids").is_none());
+
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_model_ids":["m-1"]}"#).unwrap();
+        let v = serde_json::to_value(&k).unwrap();
+        assert_eq!(v["allowed_model_ids"], serde_json::json!(["m-1"]));
+    }
+
+    #[test]
+    fn accessible_models_follows_the_id_grant() {
+        let snap = snapshot_with_models(&[("m-1", "my-gpt4"), ("m-2", "my-claude")]);
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_model_ids":["m-2"]}"#).unwrap();
+        let names = ["my-gpt4", "my-claude"];
+        assert_eq!(
+            k.accessible_models(&snap, names.iter().copied()),
+            vec!["my-claude"]
+        );
+    }
+}

@@ -27,25 +27,25 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
-pub mod bridge;
-pub mod chat;
-pub mod content_part;
-pub mod credential;
-pub mod dns_cache;
-pub mod hub;
-pub mod media_fetch;
-pub mod response_tap;
-pub mod sse;
-pub mod ssrf;
-pub mod structured_output;
-pub mod tool_calls;
-pub mod upstream_dial;
-pub mod upstream_headers;
-pub mod upstream_http;
-pub mod upstream_tls;
-pub mod url_cache;
+pub mod surface_bridge_controller;
+pub use aisix_core::taxonomy_chat_vo;
+pub use aisix_core::taxonomy_content_part_vo;
+pub use aisix_core::utility_credential_fingerprint;
+pub mod surface_dns_cache_store;
+pub mod surface_hub_router;
+pub mod surface_media_fetch_action;
+pub mod surface_response_tap_view;
+pub mod surface_sse_view;
+pub mod surface_ssrf_guard_action;
+pub mod surface_structured_output_action;
+pub mod surface_tool_calls_action;
+pub mod surface_upstream_dial_action;
+pub mod surface_upstream_headers_action;
+pub mod surface_upstream_http_controller;
+pub mod surface_upstream_tls_component;
+pub mod surface_url_cache_store;
 
-pub use bridge::{
+pub use surface_bridge_controller::{
     capture_in_band_error, capture_in_band_error_value, capture_upstream_error_http,
     content_type_is_json, decode_success_body, in_band_error_body, in_band_error_in_body,
     in_band_error_reported, parse_retry_after, read_body_capped, response_is_json, truncate_lossy,
@@ -54,32 +54,32 @@ pub use bridge::{
     ChatChunkStream, UpstreamErrorBody, UpstreamErrorView, UpstreamWire,
     MAX_UPSTREAM_ERROR_BODY_BYTES, MAX_UPSTREAM_ERROR_MESSAGE_BYTES,
 };
-pub use chat::{
+pub use taxonomy_chat_vo::{
     CacheCreationTtl, ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, EmbeddingObject,
     EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingUsageSource, EmbeddingVector,
     FinishReason, ModalityTokens, OpenAiUsageDetails, ReportedCounts, Role, ServiceTier,
     UsageStats,
 };
-pub use credential::credential_fingerprint;
-pub use hub::{upstream_protocol, Hub, UPSTREAM_PROTOCOL_UNKNOWN};
-pub use response_tap::{
+pub use utility_credential_fingerprint::credential_fingerprint;
+pub use surface_hub_router::{upstream_protocol, Hub, UPSTREAM_PROTOCOL_UNKNOWN};
+pub use surface_response_tap_view::{
     capture_header_values, note_upstream_error_body, note_upstream_response, provider_request_id,
     wants_upstream_error_body, warn_error_body_unread, ResponseHeaderTap, UpstreamResponseCapture,
     PROVIDER_REQUEST_ID_HEADERS,
 };
-pub use sse::{SseDecoder, SseEvent, SseFrameTooLarge};
-pub use structured_output::{
+pub use surface_sse_view::{SseDecoder, SseEvent, SseFrameTooLarge};
+pub use surface_structured_output_action::{
     apply_schema_limits, close_object_schemas, json_schema_from_response_format,
     response_into_fake_stream_chunks, seal_object_schemas, unwrap_json_tool_call, SchemaLimits,
     JSON_TOOL_DESCRIPTION, JSON_TOOL_NAME,
 };
-pub use upstream_headers::{
+pub use surface_upstream_headers_action::{
     apply_request_headers, client_header_forwardable, header_forward_blocked,
     resolve_default_headers, resolve_extra_headers, CallerIdentity, ForwardedClientHeaders,
     UpstreamHeaderContext,
 };
-pub use upstream_http::{
+pub use surface_upstream_http_controller::{
     client_builder, error_with_causes, json_body, log_body_read_causes, send_error,
     transport_error_message, upstream_body_read_error, UpstreamHttpConfig,
 };
-pub use upstream_tls::TlsSettings;
+pub use surface_upstream_tls_component::TlsSettings;

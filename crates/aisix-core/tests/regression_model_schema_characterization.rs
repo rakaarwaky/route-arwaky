@@ -11,7 +11,7 @@
 //! validator wrongly rejected them even though the `RateLimit` struct and the
 //! rate limiter support them, so they now ACCEPT — the deliberate bug fix.
 
-use aisix_core::models::schema::{unknown_field_paths, validate_model};
+use aisix_core::models::taxonomy_schema_vo::{unknown_field_paths, validate_model};
 use serde_json::{json, Value};
 
 /// Assert that the current `validate_model` ACCEPTS `value`.

@@ -7,7 +7,7 @@
 //! One table per resource; the label is printed on failure so the offending
 //! case is obvious. New resources append their own table as they migrate.
 
-use aisix_core::models::schema::{
+use aisix_core::models::taxonomy_schema_vo::{
     resource_root_schema, unknown_field_paths, validate_apikey, validate_cache_policy,
     validate_guardrail, validate_guardrail_attachment, validate_observability_exporter,
     validate_provider_key, validate_rate_limit_policy, RESOURCES,
@@ -27,7 +27,7 @@ use std::path::Path;
 #[track_caller]
 fn check(
     resource: &str,
-    validate: fn(&Value) -> Result<(), aisix_core::models::schema::SchemaError>,
+    validate: fn(&Value) -> Result<(), aisix_core::models::taxonomy_schema_vo::SchemaError>,
     cases: &[(&str, bool, Value)],
 ) {
     for (label, expect_accept, payload) in cases {

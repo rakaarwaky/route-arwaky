@@ -19,14 +19,14 @@ use aisix_core::models::{
     GuardrailHookPoint, GuardrailInputMessages, GuardrailKind, GuardrailMonitorHit,
     GuardrailScopeType, KeywordPattern,
 };
-use aisix_core::snapshot::ResourceTable;
+use aisix_core::taxonomy_snapshot_vo::ResourceTable;
 use aisix_core::{ConfigStatus, IncomingRejection, SnapshotHandle};
 use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
 
-use crate::index::{GuardrailIndex, RequestContext, ScopeKind};
-use crate::keyword::{KeywordBlocklist, KeywordRule};
-use crate::pii::{builtin_rule, PiiAction, PiiGuardrail, PiiRule};
+use crate::surface_guardrail_index_store::{GuardrailIndex, RequestContext, ScopeKind};
+use crate::surface_keyword_guardrail_action::{KeywordBlocklist, KeywordRule};
+use crate::surface_pii_guard_action::{builtin_rule, PiiAction, PiiGuardrail, PiiRule};
 use crate::{
     Guardrail, GuardrailChain, GuardrailEmbedderSlot, GuardrailVerdict, Redaction, SegmentsOutcome,
     StreamOutputPolicy,
@@ -46,7 +46,7 @@ use crate::{
 /// still deterministic.
 fn sorted_guardrail_entries(
     table: &ResourceTable<DomainGuardrail>,
-) -> Vec<Arc<aisix_core::resource::ResourceEntry<DomainGuardrail>>> {
+) -> Vec<Arc<aisix_core::taxonomy_resource_vo::ResourceEntry<DomainGuardrail>>> {
     let mut entries = table.entries();
     entries.sort_by(|a, b| {
         let ka = (
@@ -191,7 +191,7 @@ struct GuardrailInstances {
 }
 
 struct MemoSlot {
-    row: Arc<aisix_core::resource::ResourceEntry<DomainGuardrail>>,
+    row: Arc<aisix_core::taxonomy_resource_vo::ResourceEntry<DomainGuardrail>>,
     outcome: Result<Option<Arc<dyn Guardrail>>, GuardrailBuildRejection>,
 }
 
@@ -207,7 +207,7 @@ struct BuildReuse {
 impl GuardrailInstances {
     fn instance(
         &mut self,
-        entry: &Arc<aisix_core::resource::ResourceEntry<DomainGuardrail>>,
+        entry: &Arc<aisix_core::taxonomy_resource_vo::ResourceEntry<DomainGuardrail>>,
         embedder: &GuardrailEmbedderSlot,
         reuse: &mut BuildReuse,
     ) -> Result<Option<Arc<dyn Guardrail>>, GuardrailBuildRejection> {
@@ -392,7 +392,7 @@ fn build_one_inner(
             // the api_key at projection time; the config carries plaintext.
             // Endpoint is per-row (default api.lakera.ai, overridable for
             // regional/self-hosted deployments and tests).
-            let g = crate::lakera::LakeraGuardrail::new(
+            let g = crate::surface_lakera_guardrail_action::LakeraGuardrail::new(
                 row.name.clone(),
                 cfg,
                 row.hook_point,
@@ -418,7 +418,7 @@ fn build_one_inner(
                     });
                 }
             }
-            let g = crate::openai_moderation::OpenaiModerationGuardrail::new(
+            let g = crate::surface_openai_moderation_action::OpenaiModerationGuardrail::new(
                 row.name.clone(),
                 cfg,
                 row.hook_point,
@@ -449,13 +449,13 @@ fn build_one_inner(
                     entity_actions.insert(e.entity_type.to_uppercase(), action);
                 }
             }
-            let anonymizers = crate::presidio::operator_config(&cfg.operator).ok_or_else(|| {
+            let anonymizers = crate::surface_presidio_guardrail_action::operator_config(&cfg.operator).ok_or_else(|| {
                 BuildError::InvalidValue {
                     field: "operator",
                     value: cfg.operator.clone(),
                 }
             })?;
-            let g = crate::presidio::PresidioGuardrail::new(
+            let g = crate::surface_presidio_guardrail_action::PresidioGuardrail::new(
                 row.name.clone(),
                 cfg,
                 row.hook_point,
@@ -484,7 +484,7 @@ fn build_one_inner(
             let Some(embedder) = embedder.get() else {
                 return Err(BuildError::EmbedderUnavailable);
             };
-            let g = crate::semantic::SemanticGuardrail::new(
+            let g = crate::surface_semantic_guardrail_action::SemanticGuardrail::new(
                 &row.name,
                 cfg,
                 row.hook_point,
@@ -512,7 +512,7 @@ fn build_one_inner(
             // path. The refusal is logged and published through config
             // status; `aisix validate` reports it synchronously, and cp-api's
             // own esbuild pass catches it at save time.
-            let g = crate::custom::CustomGuardrail::new(
+            let g = crate::surface_custom_guardrail_action::CustomGuardrail::new(
                 row.name.clone(),
                 cfg,
                 row.hook_point,
@@ -571,7 +571,7 @@ enum BuildError {
     /// engine's own message, which names the offending line and column, so
     /// the operator sees the same diagnostic their editor would show.
     #[error("custom guardrail script does not compile: {0}")]
-    ScriptCompile(crate::custom::CompileError),
+    ScriptCompile(crate::surface_custom_guardrail_action::CompileError),
 }
 
 impl BuildError {
@@ -1787,7 +1787,7 @@ impl LiveGuardrailIndex {
 mod tests {
     use super::*;
     use aisix_core::models::Guardrail as DomainGuardrail;
-    use aisix_core::resource::ResourceEntry;
+    use aisix_core::taxonomy_resource_vo::ResourceEntry;
     use aisix_gateway::{ChatFormat, ChatMessage};
 
     fn entry(_name: &str, id: &str, row: DomainGuardrail) -> ResourceEntry<DomainGuardrail> {
@@ -3941,7 +3941,7 @@ mod tests {
         for _ in 0..5 {
             let next = handle.load().as_ref().clone();
             next.apikeys
-                .insert(aisix_core::resource::ResourceEntry::new(
+                .insert(aisix_core::taxonomy_resource_vo::ResourceEntry::new(
                     "k-1",
                     serde_json::from_str::<aisix_core::models::ApiKey>(
                         r#"{"key_hash":"abc","allowed_models":["m"]}"#,

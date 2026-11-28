@@ -1,5 +1,5 @@
-use aisix_core::resource::{Resource, ResourceEntry};
-use aisix_core::snapshot::ResourceTable;
+use aisix_core::taxonomy_resource_vo::{Resource, ResourceEntry};
+use aisix_core::taxonomy_snapshot_vo::ResourceTable;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 

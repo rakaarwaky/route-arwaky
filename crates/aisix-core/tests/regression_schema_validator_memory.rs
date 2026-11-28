@@ -12,7 +12,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicIsize, Ordering};
 
-use aisix_core::models::schema::{LENIENT_SCHEMAS, SCHEMAS};
+use aisix_core::models::taxonomy_schema_vo::{LENIENT_SCHEMAS, SCHEMAS};
 
 struct CountingAllocator;
 
