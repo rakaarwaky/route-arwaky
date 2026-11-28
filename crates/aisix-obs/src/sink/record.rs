@@ -92,20 +92,14 @@ impl ContentEncoding<'_> {
     /// whatever was not structured, written even when empty, as these
     /// sinks always have.
     pub fn flat_prompt(&self) -> Option<&str> {
-        self.raw_prompt.or(self
-            .structured
-            .input_messages
-            .is_none()
-            .then_some(""))
+        self.raw_prompt
+            .or(self.structured.input_messages.is_none().then_some(""))
     }
 
     /// The flat response counterpart of [`Self::flat_prompt`].
     pub fn flat_response(&self) -> Option<&str> {
-        self.raw_response.or(self
-            .structured
-            .output_messages
-            .is_none()
-            .then_some(""))
+        self.raw_response
+            .or(self.structured.output_messages.is_none().then_some(""))
     }
 }
 

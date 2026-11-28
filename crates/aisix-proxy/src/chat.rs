@@ -1634,9 +1634,7 @@ async fn dispatch(
     // Split moderation: local/blob members check first (on the original
     // text), then the segment pass runs the Bedrock call and writes
     // ANONYMIZE masks back into `req` (#932 bedrock follow-up).
-    let (input_verdict, hits) = resolved_chain
-        .check_input_non_segment_observed(req)
-        .await;
+    let (input_verdict, hits) = resolved_chain.check_input_non_segment_observed(req).await;
     monitor_hits_out.extend(hits);
     // The segment walker below borrows `req` mutably, so the addressed
     // model the check pass just read from `req.model` is taken first.
@@ -1876,9 +1874,7 @@ async fn dispatch(
                 ));
                 continue 'targets;
             };
-            let Some(target) =
-                ChatTargetBridge::resolve(state, model, &pk_entry.value)
-            else {
+            let Some(target) = ChatTargetBridge::resolve(state, model, &pk_entry.value) else {
                 last_reserve_reject = None;
                 last_err = Some(BridgeError::Config(
                     "no bridge registered for provider_key".into(),
@@ -2755,9 +2751,9 @@ async fn dispatch(
         // attempt knows which format it requested for the media part.
         let resolved = resolved.filter(|(cached, _, _)| {
             cached.messages().all(|m| {
-                !m.extra.get("audio").is_some_and(|audio| {
-                    audio["data"].is_string() && !audio["format"].is_string()
-                })
+                !m.extra
+                    .get("audio")
+                    .is_some_and(|audio| audio["data"].is_string() && !audio["format"].is_string())
             })
         });
         match resolved {
@@ -2960,8 +2956,7 @@ async fn dispatch(
                         completion.min(u64::from(u32::MAX)) as u32,
                     );
                 }
-                let (mut response, captured_content) =
-                    unary_openai(now, cached, &req, content_cap);
+                let (mut response, captured_content) = unary_openai(now, cached, &req, content_cap);
                 if state.expose_debug_headers {
                     response
                         .headers_mut()
@@ -3099,8 +3094,7 @@ async fn dispatch(
         // (ProviderKey.adapter). The legacy `Provider`-keyed registry
         // is gone after #302 Phase A; a PK that matches neither tier is
         // a misconfiguration and surfaces as 503.
-        let Some(target) = ChatTargetBridge::resolve(state, model, &pk_entry.value)
-        else {
+        let Some(target) = ChatTargetBridge::resolve(state, model, &pk_entry.value) else {
             last_reserve_reject = None;
             last_err = Some(BridgeError::Config(format!(
                 "no bridge registered for provider_key provider={:?} adapter={:?}",
@@ -4626,8 +4620,7 @@ async fn dispatch_ensemble(
             acc.saturating_add(&p.usage)
         });
     outcome.response.usage = aggregate_usage.clone();
-    let (response, _) =
-        unary_openai(created_ts, outcome.response, &req, None);
+    let (response, _) = unary_openai(created_ts, outcome.response, &req, None);
     Ok(Success {
         response,
         // No single provider/model/key governs an ensemble response.
@@ -6192,7 +6185,10 @@ fn stream_error_event(payload: String) -> Event {
 
 /// OpenAI-wire SSE guardrail-block frame for the output path.
 fn guardrail_stream_event(name: Option<&str>, unavailable: Option<&str>) -> Event {
-    stream_error_event(crate::error::guardrail_block_frame_payload(name, unavailable))
+    stream_error_event(crate::error::guardrail_block_frame_payload(
+        name,
+        unavailable,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]

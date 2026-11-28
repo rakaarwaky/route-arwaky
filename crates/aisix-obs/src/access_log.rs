@@ -563,7 +563,7 @@ mod tests {
                 routing_fallback_count: Some(1),
                 error_kind: None,
                 error: None,
-                    cache: None,
+                cache: None,
                 request_body_bytes: Some(123),
                 response_body_bytes: Some(4567),
             }
@@ -663,7 +663,7 @@ mod tests {
                 routing_fallback_count: None,
                 error_kind: Some("timeout"),
                 error: Some("upstream request timed out after 7167ms"),
-                    cache: None,
+                cache: None,
                 request_body_bytes: None,
                 response_body_bytes: None,
             }
@@ -719,7 +719,7 @@ mod tests {
                 routing_fallback_count: None,
                 error_kind: None,
                 error: None,
-                    cache: None,
+                cache: None,
                 request_body_bytes: None,
                 response_body_bytes: None,
             }
@@ -782,7 +782,7 @@ mod tests {
                 routing_fallback_count: None,
                 error_kind: None,
                 error: None,
-                    cache: Some(CacheAccessLog {
+                cache: Some(CacheAccessLog {
                     status: "hit",
                     hit_layer: Some("semantic"),
                 }),
@@ -838,7 +838,7 @@ mod tests {
                 routing_fallback_count: None,
                 error_kind: None,
                 error: None,
-                    cache: Some(CacheAccessLog {
+                cache: Some(CacheAccessLog {
                     status: "miss",
                     hit_layer: None,
                 }),
@@ -978,10 +978,7 @@ mod tests {
         assert!(!lines[0].contains("semantic_fallback"), "{out}");
         assert!(!lines[1].contains("semantic_route"), "{out}");
         assert!(lines[1].contains("semantic_score=0.2"), "{out}");
-        assert!(
-            lines[1].contains("semantic_fallback=\"no_match\""),
-            "{out}"
-        );
+        assert!(lines[1].contains("semantic_fallback=\"no_match\""), "{out}");
         assert!(!lines[0].contains("semantic_pinned"), "{out}");
         assert!(!lines[1].contains("semantic_pinned"), "{out}");
         assert!(lines[2].contains("semantic_route=\"code\""), "{out}");

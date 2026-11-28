@@ -6142,12 +6142,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            [
-                "shell",
-                "tool_search",
-                "docs__ns__read",
-                "docs__ns__search"
-            ]
+            ["shell", "tool_search", "docs__ns__read", "docs__ns__search"]
         );
         assert_eq!(tools[1]["function"]["description"], "Find tools.");
         assert!(!tools.to_string().contains("defer_loading"));

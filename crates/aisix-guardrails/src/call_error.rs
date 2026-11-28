@@ -19,8 +19,6 @@
 // `error_kind` are used unconditionally.
 #![cfg_attr(
     not(any(
-        feature = "azure-content-safety",
-        feature = "aliyun-text-moderation",
         feature = "lakera",
         feature = "openai-moderation",
         feature = "presidio",

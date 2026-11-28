@@ -2962,10 +2962,7 @@ fn append_responses_item_strings(
     excluded.extend(["call_id", "approval_request_id"]);
     if kind.ends_with("_call")
         || kind.ends_with("_call_output")
-        || matches!(
-            kind,
-            "item_reference" | "reasoning"
-        )
+        || matches!(kind, "item_reference" | "reasoning")
     {
         excluded.push("id");
     }
@@ -3341,12 +3338,10 @@ fn responses_direct_stream_event(kind: &str) -> Option<ResponsesDirectStreamEven
             fields: &["refusal"],
             content_index: true,
         }),
-        "response.function_call_arguments.delta" => {
-            Some(ResponsesDirectStreamEvent {
-                fields: &["delta"],
-                content_index: false,
-            })
-        }
+        "response.function_call_arguments.delta" => Some(ResponsesDirectStreamEvent {
+            fields: &["delta"],
+            content_index: false,
+        }),
         "response.function_call_arguments.done" => Some(ResponsesDirectStreamEvent {
             fields: &["name", "arguments"],
             content_index: false,
@@ -5877,7 +5872,9 @@ fn frame_parts_and_tier(
         let report = match metering {
             Metering::Chat => {
                 if v.get("usage").is_some() {
-                    v.get("usage").and_then(openai_chat_usage).map(PassthroughUsage::from_stats)
+                    v.get("usage")
+                        .and_then(openai_chat_usage)
+                        .map(PassthroughUsage::from_stats)
                 } else {
                     None
                 }

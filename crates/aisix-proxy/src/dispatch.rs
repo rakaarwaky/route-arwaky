@@ -1218,10 +1218,7 @@ mod tests {
                 ),
             );
             let m = model_on("byo", "pk-1");
-            for surface in [
-                ApiSurface::Responses,
-                ApiSurface::Messages,
-            ] {
+            for surface in [ApiSurface::Responses, ApiSurface::Messages] {
                 assert!(
                     !serves_natively(&snap, &m, surface),
                     "{adapter} must not dispatch {surface:?} natively"
@@ -1256,7 +1253,6 @@ mod tests {
             );
         }
     }
-
 
     /// An empty `base` resolves as "no override" rather than building a
     /// URL from an empty string. The read schema deliberately allows it

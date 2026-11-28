@@ -406,7 +406,6 @@ impl ProxyState {
             Arc::new(crate::shared_store::MemoryStore::default());
         let guardrail_index = LiveGuardrailIndex::new_with_sink(
             snapshot.clone(),
-            None,
             Some(metrics.clone()),
             guardrail_embedder_slot(&hub, &snapshot, &semantic_cache),
         );
@@ -477,7 +476,6 @@ impl ProxyState {
             Arc::new(crate::shared_store::MemoryStore::default());
         let guardrail_index = LiveGuardrailIndex::new_with_sink(
             snapshot.clone(),
-            None,
             Some(metrics.clone()),
             guardrail_embedder_slot(&hub, &snapshot, &semantic_cache),
         );
@@ -535,7 +533,6 @@ impl ProxyState {
             Arc::new(crate::shared_store::MemoryStore::default());
         let guardrail_index = LiveGuardrailIndex::new_with_sink(
             snapshot.clone(),
-            None,
             Some(metrics.clone()),
             guardrail_embedder_slot(&hub, &snapshot, &semantic_cache),
         );
@@ -604,7 +601,7 @@ impl ProxyState {
 
     /// Replace the guardrail index. Used by the server bootstrap to
     /// wire a live snapshot-backed index; tests can substitute a
-    /// deterministic one via `LiveGuardrailIndex::new(stub_handle, None)`.
+    /// deterministic one via `LiveGuardrailIndex::new(stub_handle)`.
     pub fn with_guardrail_index(mut self, index: Arc<LiveGuardrailIndex>) -> Self {
         Arc::make_mut(&mut self.inner).guardrail_index = index;
         self

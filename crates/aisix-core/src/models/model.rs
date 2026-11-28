@@ -488,12 +488,7 @@ fn model_one_of_variant(strict: bool) -> Value {
         // top-level value is dead — as are the model-specific knobs.
         extend(
             &mut arr[0],
-            &[
-                "retries",
-                "cost",
-                "pricing_key",
-                "effort_mapping",
-            ],
+            &["retries", "cost", "pricing_key", "effort_mapping"],
         );
         // The direct-shaped branch also carries embedding models. They do
         // not accept generation effort, so forbid the mapping only when the
@@ -518,14 +513,7 @@ fn model_one_of_variant(strict: bool) -> Value {
         // semantic: top-level timeout/stream_timeout/retries ARE the group
         // slots (no routing block to carry them); the model-specific knobs
         // stay direct-only.
-        extend(
-            &mut arr[3],
-            &[
-                "cost",
-                "pricing_key",
-                "effort_mapping",
-            ],
-        );
+        extend(&mut arr[3], &["cost", "pricing_key", "effort_mapping"]);
     }
     variants
 }

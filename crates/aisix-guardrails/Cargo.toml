@@ -19,16 +19,6 @@ thiserror.workspace = true
 tracing.workspace = true
 regex.workspace = true
 
-# kind=bedrock guardrail (PRD-09c §6 Phase 2). Behind a default
-# feature so a build that never touches Bedrock can opt out via
-# `--no-default-features` on this crate to avoid the AWS SDK
-# transitive cost (~30s cold build + ~150 transitive crates).
-aws-config = { workspace = true, optional = true }
-aws-sdk-bedrockruntime = { workspace = true, optional = true }
-aws-credential-types = { workspace = true, optional = true }
-aws-smithy-async = { workspace = true, optional = true }
-aws-smithy-runtime-api = { workspace = true, optional = true }
-
 # HTTP client shared by every remote guardrail kind. Unconditional
 # because kind=custom is always compiled in and its host `fetch` needs it.
 reqwest.workspace = true
@@ -46,10 +36,7 @@ rquickjs.workspace = true
 sha2.workspace = true
 hex.workspace = true
 
-# kind=aliyun_text_moderation guardrail (#603). The Aliyun green-cip
-# TextModerationPlus call is signed (RPC signature v1, HMAC-SHA1) and POSTed
-# over the shared reqwest client. There is no official Aliyun Rust SDK, so the
-# RPC signature is hand-rolled with these primitives (all workspace deps).
+# Signing, encoding, time and IDs used by custom guardrail scripts.
 hmac.workspace = true
 sha1.workspace = true
 base64.workspace = true
@@ -58,25 +45,10 @@ uuid.workspace = true
 
 [features]
 default = [
-    "bedrock",
-    "azure-content-safety",
-    "aliyun-text-moderation",
     "lakera",
     "openai-moderation",
     "presidio",
 ]
-bedrock = [
-    "dep:aws-config",
-    "dep:aws-sdk-bedrockruntime",
-    "dep:aws-credential-types",
-    "dep:aws-smithy-async",
-    "dep:aws-smithy-runtime-api",
-    # So the guardrail's Bedrock client trusts the same roots the
-    # provider bridge's does.
-    "aisix-gateway/aws",
-]
-azure-content-safety = []
-aliyun-text-moderation = []
 # kind=lakera / kind=openai_moderation / kind=presidio guardrails (#52).
 # Plain HTTP dispatchers over the shared reqwest client.
 lakera = []

@@ -1809,18 +1809,6 @@ fn document_former_apikeys_paths(doc: &mut Value) {
 fn add_variant_titles(doc: &mut Value) {
     let variant_titles: &[(&str, &[&str])] = &[
         (
-            "/components/schemas/BedrockAWSCredentials/oneOf",
-            &[
-                "Static credentials",
-                "Bedrock API key",
-                "Default credential chain",
-            ],
-        ),
-        (
-            "/components/schemas/BedrockLatencyMode/oneOf",
-            &["Serial", "Timed"],
-        ),
-        (
             "/components/schemas/CacheScope/oneOf",
             &["Per API key", "Environment-wide"],
         ),
@@ -1828,11 +1816,6 @@ fn add_variant_titles(doc: &mut Value) {
             "/components/schemas/Guardrail/oneOf",
             &[
                 "Keyword",
-                "AWS Bedrock",
-                "Azure AI Content Safety Prompt Shield",
-                "Azure AI Content Safety Text Moderation",
-                "Aliyun Text Moderation",
-                "Aliyun AI Guardrails",
                 "PII Detection and Redaction",
                 "Lakera Guard",
                 "OpenAI Moderation",
@@ -2753,17 +2736,6 @@ mod tests {
     async fn openapi_guardrail_variants_keep_their_own_metadata() {
         let expected_titles = [
             ("keyword", "Keyword"),
-            ("bedrock", "AWS Bedrock"),
-            (
-                "azure_content_safety",
-                "Azure AI Content Safety Prompt Shield",
-            ),
-            (
-                "azure_content_safety_text_moderation",
-                "Azure AI Content Safety Text Moderation",
-            ),
-            ("aliyun_text_moderation", "Aliyun Text Moderation"),
-            ("aliyun_ai_guardrail", "Aliyun AI Guardrails"),
             ("pii", "PII Detection and Redaction"),
             ("lakera", "Lakera Guard"),
             ("openai_moderation", "OpenAI Moderation"),

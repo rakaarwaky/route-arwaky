@@ -21,8 +21,7 @@
 
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{
-    ApiKey, CachePolicy, Guardrail, Model, ObservabilityExporter,
-    PassthroughRoute, ProviderKey,
+    ApiKey, CachePolicy, Guardrail, Model, ObservabilityExporter, PassthroughRoute, ProviderKey,
 };
 use aisix_etcd::{kv_client, CallError, LazyEtcdClient};
 use etcd_client::GetOptions;

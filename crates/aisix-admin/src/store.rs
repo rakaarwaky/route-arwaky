@@ -9,8 +9,7 @@
 
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{
-    ApiKey, CachePolicy, Guardrail, Model, ObservabilityExporter,
-    PassthroughRoute, ProviderKey,
+    ApiKey, CachePolicy, Guardrail, Model, ObservabilityExporter, PassthroughRoute, ProviderKey,
 };
 use dashmap::DashMap;
 use std::sync::Arc;

@@ -83,15 +83,13 @@ fn snapshot() -> AisixSnapshot {
     .expect("valid api key");
     snap.apikeys.insert(ResourceEntry::new("ak-1", key, 1));
 
-    for (id, name, provider, adapter, base) in [
-        (
-            PK_ID,
-            "openai-up",
-            "openai",
-            "openai",
-            format!("{DEAD_UPSTREAM}/v1"),
-        ),
-    ] {
+    for (id, name, provider, adapter, base) in [(
+        PK_ID,
+        "openai-up",
+        "openai",
+        "openai",
+        format!("{DEAD_UPSTREAM}/v1"),
+    )] {
         let pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
             "display_name": name,
             "api_key": "sk-unused",

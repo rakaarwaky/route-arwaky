@@ -49,14 +49,9 @@ pub(crate) fn upstream_facts(
             ..UpstreamFacts::default()
         };
         return Some(
-            match pk.and_then(|p| {
-                upstream_base(
-                    model,
-                    p,
-                    &event.operation,
-                    declares_additional_tools,
-                )
-            }) {
+            match pk
+                .and_then(|p| upstream_base(model, p, &event.operation, declares_additional_tools))
+            {
                 Some(base) => facts.with_base_url(&base),
                 None => facts,
             },

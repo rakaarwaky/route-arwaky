@@ -1068,8 +1068,8 @@ mod tests {
     async fn status_models_store_failure_never_leaks_backend_detail() {
         use aisix_core::resource::ResourceEntry;
         use aisix_core::{
-            ApiKey, CachePolicy, Guardrail, Model, ObservabilityExporter,
-            PassthroughRoute, ProviderKey,
+            ApiKey, CachePolicy, Guardrail, Model, ObservabilityExporter, PassthroughRoute,
+            ProviderKey,
         };
 
         // A store whose every call fails with backend detail an anonymous
@@ -1141,8 +1141,8 @@ mod tests {
     async fn status_models_answers_the_fixed_500_when_the_store_hangs() {
         use aisix_core::resource::ResourceEntry;
         use aisix_core::{
-            ApiKey, CachePolicy, Guardrail, Model, ObservabilityExporter,
-            PassthroughRoute, ProviderKey,
+            ApiKey, CachePolicy, Guardrail, Model, ObservabilityExporter, PassthroughRoute,
+            ProviderKey,
         };
 
         // A store whose every call never resolves (mimics a blackholed

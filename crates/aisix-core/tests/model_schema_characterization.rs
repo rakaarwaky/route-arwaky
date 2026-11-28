@@ -169,14 +169,6 @@ fn strict_rejects_dead_knobs_per_kind_but_lenient_loads_them() {
             }),
         ),
         (
-            "routing + auto_prompt_caching",
-            json!({
-                "display_name": "r",
-                "routing": {"targets": [{"model": "m"}]},
-                "auto_prompt_caching": {"enabled": true}
-            }),
-        ),
-        (
             "ensemble + timeout",
             json!({
                 "display_name": "e",

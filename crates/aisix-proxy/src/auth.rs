@@ -611,8 +611,7 @@ fn raw_credential(
 }
 
 fn extract_bearer(parts: &Parts) -> Result<String, ProxyError> {
-    header_credential(&parts.headers)
-        .unwrap_or(Err(ProxyError::MissingAuth(AUTHORIZATION_LABEL)))
+    header_credential(&parts.headers).unwrap_or(Err(ProxyError::MissingAuth(AUTHORIZATION_LABEL)))
 }
 
 #[cfg(test)]
