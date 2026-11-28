@@ -73,13 +73,14 @@ fn enable_jemalloc_background_thread() -> Result<bool, tikv_jemalloc_ctl::Error>
     outcome
 }
 
-mod cert_bundle;
-mod dp_store;
+mod surface_cert_bundle_store;
+mod surface_dp_store;
 mod export;
-mod heartbeat;
-mod managed_bundle;
-mod proxy_protocol;
-mod telemetry;
+mod surface_heartbeat_controller;
+mod surface_managed_bundle_store;
+mod surface_proxy_protocol_component;
+mod surface_telemetry_controller;
+mod surface_telemetry_clip_action;
 
 use aisix_admin::{AdminState, ConfigStore, EtcdConfigStore, FileManagedStore};
 use aisix_cache::{Cache, MemoryCache};
@@ -92,9 +93,10 @@ use aisix_etcd::{EtcdConfigProvider, SnapshotCache, Supervisor, WatchedPrefix};
 use aisix_gateway::{Hub, UpstreamHttpConfig};
 use aisix_obs::{init_tracing, Metrics};
 use aisix_provider_openai::OpenAiBridge;
-use aisix_proxy::background::run_background_model_check_once;
+use aisix_proxy::surface_background_action::run_background_model_check_once;
 use aisix_proxy::{CacheBackends, ProxyState};
-use aisix_ratelimit::{Limiter, RedisStore};
+use aisix_ratelimit::Limiter;
+use aisix_ratelimit::store::surface_redis_store::RedisStore;
 use clap::Parser;
 use etcd_client::{Certificate, ConnectOptions, Identity, TlsOptions};
 use std::time::Duration;
@@ -266,7 +268,7 @@ async fn async_main(cfg: Config) -> anyhow::Result<()> {
     // returned outcome is already logged inside.
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     let _ = enable_jemalloc_background_thread();
-    aisix_obs::memory::register_runtime("control", tokio::runtime::Handle::current());
+    aisix_obs::surface_memory_view::register_runtime("control", tokio::runtime::Handle::current());
 
     // Everything from here on is inside the drained scope, because
     // everything from here on can log and then fail: `?` would otherwise
@@ -278,11 +280,11 @@ async fn async_main(cfg: Config) -> anyhow::Result<()> {
     let outcome = async {
         // Before any bridge builds its `reqwest::Client` — the connection
         // pools are constructed once and can't be reconfigured afterwards.
-        aisix_gateway::upstream_http::init(upstream_http_config(&cfg.upstream)?)
+        aisix_gateway::surface_upstream_http_controller::init(upstream_http_config(&cfg.upstream)?)
             .map_err(|e| anyhow::anyhow!("upstream TLS init failed: {e}"))?;
-        aisix_gateway::ssrf::init(&cfg.outbound.ssrf_protection)
+        aisix_gateway::surface_ssrf_guard_action::init(&cfg.outbound.ssrf_protection)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        aisix_gateway::media_fetch::init(
+        aisix_gateway::surface_media_fetch_action::init(
             &cfg.upstream.media_fetch,
             cfg.proxy.request_body_limit_bytes,
         );
@@ -535,7 +537,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // Here rather than in `main` so anything that drives `run` directly —
     // the integration tests — gets the configured interval instead of
     // silently falling back to the default.
-    aisix_proxy::sse_keepalive::init(
+    aisix_proxy::surface_sse_keepalive_view::init(
         (cfg.downstream.sse_keepalive_interval_secs > 0)
             .then(|| Duration::from_secs(cfg.downstream.sse_keepalive_interval_secs)),
     );
@@ -546,13 +548,13 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // CP serves a cert distinct from the cert-manager-issued client-
     // cert CA. Production with public-CA certs leaves this `None`.
     let extra_ca_pem =
-        managed_bundle::read_optional_ca_pem(cfg.managed.cp_ca_cert_file.as_deref())?;
+        surface_managed_bundle_store::read_optional_ca_pem(cfg.managed.cp_ca_cert_file.as_deref())?;
 
     // Managed-mode bootstrap. First boot materialises the dashboard-
     // issued cert bundle. Subsequent boots re-use the persisted files
     // and synthesise heartbeat config from config + dp_id_file.
-    let heartbeat_cfg: Option<heartbeat::HeartbeatConfig> = if cfg.managed.is_managed() {
-        let bundle_on_disk = managed_bundle::bundle_exists(&cfg.managed.mtls_dir);
+    let heartbeat_cfg: Option<surface_heartbeat_controller::HeartbeatConfig> = if cfg.managed.is_managed() {
+        let bundle_on_disk = surface_managed_bundle_store::bundle_exists(&cfg.managed.mtls_dir);
         let bundle_provided = cfg.managed.cert_bundle_provided();
         // Log the branch inputs so operators don't have to guess why
         // their DP could not bootstrap.
@@ -587,7 +589,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             // CA-rotation fix), parse env_id + dp_id from the leaf SAN,
             // and populate cfg.etcd.*. No /dp/register round-trip.
             tracing::info!("managed mode: provisioning from supplied cert bundle (api7ee parity)");
-            let p = cert_bundle::provision(&cfg.managed)
+            let p = surface_cert_bundle_store::provision(&cfg.managed)
                 .await
                 .map_err(|e| anyhow::anyhow!("DP cert-bundle provisioning failed: {e:#}"))?;
             let etcd_url = derive_cp_etcd_url(&cfg.managed)?;
@@ -607,7 +609,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             });
             // Persist dp_id + env_id so subsequent boots take the
             // bundle-on-disk path without re-running provisioning.
-            managed_bundle::persist_dp_id_for_provisioning(&cfg.managed, &p.dp_id, &p.env_id)
+            surface_managed_bundle_store::persist_dp_id_for_provisioning(&cfg.managed, &p.dp_id, &p.env_id)
                 .await
                 .map_err(|e| anyhow::anyhow!("persist dp_id/env_id sidecars: {e:#}"))?;
             // Heartbeat — same shape as register branch. The
@@ -624,11 +626,11 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                         "managed.cp_base_url required for heartbeat when cert bundle is provided"
                     )
                 })?;
-            Some(heartbeat::HeartbeatConfig::sanitised(
-                heartbeat::heartbeat_url(cp_base),
+            Some(surface_heartbeat_controller::HeartbeatConfig::sanitised(
+                surface_heartbeat_controller::heartbeat_url(cp_base),
                 p.dp_id,
                 std::time::Duration::from_secs(cfg.managed.heartbeat_interval_secs),
-                heartbeat::MtlsBundle {
+                surface_heartbeat_controller::MtlsBundle {
                     ca_cert_path: p.ca_cert_path,
                     client_cert_path: p.client_cert_path,
                     client_key_path: p.client_key_path,
@@ -655,13 +657,13 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             tracing::info!(etcd = %etcd_url, "managed mode: etcd endpoint for subsequent boot");
             cfg.etcd.endpoints = vec![etcd_url];
             cfg.etcd.tls = Some(EtcdTlsConfig {
-                ca_cert_file: managed_bundle::ca_cert_path(&cfg.managed.mtls_dir)
+                ca_cert_file: surface_managed_bundle_store::ca_cert_path(&cfg.managed.mtls_dir)
                     .to_string_lossy()
                     .into_owned(),
-                client_cert_file: managed_bundle::client_cert_path(&cfg.managed.mtls_dir)
+                client_cert_file: surface_managed_bundle_store::client_cert_path(&cfg.managed.mtls_dir)
                     .to_string_lossy()
                     .into_owned(),
-                client_key_file: managed_bundle::client_key_path(&cfg.managed.mtls_dir)
+                client_key_file: surface_managed_bundle_store::client_key_path(&cfg.managed.mtls_dir)
                     .to_string_lossy()
                     .into_owned(),
                 domain_name: None,
@@ -671,10 +673,10 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             // `/aisix/<env_id>/` across DP restarts. Missing file is a
             // hard error — proceeding without env_id would silently
             // pull the wrong (empty-prefix) tenant.
-            cfg.etcd.env_id = managed_bundle::read_env_id(&cfg.managed.mtls_dir).map_err(|e| {
+            cfg.etcd.env_id = surface_managed_bundle_store::read_env_id(&cfg.managed.mtls_dir).map_err(|e| {
                 anyhow::anyhow!(
                     "managed mode: bundle on disk but env_id file unreadable at {:?}: {e}",
-                    managed_bundle::env_id_path(&cfg.managed.mtls_dir),
+                    surface_managed_bundle_store::env_id_path(&cfg.managed.mtls_dir),
                 )
             })?;
             match load_heartbeat_config_from_disk(&cfg.managed, extra_ca_pem.clone()) {
@@ -887,7 +889,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // path suffix so the two stay in lock-step on cp_base changes.
     let telemetry_cfg = heartbeat_cfg
         .as_ref()
-        .map(|h| telemetry::TelemetryConfig::new(telemetry_url(&h.url), h.mtls.clone()));
+        .map(|h| surface_telemetry_controller::TelemetryConfig::new(telemetry_url(&h.url), h.mtls.clone()));
     // Steps 7-8: build Hub, shared components, then routers.
     let hub = Arc::new(build_hub());
     // env_id is resolved by now (managed provisioning / sidecar restore
@@ -914,11 +916,11 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // drops land on.
     //
     // It stops on its own signal rather than `cancel`, flipped once the
-    // proxy has finished serving: see `telemetry::stop_after`.
+    // proxy has finished serving: see `surface_telemetry_controller::stop_after`.
     let (usage_stop_tx, usage_stop_rx) = watch::channel(false);
     let (usage_sink, telemetry_task) = match telemetry_cfg {
         Some(cfg) => {
-            let (sink, handle) = telemetry::spawn(cfg, (*metrics).clone(), usage_stop_rx);
+            let (sink, handle) = surface_telemetry_controller::spawn(cfg, (*metrics).clone(), usage_stop_rx);
             (sink, Some(handle))
         }
         None => (aisix_obs::UsageSink::disabled(), None),
@@ -1186,7 +1188,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // With no dp-manager, per-user tokens and semantic session pins stay in
     // this process and do not survive a restart.
     if let Some(h) = heartbeat_cfg.as_ref() {
-        proxy_state = proxy_state.with_shared_store(Arc::new(dp_store::DpManagerStore::new(
+        proxy_state = proxy_state.with_shared_store(Arc::new(surface_dp_store::DpManagerStore::new(
             dpmgr_origin(&h.url),
             &h.mtls,
         )));
@@ -1261,7 +1263,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         }));
         let fan_out = proxy_state.otlp_fan_out.clone();
         h = h.with_exporter_health_fetcher(Arc::new(move || fan_out.exporter_stats()));
-        heartbeat::spawn(h, cancel_rx.clone())
+        surface_heartbeat_controller::spawn(h, cancel_rx.clone())
     });
 
     // Name the guardrails that are attached to nothing, on a timer.
@@ -1330,7 +1332,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         None => proxy_state.with_config_apply_age(Arc::new(|| Some(std::time::Duration::ZERO))),
     };
     register_memory_probes(&metrics, &proxy_state);
-    aisix_obs::heap_profile::spawn_auto_dump(
+    aisix_obs::surface_heap_profile_action::spawn_auto_dump(
         &cfg.observability.heap_profiling.auto_dump,
         (*metrics).clone(),
     );
@@ -1503,7 +1505,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 drop(probe);
                 let router = aisix_admin::debug_router(
                     metrics.clone(),
-                    aisix_obs::heap_profile::scratch_dir(
+                    aisix_obs::surface_heap_profile_action::scratch_dir(
                         &cfg.observability.heap_profiling.auto_dump,
                     ),
                 );
@@ -1628,7 +1630,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         Duration::from_secs(cfg.shutdown.min_drain_secs),
     ));
 
-    telemetry::stop_after(proxy_serve, &usage_stop_tx)
+    surface_telemetry_controller::stop_after(proxy_serve, &usage_stop_tx)
         .await
         .map_err(|e| anyhow::anyhow!("proxy serve error: {e}"))?;
     if let Some(handle) = admin_serve_handle {
@@ -1665,7 +1667,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
 /// Report each in-process store's size on the Prometheus scrape. Every
 /// reading here is O(1) or bounded by configuration, never by traffic.
 fn register_memory_probes(metrics: &aisix_obs::Metrics, state: &ProxyState) {
-    use aisix_obs::memory::ComponentReading;
+    use aisix_obs::surface_memory_view::ComponentReading;
     fn entries(n: u64) -> ComponentReading {
         ComponentReading {
             entries: Some(n),
@@ -1703,10 +1705,10 @@ fn register_memory_probes(metrics: &aisix_obs::Metrics, state: &ProxyState) {
         entries(limiter.local_key_count())
     });
     probes.register_component("snapshot_pending_reclaim", || {
-        entries(aisix_core::snapshot::pending_reclaim() as u64)
+        entries(aisix_core::taxonomy_snapshot_vo::pending_reclaim() as u64)
     });
     probes.register_component("upstream_clients", || {
-        entries(aisix_gateway::upstream_tls::provider_key_client_count())
+        entries(aisix_gateway::surface_upstream_tls_component::provider_key_client_count())
     });
     probes.register_component("in_flight_request_bodies", || {
         let (bodies, bytes) = aisix_proxy::in_flight_request_bodies();
@@ -2122,7 +2124,7 @@ fn default_domain_from_endpoint(endpoint: &str) -> anyhow::Result<String> {
 /// The dpmgr origin: the heartbeat URL with its path stripped back off.
 fn dpmgr_origin(heartbeat_url: &str) -> &str {
     heartbeat_url
-        .strip_suffix(heartbeat::HEARTBEAT_PATH)
+        .strip_suffix(surface_heartbeat_controller::HEARTBEAT_PATH)
         .unwrap_or(heartbeat_url)
 }
 
@@ -2136,7 +2138,7 @@ fn telemetry_url(heartbeat_url: &str) -> String {
     format!(
         "{}{}",
         dpmgr_origin(heartbeat_url),
-        telemetry::TELEMETRY_PATH
+        surface_telemetry_controller::TELEMETRY_PATH
     )
 }
 
@@ -2184,7 +2186,7 @@ fn derive_cp_etcd_url(managed: &aisix_core::ManagedConfig) -> anyhow::Result<Str
 fn load_heartbeat_config_from_disk(
     managed: &aisix_core::ManagedConfig,
     extra_ca_pem: Option<Vec<u8>>,
-) -> anyhow::Result<heartbeat::HeartbeatConfig> {
+) -> anyhow::Result<surface_heartbeat_controller::HeartbeatConfig> {
     let base = managed
         .cp_base_url
         .as_deref()
@@ -2199,15 +2201,15 @@ fn load_heartbeat_config_from_disk(
     if dp_id.is_empty() {
         anyhow::bail!("dp_id file {} is empty", managed.dp_id_file);
     }
-    let url = heartbeat::heartbeat_url(base);
-    Ok(heartbeat::HeartbeatConfig::sanitised(
+    let url = surface_heartbeat_controller::heartbeat_url(base);
+    Ok(surface_heartbeat_controller::HeartbeatConfig::sanitised(
         url,
         dp_id,
         std::time::Duration::from_secs(managed.heartbeat_interval_secs),
-        heartbeat::MtlsBundle {
-            ca_cert_path: managed_bundle::ca_cert_path(&managed.mtls_dir),
-            client_cert_path: managed_bundle::client_cert_path(&managed.mtls_dir),
-            client_key_path: managed_bundle::client_key_path(&managed.mtls_dir),
+        surface_heartbeat_controller::MtlsBundle {
+            ca_cert_path: surface_managed_bundle_store::ca_cert_path(&managed.mtls_dir),
+            client_cert_path: surface_managed_bundle_store::client_cert_path(&managed.mtls_dir),
+            client_key_path: surface_managed_bundle_store::client_key_path(&managed.mtls_dir),
             extra_ca_pem,
         },
     ))
@@ -2236,7 +2238,7 @@ fn load_heartbeat_config_from_disk(
 /// `UnknownIssuer` transport error the misconfiguration otherwise
 /// produces on every upstream call.
 fn upstream_http_config(
-    cfg: &aisix_core::config::UpstreamConfig,
+    cfg: &aisix_core::taxonomy_config_vo::UpstreamConfig,
 ) -> anyhow::Result<UpstreamHttpConfig> {
     fn ms(v: u64) -> Option<Duration> {
         (v > 0).then(|| Duration::from_millis(v))
@@ -2528,10 +2530,10 @@ async fn read_proxy_header(
     timeout: Option<Duration>,
     label: &'static str,
 ) -> Option<(std::net::SocketAddr, Rewind<tokio::net::TcpStream>)> {
-    let read = proxy_protocol::read(&mut stream, socket_peer, trusted, timeout).await;
+    let read = surface_proxy_protocol_component::read(&mut stream, socket_peer, trusted, timeout).await;
     match read {
         Ok((peer, replay)) => Some((peer, Rewind::new(replay, stream))),
-        Err(proxy_protocol::Refused::Untrusted) => {
+        Err(surface_proxy_protocol_component::Refused::Untrusted) => {
             tracing::warn!(
                 label,
                 peer = %socket_peer,
@@ -2540,7 +2542,7 @@ async fn read_proxy_header(
             );
             None
         }
-        Err(proxy_protocol::Refused::Malformed(reason)) => {
+        Err(surface_proxy_protocol_component::Refused::Malformed(reason)) => {
             tracing::warn!(
                 label,
                 peer = %socket_peer,
@@ -2549,7 +2551,7 @@ async fn read_proxy_header(
             );
             None
         }
-        Err(proxy_protocol::Refused::Io(e)) => {
+        Err(surface_proxy_protocol_component::Refused::Io(e)) => {
             tracing::debug!(label, error = %e, "reading the connection's first bytes failed");
             None
         }
@@ -3372,11 +3374,11 @@ fn run_tpc_worker(
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    aisix_obs::memory::register_runtime(format!("tpc-{worker}"), rt.handle().clone());
+    aisix_obs::surface_memory_view::register_runtime(format!("tpc-{worker}"), rt.handle().clone());
     // Every dispatch from this thread now uses this thread's pool, so an
     // upstream response is read by the same runtime that is waiting for
     // it. Marked inside the worker because the marker is per thread.
-    aisix_gateway::upstream_tls::mark_worker_thread();
+    aisix_gateway::surface_upstream_tls_component::mark_worker_thread();
     rt.block_on(async move {
         // This worker's share of every configured listener, accepted
         // concurrently on its own runtime.
@@ -3619,7 +3621,7 @@ mod tests {
         .unwrap();
         let snap = AisixSnapshot::new();
         snap.apikeys
-            .insert(aisix_core::resource::ResourceEntry::new(id, key, 1));
+            .insert(aisix_core::taxonomy_resource_vo::ResourceEntry::new(id, key, 1));
         snap
     }
 
@@ -3697,15 +3699,15 @@ mod tests {
         }))
         .unwrap();
         snap.apikeys
-            .insert(aisix_core::resource::ResourceEntry::new("ak-1", key, 1));
+            .insert(aisix_core::taxonomy_resource_vo::ResourceEntry::new("ak-1", key, 1));
         let team: aisix_core::Team =
             serde_json::from_value(serde_json::json!({"name": "Platform"})).unwrap();
         snap.teams
-            .insert(aisix_core::resource::ResourceEntry::new("t-1", team, 1));
+            .insert(aisix_core::taxonomy_resource_vo::ResourceEntry::new("t-1", team, 1));
         let user: aisix_core::User =
             serde_json::from_value(serde_json::json!({"name": "Alice"})).unwrap();
         snap.users
-            .insert(aisix_core::resource::ResourceEntry::new("u-1", user, 1));
+            .insert(aisix_core::taxonomy_resource_vo::ResourceEntry::new("u-1", user, 1));
         let at = |user_name, api_key_name, team_name| aisix_obs::LiveGaugeSeries::Budget {
             api_key_id: "ak-1",
             team_id: "t-1",
@@ -3759,7 +3761,7 @@ mod tests {
         }))
         .unwrap();
         snap.models
-            .insert(aisix_core::resource::ResourceEntry::new("m-1", model, 1));
+            .insert(aisix_core::taxonomy_resource_vo::ResourceEntry::new("m-1", model, 1));
         let at = |key, model| aisix_obs::LiveGaugeSeries::RatelimitRemaining {
             api_key_id: key,
             model,
@@ -4077,7 +4079,7 @@ managed:
         let cfg = aisix_core::Config::load_from_path(Some(file.path())).unwrap();
         let base = cfg.managed.cp_base_url.as_deref().unwrap();
 
-        let hb = heartbeat::heartbeat_url(base);
+        let hb = surface_heartbeat_controller::heartbeat_url(base);
         assert_eq!(hb, "https://dpm.example.com:7944/dp/heartbeat");
         assert_eq!(
             telemetry_url(&hb),
@@ -4129,7 +4131,7 @@ managed:
     /// call sites own the trimming.
     #[test]
     fn managed_urls_tolerate_a_trailing_slash_on_the_base() {
-        let hb = heartbeat::heartbeat_url("https://dpm.example.com:7944/");
+        let hb = surface_heartbeat_controller::heartbeat_url("https://dpm.example.com:7944/");
         assert_eq!(hb, "https://dpm.example.com:7944/dp/heartbeat");
         assert_eq!(dpmgr_origin(&hb), "https://dpm.example.com:7944");
     }
@@ -4142,7 +4144,7 @@ managed:
     /// returned the origin untouched.
     #[test]
     fn managed_urls_agree_on_a_base_carrying_a_path() {
-        let hb = heartbeat::heartbeat_url("https://cp.example.com/api");
+        let hb = surface_heartbeat_controller::heartbeat_url("https://cp.example.com/api");
         assert_eq!(hb, "https://cp.example.com/api/dp/heartbeat");
         assert_eq!(
             telemetry_url(&hb),
@@ -4150,7 +4152,7 @@ managed:
         );
         assert_eq!(dpmgr_origin(&hb), "https://cp.example.com/api");
 
-        let hb = heartbeat::heartbeat_url("https://cp.example.com/dp/heartbeat");
+        let hb = surface_heartbeat_controller::heartbeat_url("https://cp.example.com/dp/heartbeat");
         assert_eq!(hb, "https://cp.example.com/dp/heartbeat/dp/heartbeat");
         assert_eq!(
             telemetry_url(&hb),
@@ -4366,7 +4368,7 @@ managed:
     /// version sniff.
     #[test]
     fn the_gateway_has_one_accept_path_and_it_sets_tcp_nodelay() {
-        let src = include_str!("main.rs");
+        let src = include_str!("root_server_entry.rs");
         let production = src
             .split("\n#[cfg(test)]\nmod ")
             .next()

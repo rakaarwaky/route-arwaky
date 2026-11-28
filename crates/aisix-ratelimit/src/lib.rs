@@ -13,19 +13,19 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
-pub mod clock;
-mod error;
-mod limiter;
+pub mod taxonomy_clock_vo;
+mod taxonomy_rate_limit_error_vo;
+mod surface_rate_limiter_controller;
 pub mod store;
-mod window;
+mod surface_window_counter_action;
 
-pub use clock::{Clock, SystemClock, TestClock};
-pub use error::{LimitDetail, RateLimitError, CONCURRENCY_DIMENSION, CONCURRENCY_RETRY_AFTER_SECS};
-pub use limiter::{
+pub use taxonomy_clock_vo::{Clock, SystemClock, TestClock};
+pub use taxonomy_rate_limit_error_vo::{LimitDetail, RateLimitError, CONCURRENCY_DIMENSION, CONCURRENCY_RETRY_AFTER_SECS};
+pub use surface_rate_limiter_controller::{
     BucketKey, Limiter, MultiReservation, RateLimitStatus, Reservation, StreamConcurrencyGuard,
     TokenCharge,
 };
-pub use store::local::LocalStore;
-pub use store::redis::RedisStore;
+pub use store::surface_local_store::LocalStore;
+pub use store::surface_redis_store::RedisStore;
 pub use store::{AcquireStamp, RateStore, StreamLeaseRefresh};
-pub use window::{FixedWindowCounter, SlidingWindowCounter, WindowCheck};
+pub use surface_window_counter_action::{FixedWindowCounter, SlidingWindowCounter, WindowCheck};

@@ -8,14 +8,14 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use aisix_proxy::shared_store::{PutCondition, SharedStore, StoreError, StoredValue};
+use aisix_proxy::surface_shared_store::{PutCondition, SharedStore, StoreError, StoredValue};
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 
-use crate::heartbeat::MtlsBundle;
+use crate::surface_heartbeat_controller::MtlsBundle;
 
 pub const STORE_PATH: &str = "/dp/store/v1";
 
@@ -29,7 +29,7 @@ pub struct DpManagerStore {
 impl DpManagerStore {
     /// `origin` is the dp-manager's scheme and authority.
     pub fn new(origin: &str, mtls: &MtlsBundle) -> Self {
-        let client = crate::heartbeat::build_client(mtls)
+        let client = crate::surface_heartbeat_controller::build_client(mtls)
             .inspect_err(|error| {
                 tracing::error!(error = %format_args!("{error:#}"), "shared storage (semantic-router session pins) is unavailable: \
                     could not build the dp-manager client");

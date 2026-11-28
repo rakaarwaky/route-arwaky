@@ -2,7 +2,7 @@
 //!
 //! Every DP replica points at the same Redis, so one global window is
 //! enforced across the cluster instead of one-per-replica. The counter
-//! math mirrors [`super::local::LocalStore`] / [`crate::window`] exactly
+//! math mirrors [`super::surface_local_store::LocalStore`] / [`crate::surface_window_counter_action`] exactly
 //! (wall-clock-aligned fixed windows: `window_start = now - now % window`),
 //! so swapping `memory ↔ redis` doesn't change observable limits — only
 //! whether the count is shared.
@@ -45,18 +45,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use aisix_core::{RateLimit, RateLimitWindowType, RedisConnConfig};
-use aisix_obs::metrics::Metrics;
+use aisix_obs::surface_metrics_controller::Metrics;
 use aisix_redis::{ConnSlot, FailurePolicy};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use redis::Script;
 
 use super::{
-    local::LocalStore, sliding_step_secs, token_dims, AcquireStamp, Dim, RateStore,
+    surface_local_store::LocalStore, sliding_step_secs, token_dims, AcquireStamp, Dim, RateStore,
     StreamLeaseRefresh, DAY_SECS, MINUTE_SECS,
 };
-use crate::error::{LimitDetail, RateLimitError};
-use crate::limiter::RateLimitStatus;
+use crate::taxonomy_rate_limit_error_vo::{LimitDetail, RateLimitError};
+use crate::surface_rate_limiter_controller::RateLimitStatus;
 
 /// Default key namespace, kept distinct from `aisix:cache` so the same
 /// Redis can back both the response cache and the rate limiter.
@@ -98,7 +98,7 @@ enum LeaseOwnership {
 }
 
 /// Sliding-window arithmetic shared by the scripts below; mirrors
-/// [`crate::window::SlidingWindowCounter`] (sub-bucket starts are
+/// [`crate::surface_window_counter_action::SlidingWindowCounter`] (sub-bucket starts are
 /// `now - now % step`, the sum covers starts in `[cur - window, cur]`).
 /// A macro rather than a `const` so `concat!` can prepend it.
 macro_rules! sliding_lua {

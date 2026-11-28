@@ -3,7 +3,7 @@
 //! Behaviour-identical to the pre-#798 limiter: a `DashMap` of per-key
 //! window counters guarded by one `parking_lot::Mutex` each. State
 //! is per-replica and not shared, so a multi-replica cluster multiplies
-//! every limit by the replica count — exactly what [`super::redis`]
+//! every limit by the replica count — exactly what [`super::surface_redis_store`]
 //! exists to fix. `member` is ignored here (concurrency is a plain
 //! `in_flight` counter).
 
@@ -17,10 +17,10 @@ use super::{
     request_dims, sliding_step_secs, token_dims, AcquireStamp, Dim, RateStore, DAY_SECS, DIM_RPD,
     DIM_RPH, DIM_RPM, DIM_RPS, DIM_TPD, DIM_TPM, HOUR_SECS, MINUTE_SECS, SECOND_SECS,
 };
-use crate::clock::{Clock, SystemClock};
-use crate::error::{LimitDetail, RateLimitError};
-use crate::limiter::RateLimitStatus;
-use crate::window::{FixedWindowCounter, SlidingWindowCounter, WindowCheck};
+use crate::taxonomy_clock_vo::{Clock, SystemClock};
+use crate::taxonomy_rate_limit_error_vo::{LimitDetail, RateLimitError};
+use crate::surface_rate_limiter_controller::RateLimitStatus;
+use crate::surface_window_counter_action::{FixedWindowCounter, SlidingWindowCounter, WindowCheck};
 
 /// Per-key state guarded by a single mutex. Hot path locks once per
 /// request; each operation inside is O(1) for a fixed window and

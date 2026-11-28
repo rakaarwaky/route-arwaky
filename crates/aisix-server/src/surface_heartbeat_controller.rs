@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aisix_core::ConfigRejectionSnapshot;
-use aisix_etcd::loader::PartialCompatEntry;
+use aisix_etcd::surface_config_loader_action::PartialCompatEntry;
 use aisix_obs::SinkStatsSnapshot;
 use anyhow::{anyhow, Context};
 use serde::Serialize;
@@ -461,7 +461,7 @@ impl From<&ConfigRejectionSnapshot> for RejectedResourceWire {
 }
 
 /// On-the-wire shape of one partially-compatible aggregate entry (#871).
-/// Kept separate from `aisix_etcd::loader::PartialCompatEntry` so the
+/// Kept separate from `aisix_etcd::surface_config_loader_action::PartialCompatEntry` so the
 /// loader's internal representation can evolve without a wire bump.
 /// `kind` is the plural resource kind; `field` a dotted document path
 /// with array indices normalized to `[]`; `count` the number of served
@@ -947,7 +947,7 @@ managed:
         let mtls = write_test_bundle(dir.path());
         let cfg = cfg_with_bundle(format!("{}/dp/heartbeat", server.uri()), mtls)
             .with_partial_compat_fetcher(Arc::new(|| {
-                vec![aisix_etcd::loader::PartialCompatEntry {
+                vec![aisix_etcd::surface_config_loader_action::PartialCompatEntry {
                     kind: "api_keys".into(),
                     field: "quota_profile".into(),
                     count: 3,
@@ -1331,7 +1331,7 @@ managed:
         let cfg = cfg_with_bundle(url, write_test_bundle(dir.path()));
         let (_keep, mut cancel) = watch::channel(false);
         // The first tick fires at once; `run` never returns on its own.
-        let (_, logged) = crate::dp_store::test_logs::capture_logs(tokio::time::timeout(
+        let (_, logged) = crate::surface_dp_store::test_logs::capture_logs(tokio::time::timeout(
             Duration::from_secs(3),
             run(cfg, &mut cancel),
         ))

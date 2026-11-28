@@ -10,7 +10,7 @@ description = "aisix — the single binary"
 
 [[bin]]
 name = "aisix"
-path = "src/main.rs"
+path = "src/root_server_entry.rs"
 
 [dependencies]
 aisix-core = { path = "../aisix-core" }

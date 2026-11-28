@@ -40,9 +40,7 @@ use uuid::Uuid;
 
 use aisix_obs::{Metrics, UsageEvent, UsageEventLabels, UsageSink};
 
-use crate::heartbeat::MtlsBundle;
-
-mod clip;
+use crate::surface_heartbeat_controller::MtlsBundle;
 
 /// Maximum number of events accumulated per outbound POST. Pinned in
 /// code rather than config — at >100 events/batch the request body
@@ -205,7 +203,7 @@ impl TelemetryConfig {
 /// The worker stops when `cancel` flips to `true` AND the channel is
 /// drained (one final flush so we don't lose the tail). Errors during
 /// individual flushes are logged, not propagated — same contract as
-/// heartbeat::spawn.
+/// surface_heartbeat_controller::spawn.
 pub fn spawn(
     cfg: TelemetryConfig,
     metrics: Metrics,
@@ -495,7 +493,7 @@ fn wire_event(event: &UsageEvent) -> serde_json::Result<Vec<u8>> {
         }
         None => event,
     };
-    serde_json::to_vec(&clip::Clipped {
+    serde_json::to_vec(&crate::surface_telemetry_clip_action::Clipped {
         value: event,
         max_bytes: FREE_TEXT_MAX_BYTES,
     })
@@ -917,14 +915,14 @@ fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
         .user_agent(format!("aisix-dp/{}", &*aisix_core::BUILD_VERSION))
         .identity(identity)
         .add_root_certificate(ca)
-        // Pin HTTP/1.1 — see heartbeat::build_client. dp-manager cmux
+        // Pin HTTP/1.1 — see surface_heartbeat_controller::build_client. dp-manager cmux
         // routes one TLS port to gRPC (h2) vs REST (http1) by ALPN; once
         // the cloud-sink crates pulled reqwest's `http2` feature into the
         // workspace, this telemetry client advertised `h2` and cmux
         // misrouted the /dp/telemetry POSTs to the gRPC handler.
         .http1_only()
         .use_rustls_tls();
-    // Mirror heartbeat::build_client — pick up the operator-supplied
+    // Mirror surface_heartbeat_controller::build_client — pick up the operator-supplied
     // extra trust root (managed.cp_ca_cert_file) when set.
     if let Some(extra) = mtls.extra_ca_pem.as_ref() {
         let extra_ca = reqwest::Certificate::from_pem(extra)

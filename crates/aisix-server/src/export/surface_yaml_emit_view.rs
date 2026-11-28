@@ -15,7 +15,7 @@ use serde_json::Value;
 use yaml_rust2::yaml::Hash;
 use yaml_rust2::{Yaml, YamlEmitter};
 
-use super::document::ExportDocument;
+use super::surface_document_controller::ExportDocument;
 
 use aisix_etcd::file_source::{FORMAT_VERSION, GLOBAL_SECTION};
 

@@ -12,9 +12,9 @@ use std::time::Duration;
 use aisix_core::{RateLimit, RateLimitScope, RateLimitWindowType, RedisConnConfig, RedisMode};
 
 const FIXED: RateLimitWindowType = RateLimitWindowType::Fixed;
-use aisix_obs::metrics::Metrics;
+use aisix_obs::surface_metrics_controller::Metrics;
 use aisix_ratelimit::{
-    store::redis::DEFAULT_PREFIX, Limiter, MultiReservation, RateLimitError, RateStore, RedisStore,
+    store::surface_redis_store::DEFAULT_PREFIX, Limiter, MultiReservation, RateLimitError, RateStore, RedisStore,
     StreamLeaseRefresh, TokenCharge,
 };
 

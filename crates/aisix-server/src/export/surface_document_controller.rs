@@ -9,7 +9,7 @@
 //!
 //! - **`$`-escaping** — the file interpolates `${VAR}` and unescapes `$$`
 //!   in every string it reads, so a stored `$` is written as `$$`;
-//! - **secret redaction** — see [`super::secrets`].
+//! - **secret redaction** — see [`super::surface_secrets_action`].
 //!
 //! A reference naming an id that is not among the exported entries is
 //! reported as a warning: the file carries it as stored, and a gateway
@@ -28,7 +28,7 @@ use aisix_core::AisixSnapshot;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::secrets::{
+use super::surface_secrets_action::{
     redact_by_key, redact_headers, redact_string_map, redact_top_level, RedactionCtx,
     SecretPlaceholder,
 };
@@ -406,7 +406,7 @@ pub fn build_export_document(
 /// `(id, key, winner id)` of every price another row of the same table
 /// overrides under the gateway's rule: highest revision, then highest id.
 fn superseded_prices(
-    table: &aisix_core::snapshot::ResourceTable<aisix_core::models::Pricing>,
+    table: &aisix_core::taxonomy_snapshot_vo::ResourceTable<aisix_core::models::Pricing>,
 ) -> Vec<(String, String, String)> {
     let entries = table.entries();
     let mut winners: BTreeMap<&str, (i64, &str)> = BTreeMap::new();
@@ -449,7 +449,7 @@ fn push_kind(
 /// interpolate, so they are added after escaping.
 #[allow(clippy::too_many_arguments)]
 fn emit_entries<T, N>(
-    table: &aisix_core::snapshot::ResourceTable<T>,
+    table: &aisix_core::taxonomy_snapshot_vo::ResourceTable<T>,
     raw: &RawDocs,
     raw_kind: &str,
     kind: &'static str,
@@ -460,7 +460,7 @@ fn emit_entries<T, N>(
     placeholders: &mut Vec<SecretPlaceholder>,
 ) -> Vec<Value>
 where
-    T: aisix_core::resource::Resource,
+    T: aisix_core::taxonomy_resource_vo::Resource,
     N: Fn(&T) -> String,
 {
     let mut entries = table.entries();
@@ -515,9 +515,9 @@ fn escape_dollars(value: &mut Value) {
 /// Every reference whose id is not among the exported entries of the kind
 /// it names, as warnings.
 fn dangling_references(snapshot: &AisixSnapshot) -> Vec<String> {
-    fn ids<T>(table: &aisix_core::snapshot::ResourceTable<T>) -> BTreeSet<String>
+    fn ids<T>(table: &aisix_core::taxonomy_snapshot_vo::ResourceTable<T>) -> BTreeSet<String>
     where
-        T: aisix_core::resource::Resource,
+        T: aisix_core::taxonomy_resource_vo::Resource,
     {
         table.entries().into_iter().map(|e| e.id.clone()).collect()
     }
@@ -616,14 +616,14 @@ fn dangling_references(snapshot: &AisixSnapshot) -> Vec<String> {
     warnings
 }
 
-fn to_docs<T>(table: &aisix_core::snapshot::ResourceTable<T>) -> Vec<(String, Value)>
+fn to_docs<T>(table: &aisix_core::taxonomy_snapshot_vo::ResourceTable<T>) -> Vec<(String, Value)>
 where
-    T: aisix_core::resource::Resource + Serialize,
+    T: aisix_core::taxonomy_resource_vo::Resource + Serialize,
 {
     let mut out: Vec<(String, Value)> = table
         .entries()
         .into_iter()
-        .filter_map(|e| Some((e.id.clone(), aisix_core::json::to_value(&e.value).ok()?)))
+        .filter_map(|e| Some((e.id.clone(), aisix_core::utility_json_helper::to_value(&e.value).ok()?)))
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
@@ -718,6 +718,3 @@ fn condition_refs(nodes: &Value, found: &mut dyn FnMut(&'static str, &str)) {
     }
 }
 
-#[cfg(test)]
-#[path = "document_tests.rs"]
-mod tests;

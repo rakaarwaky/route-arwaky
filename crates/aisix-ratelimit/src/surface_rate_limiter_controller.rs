@@ -16,8 +16,8 @@
 //! error path.
 //!
 //! The counters live wherever the [`RateStore`] keeps them: the default
-//! [`crate::store::local::LocalStore`] is per-process (historical
-//! behaviour), while [`crate::store::redis::RedisStore`] shares them
+//! [`crate::store::surface_local_store::LocalStore`] is per-process (historical
+//! behaviour), while [`crate::store::surface_redis_store::RedisStore`] shares them
 //! across every DP replica so a cluster enforces one global window
 //! (api7/AISIX-Cloud#798).
 
@@ -26,9 +26,9 @@ use std::sync::Arc;
 
 use aisix_core::{RateLimit, RateLimitWindowType};
 
-use crate::clock::Clock;
-use crate::error::RateLimitError;
-use crate::store::local::LocalStore;
+use crate::taxonomy_clock_vo::Clock;
+use crate::taxonomy_rate_limit_error_vo::RateLimitError;
+use crate::store::surface_local_store::LocalStore;
 use crate::store::{AcquireStamp, RateStore, StreamLeaseRefresh};
 
 /// Current window state for a single key, returned by [`Limiter::peek`].
@@ -544,7 +544,7 @@ impl Drop for StreamConcurrencyGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clock::TestClock;
+    use crate::taxonomy_clock_vo::TestClock;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;

@@ -1,6 +1,8 @@
-use super::*;
+use super::surface_document_controller::*;
+use aisix_core::AisixSnapshot;
 use aisix_etcd::{build_snapshot, PrefixSet, RawEntry, WatchedPrefix};
 use serde_json::json;
+use serde_json::Value;
 
 const PK: &str = "0b6f3c1e-2f0a-4c5e-9d55-7d1a8b0c2e11";
 const MODEL: &str = "6efd592d-a73b-573d-8e2c-e9e103692f92";
@@ -100,7 +102,7 @@ fn every_entry_carries_its_etcd_id_and_its_references_as_stored() {
 #[test]
 fn the_exported_file_loads_back_as_the_same_rows() {
     let doc = export(&rows(), false);
-    let yaml = super::super::yaml_emit::emit_yaml(&doc).unwrap();
+    let yaml = super::surface_yaml_emit_view::emit_yaml(&doc).unwrap();
     let env = |name: &str| {
         (name == "AISIXSECRET_PROVIDER_KEY_OPENAI_PROD_API_KEY").then(|| "sk-live".to_string())
     };
@@ -381,7 +383,7 @@ fn every_kind_the_gateway_reads_is_exported_except_budgets() {
 #[test]
 fn every_exported_kind_loads_back_from_the_file() {
     let doc = export_entries(&every_other_kind());
-    let yaml = super::super::yaml_emit::emit_yaml(&doc).unwrap();
+    let yaml = super::surface_yaml_emit_view::emit_yaml(&doc).unwrap();
     let entries = aisix_etcd::file_source::read_str(&yaml, "exported.yaml", 1, &|_| None)
         .unwrap_or_else(|e| panic!("{e}\n{yaml}"));
     let (loaded, stats) = build_snapshot(&aisix_etcd::file_source::prefixes(), &entries);
@@ -427,7 +429,7 @@ fn budget_policy_export_preserves_timezone_when_set_and_omits_when_absent() {
     assert!(without.get("timezone").is_none());
     assert_eq!(with_tz["timezone"], json!("Asia/Shanghai"));
 
-    let yaml = super::super::yaml_emit::emit_yaml(&doc).unwrap();
+    let yaml = super::surface_yaml_emit_view::emit_yaml(&doc).unwrap();
     let reloaded = aisix_etcd::file_source::read_str(&yaml, "exported.yaml", 1, &|_| None)
         .unwrap_or_else(|e| panic!("{e}\n{yaml}"));
     let (loaded, stats) = build_snapshot(&aisix_etcd::file_source::prefixes(), &reloaded);

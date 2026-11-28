@@ -11,8 +11,8 @@
 //! until the data plane is upgraded. This pins the loader and the guardrail
 //! build together, because either one alone can still drop the row.
 
-use aisix_etcd::loader::{build_snapshot, PartialCompatEntry};
-use aisix_etcd::provider::RawEntry;
+use aisix_etcd::surface_config_loader_action::{build_snapshot, PartialCompatEntry};
+use aisix_etcd::taxonomy_provider_vo::RawEntry;
 use aisix_guardrails::{build_chain_from_snapshot, Guardrail, GuardrailEmbedderSlot};
 
 /// A `kind: "pii"` guardrail whose custom pattern carries one field this

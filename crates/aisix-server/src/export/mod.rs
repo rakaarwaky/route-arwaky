@@ -19,9 +19,11 @@
 //! Secrets are replaced with `${VAR}` placeholders by default; the real
 //! values are never written unless `--reveal-secrets` is passed.
 
-mod document;
-mod secrets;
-mod yaml_emit;
+mod surface_document_controller;
+#[cfg(test)]
+mod surface_document_test_view;
+mod surface_secrets_action;
+mod surface_yaml_emit_view;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -30,8 +32,8 @@ use aisix_etcd::{
     build_snapshot, ConfigProvider, ConnectPolicy, EtcdConfigProvider, PrefixSet, WatchedPrefix,
 };
 
-use document::build_export_document;
-use yaml_emit::emit_yaml;
+use surface_document_controller::build_export_document;
+use surface_yaml_emit_view::emit_yaml;
 
 /// Arguments for the `export` subcommand, parsed by `clap` in `main`.
 pub struct ExportArgs {
@@ -89,7 +91,7 @@ pub async fn run(args: ExportArgs) -> anyhow::Result<()> {
         WatchedPrefix::global(format!("{}/global/", args.prefix.trim_end_matches('/'))),
     ]);
     let (snapshot, stats) = build_snapshot(&prefixes, &entries);
-    let (raw, dropped) = document::stored_documents(&prefixes, &entries, &stats);
+    let (raw, dropped) = surface_document_controller::stored_documents(&prefixes, &entries, &stats);
 
     let document = build_export_document(&snapshot, &raw, args.reveal_secrets);
     let yaml = emit_yaml(&document).map_err(|e| anyhow::anyhow!(e))?;
@@ -234,7 +236,7 @@ fn report_warnings(warnings: &[String]) {
 
 /// Print the operator's "set these before loading" list on stderr — never
 /// into the file. Deduplicated and sorted for a stable report.
-fn report_secrets(document: &document::ExportDocument, reveal_secrets: bool) {
+fn report_secrets(document: &surface_document_controller::ExportDocument, reveal_secrets: bool) {
     if reveal_secrets {
         if document_has_any_entry(document) {
             eprintln!(
@@ -266,7 +268,7 @@ fn report_secrets(document: &document::ExportDocument, reveal_secrets: bool) {
     }
 }
 
-fn document_has_any_entry(document: &document::ExportDocument) -> bool {
+fn document_has_any_entry(document: &surface_document_controller::ExportDocument) -> bool {
     document
         .collections
         .iter()
