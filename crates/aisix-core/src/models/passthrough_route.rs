@@ -649,11 +649,7 @@ mod coupling_tests {
         // A host-less route on a gateway namespace is shadowed by the typed
         // routes, so it stays rejected…
         let mut doc = base();
-        for p in [
-            "/v1",
-            "/v1/chat/completions",
-            "/metrics",
-        ] {
+        for p in ["/v1", "/v1/chat/completions", "/metrics"] {
             doc["path_prefix"] = json!(p);
             assert!(
                 validate_passthrough_route(&doc).is_err(),

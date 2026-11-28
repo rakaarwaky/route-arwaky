@@ -363,15 +363,7 @@ async fn reserve_layers(
     // Starts empty so the common no-limits request never allocates;
     // the first reservation (if any) grows it on demand.
     let mut reservations = Vec::new();
-    match reserve_request_layers(
-        state,
-        snapshot,
-        auth,
-        model_rl,
-        &mut reservations,
-    )
-    .await
-    {
+    match reserve_request_layers(state, snapshot, auth, model_rl, &mut reservations).await {
         Ok(()) => Ok(MultiReservation::new(reservations)),
         Err(e) => {
             MultiReservation::new(reservations).refund().await;
@@ -618,7 +610,6 @@ fn refresh_remaining(
         tracing::Span::current(),
     ));
 }
-
 
 /// The budget gauge labels of `auth`, shared by every emit site so the
 /// gauge-liveness sweep (`gauge_series_is_live` in the server) can judge

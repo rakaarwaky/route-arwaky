@@ -339,7 +339,7 @@ fn run_validate(resources: &Path) -> anyhow::Result<()> {
     // chain while the gateway keeps serving. Runtime status reports that
     // rejection, but this command still needs to fail synchronously rather
     // than validate a file whose screening rule cannot run.
-    let unbuildable = aisix_guardrails::unbuildable_guardrail_rows(&snapshot.guardrails, None);
+    let unbuildable = aisix_guardrails::unbuildable_guardrail_rows(&snapshot.guardrails);
     if !unbuildable.is_empty() {
         eprintln!(
             "resources file {}: {} guardrail(s) load but cannot run:",
@@ -380,7 +380,6 @@ fn run_validate(resources: &Path) -> anyhow::Result<()> {
     );
     Ok(())
 }
-
 
 /// Is this gauge label set still describing something the configuration
 /// contains?
@@ -1217,18 +1216,11 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // take effect within one watch tick. Empty attachment table →
     // every resolved chain is empty (no-op). See
     // `aisix_guardrails::LiveGuardrailIndex`.
-    //
-    // `bedrock_endpoint_url` is the deployment-wide override for
-    // kind=bedrock guardrails; empty string is normalized to
-    // `None` so a `docker run -e AISIX_BEDROCK_ENDPOINT_URL=`
-    // doesn't accidentally redirect Bedrock calls into thin air.
-    let bedrock_endpoint_url = cfg.bedrock_endpoint_url.clone().filter(|s| !s.is_empty());
     let guardrail_metrics_sink = proxy_state.metrics.clone();
     let guardrail_embedder = proxy_state.guardrail_embedder();
     proxy_state = proxy_state.with_guardrail_index(
         aisix_guardrails::LiveGuardrailIndex::new_with_sink_and_status(
             snapshot_handle.clone(),
-            bedrock_endpoint_url,
             Some(guardrail_metrics_sink),
             guardrail_embedder,
             Some(config_status.clone()),

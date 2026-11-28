@@ -1385,9 +1385,7 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
         .expect("guardrail root schema is a JSON object");
 
     if let Some(Value::Object(defs)) = obj.get_mut("definitions") {
-        for name in [
-            "KeywordPattern",
-        ] {
+        for name in ["KeywordPattern"] {
             if let Some(Value::Array(branches)) =
                 defs.get_mut(name).and_then(|d| d.get_mut("oneOf"))
             {
@@ -2656,7 +2654,6 @@ mod tests {
         });
         assert!(!validator.is_valid(&null_match));
     }
-
 
     #[test]
     fn model_semantic_threshold_out_of_range_fails() {
@@ -4234,7 +4231,6 @@ mod tests {
         validate_provider_key(&v).unwrap();
     }
 
-
     /// The surface key set is closed on the write path, so a typo (or a
     /// surface this release does not serve) fails loudly rather than
     /// sitting in the document doing nothing.
@@ -4942,21 +4938,6 @@ mod tests {
         let msg = validate_model(&ensemble).unwrap_err().message;
         assert!(msg.contains("`timeout`"), "{msg}");
         assert!(msg.contains("not accepted on an ensemble"), "{msg}");
-
-        let semantic = json!({
-            "display_name": "s",
-            "semantic": {
-                "embedding_model": "e",
-                "routes": [{"name": "a", "target": "m", "examples": ["x"]}],
-                "default": "d",
-                "match": {"threshold": 0.5},
-                "on_embedding_failure": {"target": "t"}
-            },
-            "auto_prompt_caching": {"enabled": true}
-        });
-        let msg = validate_model(&semantic).unwrap_err().message;
-        assert!(msg.contains("`auto_prompt_caching`"), "{msg}");
-        assert!(msg.contains("not accepted on a semantic router"), "{msg}");
 
         let embedding = json!({
             "display_name": "embed",

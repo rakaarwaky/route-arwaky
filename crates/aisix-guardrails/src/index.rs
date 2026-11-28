@@ -376,7 +376,13 @@ mod tests {
     #[tokio::test]
     async fn empty_scope_id_never_matches_an_absent_dimension() {
         let idx = GuardrailIndex::from_entries(vec![
-            entry("g1", ScopeKind::PassthroughRoute, Some(""), 50, kw("g1", "secret")),
+            entry(
+                "g1",
+                ScopeKind::PassthroughRoute,
+                Some(""),
+                50,
+                kw("g1", "secret"),
+            ),
             entry("g2", ScopeKind::Model, Some(""), 50, kw("g2", "secret")),
         ]);
 

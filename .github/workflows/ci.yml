@@ -75,7 +75,7 @@ jobs:
           # keep being vendored. Clear both sets first so a vanished file shows
           # up in `git diff` as a deletion.
           rm -f schemas/resources/*.schema.json schemas/resources-lenient/*.schema.json
-          cargo run -p aisix-core --bin dump-schema
+          cargo run --locked -p aisix-core --bin dump-schema
       - name: assert no drift
         run: |
           # --intent-to-add so a file the dump newly creates (a new resource,
@@ -86,7 +86,7 @@ jobs:
           git add --intent-to-add schemas/
           if ! git diff --exit-code schemas/; then
             echo "::error::Resource JSON Schemas in 'schemas/resources/' or 'schemas/resources-lenient/' drift from the Rust types in 'crates/aisix-core/src/models/'."
-            echo "::error::Fix: run 'cargo run -p aisix-core --bin dump-schema' locally and commit the diff."
+            echo "::error::Fix: run 'cargo run --locked -p aisix-core --bin dump-schema' locally and commit the diff."
             exit 1
           fi
 
@@ -100,7 +100,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: generate Admin API OpenAPI
         run: |
-          cargo run -p aisix-admin --bin dump-openapi > /tmp/admin-api.openapi.json
+          cargo run --locked -p aisix-admin --bin dump-openapi > /tmp/admin-api.openapi.json
       - name: validate generated OpenAPI
         run: |
           python3 - <<'PY'
@@ -341,7 +341,7 @@ jobs:
           docker exec redis-auth redis-cli -p 6390 -a aisix-ci-redis ping | grep -q PONG \
             || { echo "::error::Authenticated Redis 6390 did not come up"; exit 1; }
       - name: unit tests with coverage
-        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov-unit.info
+        run: cargo llvm-cov --locked --workspace --all-features --lcov --output-path lcov-unit.info
       - uses: actions/upload-artifact@v7
         with:
           name: coverage-unit
@@ -351,7 +351,7 @@ jobs:
         env:
           # Differ from Cargo's version so the old source cannot pass.
           AISIX_BUILD_VERSION: 0.0.0-ci
-        run: cargo test -p aisix-obs --lib otlp_http_sink::tests::otlp_sink_posts_one_request_with_all_spans -- --exact
+        run: cargo test --locked -p aisix-obs --lib otlp_http_sink::tests::otlp_sink_posts_one_request_with_all_spans -- --exact
 
   build-bin:
     name: build aisix (instrumented)
@@ -370,7 +370,7 @@ jobs:
       - uses: ./.github/actions/setup-protoc
       - uses: Swatinem/rust-cache@v2
       - name: build
-        run: cargo build -p aisix-server --bin aisix
+        run: cargo build --locked -p aisix-server --bin aisix
       - uses: actions/upload-artifact@v7
         with:
           name: aisix-bin
@@ -385,7 +385,6 @@ jobs:
     runs-on: ubuntu-latest
     # Explicit, so the job's token stays read-only regardless of the
     # repository-level default (currently `read`, but that is a setting).
-    # Mirrors the mcp-conformance job below.
     permissions:
       contents: read
     strategy:
@@ -540,7 +539,7 @@ jobs:
     # other open PRs still report the old name and would all break the
     # moment the required contexts were renamed to the two leg names.
     name: e2e (vitest) + coverage
-    needs: [e2e, mcp-conformance]
+    needs: [e2e]
     # A skipped required check counts as satisfied, so this must still run
     # when the matrix fails — otherwise the gate would vanish exactly when
     # it matters.
@@ -553,43 +552,6 @@ jobs:
             echo "::error::e2e matrix result: ${{ needs.e2e.result }}"
             exit 1
           fi
-      - name: assert MCP conformance passed
-        # Folded into this required aggregate so the official-suite gate is
-        # merge-blocking without renaming the branch-protection contexts.
-        run: |
-          if [ "${{ needs.mcp-conformance.result }}" != "success" ]; then
-            echo "::error::mcp conformance result: ${{ needs.mcp-conformance.result }}"
-            exit 1
-          fi
-
-  mcp-conformance:
-    # The OFFICIAL MCP conformance suite against the shipped /mcp chain
-    # (scoped gateway + bridge + in-process upstream). Scenario list and
-    # deliberate exclusions live in scripts/mcp-conformance.sh; the suite
-    # and its transitive graph are pinned by tools/mcp-conformance/
-    # package-lock.json; needs Node >= 22 (fs.globSync). Merge-blocking
-    # through the e2e-gate aggregate below.
-    name: mcp conformance (official suite)
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    # This job executes third-party code (npm ci + cargo build scripts):
-    # keep the token read-only and out of the checkout's git config.
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: ./.github/actions/setup-protoc
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-      - name: build the conformance target
-        run: cargo build -p aisix-mcp --example conformance_server
-      - name: run the applicable server scenarios
-        run: bash scripts/mcp-conformance.sh
 
   coverage-gate:
     name: coverage >= 90%

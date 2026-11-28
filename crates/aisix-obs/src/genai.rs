@@ -170,9 +170,8 @@ impl HttpServerFacts {
 /// The upstream one attempt was addressed to.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UpstreamFacts {
-    /// `gen_ai.provider.name`, already mapped onto the conventions'
-    /// well-known values (see [`genai_provider_name`]). Empty when the
-    /// upstream is not a GenAI provider the gateway can name.
+    /// `gen_ai.provider.name`, preserving the configured provider identifier
+    /// (see [`genai_provider_name`]).
     pub provider_name: String,
     /// `gen_ai.request.model`: the model name sent to the upstream.
     pub request_model: String,
@@ -202,44 +201,9 @@ impl UpstreamFacts {
 
 /// `gen_ai.provider.name` for a dispatched upstream.
 ///
-/// The value is the conventions' discriminator for which provider's
-/// telemetry flavour a span follows, so a platform that hosts other vendors'
-/// models wins over the vendor: Claude reached through Bedrock is
-/// `aws.bedrock`. Otherwise the catalog vendor id maps onto the well-known
-/// value it names, and a vendor the conventions do not list keeps its own id,
-/// which they allow as a custom value.
-pub fn genai_provider_name(vendor: &str, adapter: Option<aisix_core::Adapter>) -> String {
-    use aisix_core::Adapter;
-    match adapter {
-        Some(Adapter::Bedrock) => return "aws.bedrock".into(),
-        Some(Adapter::Vertex) => return "gcp.vertex_ai".into(),
-        Some(Adapter::AzureOpenai) => return "azure.ai.openai".into(),
-        Some(Adapter::Openai) | Some(Adapter::Anthropic) | None => {}
-    }
-    let vendor = vendor.trim().to_ascii_lowercase();
-    let known = match vendor.as_str() {
-        "openai" => "openai",
-        "anthropic" => "anthropic",
-        "amazon-bedrock" | "bedrock" => "aws.bedrock",
-        "azure" | "azure-openai" | "azure_openai" => "azure.ai.openai",
-        "google" | "gemini" => "gcp.gemini",
-        "google-vertex" | "vertex" | "vertex_ai" => "gcp.vertex_ai",
-        "cohere" => "cohere",
-        "deepseek" => "deepseek",
-        "groq" => "groq",
-        "mistral" | "mistralai" | "mistral_ai" => "mistral_ai",
-        "perplexity" => "perplexity",
-        "xai" | "x_ai" => "x_ai",
-        "ibm" | "watsonx" | "ibm.watsonx.ai" => "ibm.watsonx.ai",
-        // A legacy row with no vendor is dispatched by its adapter family.
-        "" => match adapter {
-            Some(Adapter::Openai) => "openai",
-            Some(Adapter::Anthropic) => "anthropic",
-            _ => return String::new(),
-        },
-        _ => return vendor,
-    };
-    known.to_string()
+/// Provider identifiers are operator-defined and are exported verbatim.
+pub fn genai_provider_name(vendor: &str, _adapter: Option<aisix_core::Adapter>) -> String {
+    vendor.to_owned()
 }
 
 /// The caller's GenAI request parameters, read from the inbound body in the
@@ -937,27 +901,20 @@ mod tests {
     }
 
     #[test]
-    fn provider_name_prefers_the_hosting_platform_then_the_vendor() {
+    fn provider_name_preserves_the_configured_identifier() {
         use aisix_core::Adapter;
-        assert_eq!(
-            genai_provider_name("openai", Some(Adapter::Openai)),
-            "openai"
-        );
-        assert_eq!(
-            genai_provider_name("anthropic", Some(Adapter::Bedrock)),
-            "aws.bedrock"
-        );
-        assert_eq!(genai_provider_name("google-vertex", None), "gcp.vertex_ai");
-        assert_eq!(genai_provider_name("xai", Some(Adapter::Openai)), "x_ai");
-        assert_eq!(
-            genai_provider_name("wafer.ai", Some(Adapter::Openai)),
-            "wafer.ai"
-        );
-        assert_eq!(
-            genai_provider_name("", Some(Adapter::Anthropic)),
-            "anthropic"
-        );
-        assert_eq!(genai_provider_name("", None), "");
+        for vendor in [
+            "openai",
+            "anthropic",
+            "google-vertex",
+            "xai",
+            "wafer.ai",
+            " Acme.AI ",
+            "",
+        ] {
+            assert_eq!(genai_provider_name(vendor, Some(Adapter::Openai)), vendor);
+            assert_eq!(genai_provider_name(vendor, None), vendor);
+        }
     }
 
     #[test]

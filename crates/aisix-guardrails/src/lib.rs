@@ -18,18 +18,10 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
-#[cfg(feature = "aliyun-text-moderation")]
-mod aliyun;
-#[cfg(feature = "aliyun-text-moderation")]
-mod aliyun_ai_guardrail;
 mod audit;
-#[cfg(feature = "bedrock")]
-mod bedrock;
 mod build;
 mod call_error;
 mod chain;
-#[cfg(any(feature = "azure-content-safety", feature = "aliyun-text-moderation"))]
-mod chunk;
 mod custom;
 mod index;
 mod keyword;
@@ -40,11 +32,7 @@ mod openai_moderation;
 mod pii;
 #[cfg(feature = "presidio")]
 mod presidio;
-#[cfg(feature = "azure-content-safety")]
-mod prompt_shield;
 mod semantic;
-#[cfg(feature = "azure-content-safety")]
-mod text_moderation;
 mod too_large;
 
 use aisix_core::models::GuardrailMonitorHit;
@@ -78,8 +66,6 @@ pub(crate) fn truncate_error_body_for_log(body: &str) -> &str {
 /// thing. Reads chunk-by-chunk and gives up on the first read error — this is
 /// best-effort diagnostics on a path that's already returning an error.
 #[cfg(any(
-    feature = "azure-content-safety",
-    feature = "aliyun-text-moderation",
     feature = "lakera",
     feature = "openai-moderation",
     feature = "presidio",
@@ -96,7 +82,7 @@ pub(crate) async fn read_error_body_capped(mut resp: reqwest::Response, row: &st
 /// Split out from [`read_error_body_capped`] because a caller that PARSES the
 /// body needs a different budget from one that logs a snippet of it: a snippet
 /// can stop anywhere, whereas a truncated body may simply not contain the field
-/// being looked for. See `aliyun::MAX_ERROR_BODY_PARSE_BYTES`.
+/// being looked for. Parsing callers can choose a larger cap.
 pub(crate) async fn read_body_capped(
     resp: &mut reqwest::Response,
     cap: usize,
@@ -273,16 +259,6 @@ pub fn supported_kinds() -> &'static [&'static str] {
     &[
         "keyword",
         "pii",
-        #[cfg(feature = "azure-content-safety")]
-        "azure_content_safety",
-        #[cfg(feature = "azure-content-safety")]
-        "azure_content_safety_text_moderation",
-        #[cfg(feature = "aliyun-text-moderation")]
-        "aliyun_text_moderation",
-        #[cfg(feature = "aliyun-text-moderation")]
-        "aliyun_ai_guardrail",
-        #[cfg(feature = "bedrock")]
-        "bedrock",
         #[cfg(feature = "lakera")]
         "lakera",
         #[cfg(feature = "openai-moderation")]
@@ -446,13 +422,7 @@ impl std::fmt::Debug for GuardrailEmbedderSlot {
     }
 }
 
-#[cfg(feature = "aliyun-text-moderation")]
-pub use aliyun::AliyunTextModerationGuardrail;
-#[cfg(feature = "aliyun-text-moderation")]
-pub use aliyun_ai_guardrail::AliyunAiGuardrail;
 pub use audit::GuardrailAuditLog;
-#[cfg(feature = "bedrock")]
-pub use bedrock::BedrockGuardrail;
 pub use build::{
     build_chain_from_snapshot, build_index_from_snapshot, sweep_unattached_guardrails,
     unattached_guardrail_names, unbuildable_guardrail_rows, LiveGuardrailChain, LiveGuardrailIndex,
@@ -469,11 +439,7 @@ pub use openai_moderation::OpenaiModerationGuardrail;
 pub use pii::{builtin_rule, PiiAction, PiiGuardrail, PiiRule, BUILTIN_DETECTORS};
 #[cfg(feature = "presidio")]
 pub use presidio::PresidioGuardrail;
-#[cfg(feature = "azure-content-safety")]
-pub use prompt_shield::PromptShieldGuardrail;
 pub use semantic::SemanticGuardrail;
-#[cfg(feature = "azure-content-safety")]
-pub use text_moderation::TextModerationGuardrail;
 
 /// What a guardrail decided about a request or response.
 ///
@@ -1590,8 +1556,7 @@ mod tests {
     /// kind is either advertised or declared feature-gated.
     ///
     /// Only the top-level `oneOf` is read: the tagged sub-enums nested inside
-    /// a kind (`literal`/`regex` keyword patterns, the `static` credential
-    /// and `serial`/`timed` latency modes of `bedrock`) live under
+    /// a kind (such as `literal`/`regex` keyword patterns) live under
     /// `definitions` and are not selectable provider kinds.
     fn schema_kind_vocabulary() -> BTreeSet<String> {
         aisix_core::models::schema::guardrail_root_schema(true)["oneOf"]
@@ -1614,18 +1579,6 @@ mod tests {
     fn feature_disabled_kinds() -> BTreeSet<&'static str> {
         #[allow(unused_mut)]
         let mut disabled = BTreeSet::new();
-        #[cfg(not(feature = "azure-content-safety"))]
-        {
-            disabled.insert("azure_content_safety");
-            disabled.insert("azure_content_safety_text_moderation");
-        }
-        #[cfg(not(feature = "aliyun-text-moderation"))]
-        {
-            disabled.insert("aliyun_text_moderation");
-            disabled.insert("aliyun_ai_guardrail");
-        }
-        #[cfg(not(feature = "bedrock"))]
-        disabled.insert("bedrock");
         #[cfg(not(feature = "lakera"))]
         disabled.insert("lakera");
         #[cfg(not(feature = "openai-moderation"))]
@@ -1683,36 +1636,6 @@ mod tests {
                 "pii" => serde_json::json!({
                     "kind": "pii",
                     "detectors": [{"type": "email"}],
-                }),
-                "azure_content_safety" => serde_json::json!({
-                    "kind": "azure_content_safety",
-                    "endpoint": "https://x.cognitiveservices.azure.com",
-                    "api_key": "k",
-                }),
-                "azure_content_safety_text_moderation" => serde_json::json!({
-                    "kind": "azure_content_safety_text_moderation",
-                    "endpoint": "https://x.cognitiveservices.azure.com",
-                    "api_key": "k",
-                }),
-                "aliyun_text_moderation" => serde_json::json!({
-                    "kind": "aliyun_text_moderation",
-                    "region": "ap-southeast-1",
-                    "access_key_id": "ak",
-                    "access_key_secret": "sk",
-                }),
-                "aliyun_ai_guardrail" => serde_json::json!({
-                    "kind": "aliyun_ai_guardrail",
-                    "region": "cn-shanghai",
-                    "access_key_id": "ak",
-                    "access_key_secret": "sk",
-                }),
-                "bedrock" => serde_json::json!({
-                    "kind": "bedrock",
-                    "guardrail_id": "gr-1",
-                    "guardrail_version": "1",
-                    "region": "us-east-1",
-                    "aws_credentials": {"kind": "static", "access_key_id": "ak", "secret_access_key": "sk"},
-                    "latency_mode": {"kind": "serial"},
                 }),
                 "lakera" => serde_json::json!({
                     "kind": "lakera",

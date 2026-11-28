@@ -387,8 +387,8 @@ fn decode(stored: &StoredValue) -> Option<(Pin, StoreRecord)> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::shared_store::MemoryStore;
+    use super::*;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 

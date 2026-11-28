@@ -283,8 +283,8 @@ pub(crate) async fn resolve(
         return Ok(eligible.into_dispatch(None));
     }
 
-    let pick = decide_by_embedding(state, snapshot, router_entry, semantic, prompt, request_id)
-        .await;
+    let pick =
+        decide_by_embedding(state, snapshot, router_entry, semantic, prompt, request_id).await;
     let pick = match pick {
         Ok(pick) => pick,
         Err(failure) => {
@@ -817,7 +817,6 @@ fn fallback(
         }),
     }
 }
-
 
 /// The target [`select_eligible`] picked.
 struct Eligible {

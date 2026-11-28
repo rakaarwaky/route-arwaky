@@ -14,8 +14,8 @@ use aisix_core::resource::Resource;
 use aisix_core::resource::ResourceEntry;
 use aisix_core::snapshot::{ResourceTable, SnapshotHandle};
 use aisix_core::{
-    AisixSnapshot, ApiKey, CachePolicy, Guardrail, Model,
-    ObservabilityExporter, PassthroughRoute, ProviderKey,
+    AisixSnapshot, ApiKey, CachePolicy, Guardrail, Model, ObservabilityExporter, PassthroughRoute,
+    ProviderKey,
 };
 
 use crate::store::{ConfigStore, StoreError};

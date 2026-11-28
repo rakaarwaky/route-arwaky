@@ -34,11 +34,6 @@
 # this image's fails the build instead of producing an image that cannot start.
 FROM debian:trixie-slim AS runtime
 
-# Ownership-verification label for the MCP Registry: when this image is
-# published as an MCP server entry, the registry requires this label to
-# match the server name in server.json.
-LABEL io.modelcontextprotocol.server.name="io.github.api7/aisix"
-
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates tini \
     && rm -rf /var/lib/apt/lists/* \

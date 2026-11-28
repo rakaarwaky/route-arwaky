@@ -24,14 +24,12 @@
 //! rest."
 
 use aisix_core::models::{
-    validate_apikey_lenient, validate_cache_policy_lenient,
-    validate_claim_mapping_lenient, validate_guardrail_attachment_lenient,
-    validate_guardrail_lenient,
-    validate_model_lenient, validate_observability_exporter_lenient,
-    validate_oidc_provider_lenient, validate_passthrough_route_lenient,
-    validate_provider_key_lenient, validate_rate_limit_policy_lenient, ApiKey,
-    CachePolicy, ClaimMapping, Guardrail, GuardrailAttachment,
-    Model, ObservabilityExporter, OidcProvider, PassthroughRoute, ProviderKey,
+    validate_apikey_lenient, validate_cache_policy_lenient, validate_claim_mapping_lenient,
+    validate_guardrail_attachment_lenient, validate_guardrail_lenient, validate_model_lenient,
+    validate_observability_exporter_lenient, validate_oidc_provider_lenient,
+    validate_passthrough_route_lenient, validate_provider_key_lenient,
+    validate_rate_limit_policy_lenient, ApiKey, CachePolicy, ClaimMapping, Guardrail,
+    GuardrailAttachment, Model, ObservabilityExporter, OidcProvider, PassthroughRoute, ProviderKey,
     RateLimitPolicy, SchemaError,
 };
 use aisix_core::models::{
@@ -1054,16 +1052,9 @@ mod tests {
 
     #[test]
     fn provider_key_aws_region_payload_loads_partially_compatible() {
-        // Flip of the pre-#871 `*_currently_rejected` pin. cp-api's
-        // adapter_map admits Bedrock provider_key payloads carrying a
-        // top-level `aws_region`; the DP adapter never reads that field
-        // — the Bedrock bridge takes its region from the credential JSON
-        // inside `api_key` (`aisix-provider-bedrock/src/bridge.rs`,
-        // `BedrockSecret.region`). So the field stays off the model
-        // (a struct field nothing consumes would be dead config) and the
-        // row loads with the field ignored and reported, instead of the
-        // pre-#871 whole-row rejection that silently kept the key from
-        // ever reaching dispatch.
+        // Legacy provider keys may carry cloud-specific fields. The OpenAI
+        // adapter does not consume them: load the row while reporting the
+        // ignored fields as partial compatibility, rather than rejecting it.
         let entries = vec![raw(
             "/aisix/provider_keys/pk-bedrock",
             br#"{"display_name":"bedrock-pk","api_key":"x","provider":"amazon-bedrock","aws_region":"us-east-1"}"#,
@@ -1085,10 +1076,8 @@ mod tests {
 
     #[test]
     fn provider_key_gcp_project_payload_loads_partially_compatible() {
-        // Same decision as aws_region: the Vertex bridge reads project
-        // and region from the credential JSON inside `api_key`
-        // (`VertexSecret.project` / `.region`), never from top-level
-        // fields — YELLOW load, fields reported.
+        // As with aws_region, legacy cloud metadata is ignored and reported;
+        // it is not a configuration input for the OpenAI adapter.
         let entries = vec![raw(
             "/aisix/provider_keys/pk-vertex",
             br#"{"display_name":"vertex-pk","api_key":"x","provider":"google-vertex","gcp_project":"my-proj","gcp_region":"us-central1"}"#,

@@ -4017,9 +4017,7 @@ fn responses_stream_event_text(event: &Value) -> String {
         ) => fields(&["delta"]),
         Some("response.output_text.done") => fields(&["text"]),
         Some("response.refusal.done") => fields(&["refusal"]),
-        Some("response.function_call_arguments.done") => {
-            fields(&["name", "arguments"])
-        }
+        Some("response.function_call_arguments.done") => fields(&["name", "arguments"]),
         Some("response.custom_tool_call_input.done") => fields(&["name", "input"]),
         Some("response.content_part.added" | "response.content_part.done") => event
             .get("part")
@@ -4090,8 +4088,7 @@ fn responses_sse_output_text(bytes: &[u8]) -> String {
             // string; a separator would split a literal that streamed across
             // two deltas (e.g. "BLOCK"+"ME") and miss the match.
             Some(
-                "response.function_call_arguments.delta"
-                | "response.custom_tool_call_input.delta",
+                "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta",
             ) => {
                 if let Some(d) = json.get("delta").and_then(|d| d.as_str()) {
                     deltas.push_str(d);

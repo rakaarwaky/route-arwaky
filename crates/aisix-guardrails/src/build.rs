@@ -72,28 +72,15 @@ fn sorted_guardrail_entries(
 /// row is skipped — same contract the loader uses for malformed etcd
 /// rows.
 ///
-/// `bedrock_endpoint_url` is the deployment-wide override for the
-/// AWS Bedrock endpoint URL (sourced from
-/// `aisix_core::Config::bedrock_endpoint_url`). `None` → SDK
-/// default (real AWS Bedrock); `Some(url)` → every kind=bedrock
-/// dispatcher built from this snapshot is pointed at `url`.
 pub fn build_chain_from_snapshot(
     table: &ResourceTable<DomainGuardrail>,
-    bedrock_endpoint_url: Option<&str>,
     embedder: &GuardrailEmbedderSlot,
 ) -> GuardrailChain {
-    build_chain_from_snapshot_reported(
-        table,
-        bedrock_endpoint_url,
-        embedder,
-        &mut GuardrailInstances::default(),
-    )
-    .0
+    build_chain_from_snapshot_reported(table, embedder, &mut GuardrailInstances::default()).0
 }
 
 fn build_chain_from_snapshot_reported(
     table: &ResourceTable<DomainGuardrail>,
-    bedrock_endpoint_url: Option<&str>,
     embedder: &GuardrailEmbedderSlot,
     instances: &mut GuardrailInstances,
 ) -> (GuardrailChain, Vec<GuardrailBuildRejection>) {
@@ -111,12 +98,7 @@ fn build_chain_from_snapshot_reported(
         if !row.enabled {
             continue;
         }
-        match instances.instance(
-            entry,
-            bedrock_endpoint_url,
-            embedder,
-            &mut BuildReuse::default(),
-        ) {
+        match instances.instance(entry, embedder, &mut BuildReuse::default()) {
             Ok(Some(g)) => {
                 chain.push((row.name.clone(), g, row.input_messages));
                 applied.push(applied_for(row));
@@ -160,22 +142,19 @@ pub struct UnbuildableGuardrailRow {
 /// reason that says nothing about the file being checked.
 pub fn unbuildable_guardrail_rows(
     table: &ResourceTable<DomainGuardrail>,
-    bedrock_endpoint_url: Option<&str>,
 ) -> Vec<UnbuildableGuardrailRow> {
     let embedder = GuardrailEmbedderSlot::none();
     sorted_guardrail_entries(table)
         .iter()
         .filter(|entry| entry.value.enabled)
-        .filter_map(
-            |entry| match build_one(&entry.value, bedrock_endpoint_url, &embedder) {
-                Ok(_) => None,
-                Err(BuildError::EmbedderUnavailable) => None,
-                Err(err) => Some(UnbuildableGuardrailRow {
-                    name: entry.value.name.clone(),
-                    reason: err.to_string(),
-                }),
-            },
-        )
+        .filter_map(|entry| match build_one(&entry.value, &embedder) {
+            Ok(_) => None,
+            Err(BuildError::EmbedderUnavailable) => None,
+            Err(err) => Some(UnbuildableGuardrailRow {
+                name: entry.value.name.clone(),
+                reason: err.to_string(),
+            }),
+        })
         .collect()
 }
 
@@ -229,7 +208,6 @@ impl GuardrailInstances {
     fn instance(
         &mut self,
         entry: &Arc<aisix_core::resource::ResourceEntry<DomainGuardrail>>,
-        bedrock_endpoint_url: Option<&str>,
         embedder: &GuardrailEmbedderSlot,
         reuse: &mut BuildReuse,
     ) -> Result<Option<Arc<dyn Guardrail>>, GuardrailBuildRejection> {
@@ -240,7 +218,7 @@ impl GuardrailInstances {
             }
         }
         reuse.constructed += 1;
-        let outcome = match build_one(&entry.value, bedrock_endpoint_url, embedder) {
+        let outcome = match build_one(&entry.value, embedder) {
             Ok(built) => Ok(built),
             Err(err) => {
                 tracing::warn!(
@@ -285,11 +263,9 @@ impl GuardrailInstances {
 /// enforcement, which is what `block` mode is.
 fn build_one(
     row: &DomainGuardrail,
-    bedrock_endpoint_url: Option<&str>,
     embedder: &GuardrailEmbedderSlot,
 ) -> Result<Option<Arc<dyn Guardrail>>, BuildError> {
-    Ok(build_one_inner(row, bedrock_endpoint_url, embedder)?
-        .map(|g| apply_enforcement_mode(row, g)))
+    Ok(build_one_inner(row, embedder)?.map(|g| apply_enforcement_mode(row, g)))
 }
 
 /// Wrap `inner` per the row's `enforcement_mode`. See [`build_one`].
@@ -314,7 +290,6 @@ fn apply_enforcement_mode(row: &DomainGuardrail, inner: Arc<dyn Guardrail>) -> A
 
 fn build_one_inner(
     row: &DomainGuardrail,
-    bedrock_endpoint_url: Option<&str>,
     embedder: &GuardrailEmbedderSlot,
 ) -> Result<Option<Arc<dyn Guardrail>>, BuildError> {
     match &row.config {
@@ -410,102 +385,6 @@ fn build_one_inner(
             )
             .with_fail_open(row.fail_open);
             Ok(Some(Arc::new(g)))
-        }
-        #[cfg(feature = "bedrock")]
-        GuardrailKind::Bedrock(cfg) => {
-            // Phase 2: build the AWS-SDK-backed dispatcher. cp-api
-            // already decrypted the secret at projection time, so
-            // the BedrockConfig in the snapshot carries plaintext
-            // credentials. The endpoint URL is forwarded from
-            // bootstrap config (Config.bedrock_endpoint_url).
-            let g = crate::bedrock::BedrockGuardrail::new(
-                row.name.clone(),
-                cfg,
-                row.hook_point,
-                row.fail_open,
-                bedrock_endpoint_url.map(str::to_owned),
-            );
-            Ok(Some(Arc::new(g)))
-        }
-        #[cfg(not(feature = "bedrock"))]
-        GuardrailKind::Bedrock(_) => {
-            // Built without --features bedrock. Skip + warn so an
-            // operator who happens to deploy a Bedrock row to a
-            // pruned-build DP sees the misconfig in logs.
-            Err(BuildError::FeatureDisabled("bedrock"))
-        }
-        #[cfg(feature = "azure-content-safety")]
-        GuardrailKind::AzureContentSafety(cfg) => {
-            // P1: HTTP-based Prompt Shield dispatcher. cp-api already
-            // decrypted the api_key at projection time; the config carries
-            // plaintext. No deployment-wide endpoint override needed —
-            // the endpoint is per-row (each customer has their own Azure CS
-            // resource).
-            let g = crate::prompt_shield::PromptShieldGuardrail::new(
-                row.name.clone(),
-                cfg,
-                row.hook_point,
-                row.fail_open,
-            );
-            Ok(Some(Arc::new(g)))
-        }
-        #[cfg(not(feature = "azure-content-safety"))]
-        GuardrailKind::AzureContentSafety(_) => {
-            // Built without --features azure-content-safety. Skip + warn.
-            Err(BuildError::FeatureDisabled("azure-content-safety"))
-        }
-        #[cfg(feature = "azure-content-safety")]
-        GuardrailKind::AzureContentSafetyTextModeration(cfg) => {
-            // P2: HTTP-based text:analyze dispatcher. cp-api already
-            // decrypted the api_key at projection time; the config carries
-            // plaintext. Endpoint is per-row (each customer's own resource).
-            let g = crate::text_moderation::TextModerationGuardrail::new(
-                row.name.clone(),
-                cfg,
-                row.hook_point,
-                row.fail_open,
-            );
-            Ok(Some(Arc::new(g)))
-        }
-        #[cfg(not(feature = "azure-content-safety"))]
-        GuardrailKind::AzureContentSafetyTextModeration(_) => {
-            Err(BuildError::FeatureDisabled("azure-content-safety"))
-        }
-        #[cfg(feature = "aliyun-text-moderation")]
-        GuardrailKind::AliyunTextModeration(cfg) => {
-            // #603: HTTP-based TextModerationPlus dispatcher. cp-api already
-            // decrypted the access_key_secret at projection time; the config
-            // carries plaintext. Endpoint is per-row (derived from the row's
-            // region, or an explicit override for tests/dev).
-            let g = crate::aliyun::AliyunTextModerationGuardrail::new(
-                row.name.clone(),
-                cfg,
-                row.hook_point,
-                row.fail_open,
-            );
-            Ok(Some(Arc::new(g)))
-        }
-        #[cfg(not(feature = "aliyun-text-moderation"))]
-        GuardrailKind::AliyunTextModeration(_) => {
-            Err(BuildError::FeatureDisabled("aliyun-text-moderation"))
-        }
-        #[cfg(feature = "aliyun-text-moderation")]
-        GuardrailKind::AliyunAiGuardrail(cfg) => {
-            // #1070: MultiModalGuard dispatcher (Aliyun AI Guardrails — a
-            // different product from TextModerationPlus above, same signing
-            // scheme). cp-api already decrypted the access_key_secret at
-            // projection time; the config carries plaintext.
-            let g = crate::aliyun_ai_guardrail::AliyunAiGuardrail::new(
-                row.name.clone(),
-                cfg,
-                row.hook_point,
-                row.fail_open,
-            );
-            Ok(Some(Arc::new(g)))
-        }
-        #[cfg(not(feature = "aliyun-text-moderation"))]
-        GuardrailKind::AliyunAiGuardrail(_) => {
-            Err(BuildError::FeatureDisabled("aliyun-text-moderation"))
         }
         #[cfg(feature = "lakera")]
         GuardrailKind::Lakera(cfg) => {
@@ -668,8 +547,7 @@ enum BuildError {
     )]
     ReplacementOnBlock { name: String },
     /// A guardrail kind whose runtime dispatch was compiled out via
-    /// feature flags (e.g. a pruned build that excluded `--features bedrock`
-    /// or `--features azure-content-safety`). The chain treats the row as
+    /// feature flags (e.g. a build without `--features openai-moderation`). The chain treats the row as
     /// disabled and the warn log surfaces the kind name so the misconfig is visible.
     ///
     /// Always declared in the enum (not behind `#[cfg]`) so `build_one` can
@@ -853,7 +731,7 @@ impl MonitorGuardrail {
     /// Probe the inner SYNC redactor (kind=pii) with the hook's scan text
     /// and record what it would have masked. Redaction stays suppressed —
     /// this only recovers the counts for telemetry. Segment moderators
-    /// (bedrock/lakera/presidio) report through the segment pass instead.
+    /// (lakera/presidio) report through the segment pass instead.
     fn probe_redaction(
         &self,
         hook: &'static str,
@@ -969,7 +847,7 @@ impl Guardrail for MonitorGuardrail {
             .await
     }
 
-    /// Delegate so a monitored segment moderator (bedrock/lakera/presidio)
+    /// Delegate so a monitored segment moderator (lakera/presidio)
     /// is consulted through the segment pass — ONE provider call whose
     /// verdict AND mask are observed with full fidelity — instead of the
     /// blob path, where a maskable outcome degrades to a would-block.
@@ -1126,13 +1004,9 @@ impl Guardrail for MonitorGuardrail {
 /// [`ResourceTable::generation`] and NOT on the snapshot version, so a
 /// write to any other resource kind rebuilds nothing (AISIX-Cloud#1542).
 ///
-/// `bedrock_endpoint_url` is captured at construct time and reused
-/// on every rebuild; this is a deployment-wide setting (sourced
-/// from `aisix_core::Config::bedrock_endpoint_url`) and doesn't
-/// change while the DP is running.
 pub struct LiveGuardrailChain {
     snapshot: SnapshotHandle<AisixSnapshot>,
-    bedrock_endpoint_url: Option<String>,
+
     embedder: GuardrailEmbedderSlot,
     config_status: Option<ConfigStatus>,
     cache: Mutex<Cache>,
@@ -1150,10 +1024,9 @@ struct Cache {
 impl LiveGuardrailChain {
     pub fn new(
         snapshot: SnapshotHandle<AisixSnapshot>,
-        bedrock_endpoint_url: Option<String>,
         embedder: GuardrailEmbedderSlot,
     ) -> Arc<Self> {
-        Self::new_with_status(snapshot, bedrock_endpoint_url, embedder, None)
+        Self::new_with_status(snapshot, embedder, None)
     }
 
     /// Construct the legacy whole-environment chain with configuration-build
@@ -1161,7 +1034,6 @@ impl LiveGuardrailChain {
     /// adapter must preserve the same status contract for direct consumers.
     pub fn new_with_status(
         snapshot: SnapshotHandle<AisixSnapshot>,
-        bedrock_endpoint_url: Option<String>,
         embedder: GuardrailEmbedderSlot,
         config_status: Option<ConfigStatus>,
     ) -> Arc<Self> {
@@ -1171,16 +1043,12 @@ impl LiveGuardrailChain {
         let snap = snapshot.load();
         let last_generation = snap.guardrails.generation();
         let mut instances = GuardrailInstances::default();
-        let (chain, rejected) = build_chain_from_snapshot_reported(
-            &snap.guardrails,
-            bedrock_endpoint_url.as_deref(),
-            &embedder,
-            &mut instances,
-        );
+        let (chain, rejected) =
+            build_chain_from_snapshot_reported(&snap.guardrails, &embedder, &mut instances);
         publish_build_rejections(config_status.as_ref(), rejected);
         Arc::new(Self {
             snapshot,
-            bedrock_endpoint_url,
+
             embedder,
             config_status,
             cache: Mutex::new(Cache {
@@ -1204,7 +1072,6 @@ impl LiveGuardrailChain {
         if cache.last_generation != generation {
             let (chain, rejected) = build_chain_from_snapshot_reported(
                 &snap.guardrails,
-                self.bedrock_endpoint_url.as_deref(),
                 &self.embedder,
                 &mut cache.instances,
             );
@@ -1327,13 +1194,11 @@ impl Guardrail for LiveGuardrailChain {
 pub fn build_index_from_snapshot(
     guardrails: &ResourceTable<DomainGuardrail>,
     attachments: &ResourceTable<GuardrailAttachment>,
-    bedrock_endpoint_url: Option<&str>,
     embedder: &GuardrailEmbedderSlot,
 ) -> GuardrailIndex {
     build_index_from_snapshot_reported(
         guardrails,
         attachments,
-        bedrock_endpoint_url,
         embedder,
         &mut GuardrailInstances::default(),
     )
@@ -1352,7 +1217,6 @@ struct GuardrailBuildRejection {
 fn build_index_from_snapshot_reported(
     guardrails: &ResourceTable<DomainGuardrail>,
     attachments: &ResourceTable<GuardrailAttachment>,
-    bedrock_endpoint_url: Option<&str>,
     embedder: &GuardrailEmbedderSlot,
     instances: &mut GuardrailInstances,
 ) -> (GuardrailIndex, Vec<GuardrailBuildRejection>, BuildReuse) {
@@ -1396,15 +1260,14 @@ fn build_index_from_snapshot_reported(
         // One instance per ROW, shared by all its attachments: `build_one`
         // reads only the row, and everything the attachment contributes
         // (scope, priority) lands on the index entry below.
-        let runtime_guardrail =
-            match instances.instance(&guardrail_arc, bedrock_endpoint_url, embedder, &mut reuse) {
-                Ok(Some(g)) => g,
-                Ok(None) => continue, // inert (e.g. empty keyword list)
-                Err(rejection) => {
-                    rejected.entry(gid.clone()).or_insert(rejection);
-                    continue;
-                }
-            };
+        let runtime_guardrail = match instances.instance(&guardrail_arc, embedder, &mut reuse) {
+            Ok(Some(g)) => g,
+            Ok(None) => continue, // inert (e.g. empty keyword list)
+            Err(rejection) => {
+                rejected.entry(gid.clone()).or_insert(rejection);
+                continue;
+            }
+        };
 
         let scope_kind = match attachment.scope_type {
             GuardrailScopeType::Env => ScopeKind::Env,
@@ -1725,7 +1588,7 @@ pub fn sweep_unattached_guardrails(
 /// configuration write off the request path (AISIX-Cloud#1542).
 pub struct LiveGuardrailIndex {
     snapshot: SnapshotHandle<AisixSnapshot>,
-    bedrock_endpoint_url: Option<String>,
+
     embedder: GuardrailEmbedderSlot,
     /// Per-execution telemetry receiver, attached to every resolved chain
     /// (AISIX-Cloud#1076). `None` (tests, standalone construction) records
@@ -1765,16 +1628,8 @@ fn index_key(snap: &AisixSnapshot) -> (u64, u64) {
 }
 
 impl LiveGuardrailIndex {
-    pub fn new(
-        snapshot: SnapshotHandle<AisixSnapshot>,
-        bedrock_endpoint_url: Option<String>,
-    ) -> Arc<Self> {
-        Self::new_with_sink(
-            snapshot,
-            bedrock_endpoint_url,
-            None,
-            GuardrailEmbedderSlot::none(),
-        )
+    pub fn new(snapshot: SnapshotHandle<AisixSnapshot>) -> Arc<Self> {
+        Self::new_with_sink(snapshot, None, GuardrailEmbedderSlot::none())
     }
 
     /// Like [`LiveGuardrailIndex::new`], also attaching a metrics sink to
@@ -1782,18 +1637,16 @@ impl LiveGuardrailIndex {
     /// process's embedding dispatcher for `kind: "semantic"` rows.
     pub fn new_with_sink(
         snapshot: SnapshotHandle<AisixSnapshot>,
-        bedrock_endpoint_url: Option<String>,
         metrics_sink: Option<Arc<dyn aisix_core::GuardrailMetricsSink>>,
         embedder: GuardrailEmbedderSlot,
     ) -> Arc<Self> {
-        Self::new_with_sink_and_status(snapshot, bedrock_endpoint_url, metrics_sink, embedder, None)
+        Self::new_with_sink_and_status(snapshot, metrics_sink, embedder, None)
     }
 
     /// Production constructor: additionally reports lazy index-build
     /// failures through the shared configuration status.
     pub fn new_with_sink_and_status(
         snapshot: SnapshotHandle<AisixSnapshot>,
-        bedrock_endpoint_url: Option<String>,
         metrics_sink: Option<Arc<dyn aisix_core::GuardrailMetricsSink>>,
         embedder: GuardrailEmbedderSlot,
         config_status: Option<ConfigStatus>,
@@ -1804,14 +1657,13 @@ impl LiveGuardrailIndex {
         let (index, rejected, _) = build_index_from_snapshot_reported(
             &snap.guardrails,
             &snap.guardrail_attachments,
-            bedrock_endpoint_url.as_deref(),
             &embedder,
             &mut instances,
         );
         publish_build_rejections(config_status.as_ref(), rejected);
         Arc::new(Self {
             snapshot,
-            bedrock_endpoint_url,
+
             embedder,
             metrics_sink,
             config_status,
@@ -1869,7 +1721,6 @@ impl LiveGuardrailIndex {
         let (new_index, rejected, reuse) = build_index_from_snapshot_reported(
             &snap.guardrails,
             &snap.guardrail_attachments,
-            self.bedrock_endpoint_url.as_deref(),
             &self.embedder,
             &mut cache.instances,
         );
@@ -1962,7 +1813,7 @@ mod tests {
                 "script": "   "
             }"#,
         );
-        match build_one(&row, None, &GuardrailEmbedderSlot::none()) {
+        match build_one(&row, &GuardrailEmbedderSlot::none()) {
             Err(BuildError::InvalidValue {
                 field: "script", ..
             }) => {}
@@ -1995,7 +1846,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(&table, &GuardrailEmbedderSlot::none());
         assert_eq!(chain.len(), 1);
         let v = chain.check_input(&req("here is AKIAEXAMPLE")).await;
         assert!(v.is_block());
@@ -2020,7 +1871,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(&table, &GuardrailEmbedderSlot::none());
         assert_eq!(chain.len(), 1, "monitor-mode row still materialises");
         // Would block under `block` mode; monitor downgrades to Allow.
         let v = chain.check_input(&req("here is AKIAEXAMPLE")).await;
@@ -2062,7 +1913,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(&table, &GuardrailEmbedderSlot::none());
 
         // mask-action detector match → would_mask hit with counts.
         let (v, hits) = chain
@@ -2111,7 +1962,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(&table, &GuardrailEmbedderSlot::none());
 
         let (verdict, hits) = chain
             .check_input_observed(&req("customer-private-text"))
@@ -2143,7 +1994,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(&table, &GuardrailEmbedderSlot::none());
         let outcome = chain
             .moderate_input_segments_for_model(&["hi".to_owned()], Some("restricted"))
             .await;
@@ -2190,7 +2041,7 @@ mod tests {
                 .unwrap(),
             ));
             let sink = Arc::new(ErrorTypes::default());
-            let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none())
+            let chain = build_chain_from_snapshot(&table, &GuardrailEmbedderSlot::none())
                 .with_metrics_sink(Some(sink.clone()));
 
             let (verdict, hits) = chain.check_input_observed(&req("anything")).await;
@@ -2227,7 +2078,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(&table, &GuardrailEmbedderSlot::none());
 
         let (verdict, hits) = chain
             .check_input_observed(&req("prefix customer-private-pattern suffix"))
@@ -2261,7 +2112,7 @@ mod tests {
     #[tokio::test]
     async fn custom_monitor_mask_uses_code_owned_counts() {
         let table = custom_mask_table("monitor");
-        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(&table, &GuardrailEmbedderSlot::none());
         let original = vec!["customer-private-text".to_owned()];
 
         let outcome = chain.moderate_input_segments(&original).await;
@@ -2280,7 +2131,7 @@ mod tests {
     #[tokio::test]
     async fn custom_enforced_mask_uses_code_owned_counts() {
         let table = custom_mask_table("block");
-        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none())
+        let chain = build_chain_from_snapshot(&table, &GuardrailEmbedderSlot::none())
             .with_audit_log(Some(Arc::new(crate::GuardrailAuditLog::new())));
         let original = vec!["customer-private-text".to_owned()];
 
@@ -2313,7 +2164,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(&table, &GuardrailEmbedderSlot::none());
         let (v, hits) = chain
             .check_input_observed(&req("here is AKIAEXAMPLE"))
             .await;
@@ -2351,7 +2202,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(&table, &GuardrailEmbedderSlot::none());
         let (v, hits) = chain
             .check_input_observed(&req("here is AKIAEXAMPLE"))
             .await;
@@ -2385,7 +2236,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(&table, &GuardrailEmbedderSlot::none());
         assert!(
             !chain.stream_output_policy().holds_back(),
             "monitor-mode output rule must not hold the stream back",
@@ -2408,7 +2259,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(&table, &GuardrailEmbedderSlot::none());
         assert!(
             chain
                 .check_input(&req("here is AKIAEXAMPLE"))
@@ -2439,7 +2290,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(&table, &GuardrailEmbedderSlot::none());
         assert_eq!(chain.len(), 1);
         let r = chain.redact_input_text("tool version: 12.1 done").unwrap();
         assert_eq!(r.text, "tool version: *** done");
@@ -2471,7 +2322,7 @@ mod tests {
                 }}"#
             )),
         ));
-        build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none())
+        build_chain_from_snapshot(&table, &GuardrailEmbedderSlot::none())
     }
 
     /// #1027: a local kind judges each segment on its own, so a rule
@@ -2562,7 +2413,7 @@ mod tests {
         ] {
             let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
             table.insert(entry("bad", "g-1", parse(row)));
-            let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+            let chain = build_chain_from_snapshot(&table, &GuardrailEmbedderSlot::none());
             assert!(
                 chain.is_empty(),
                 "replacement+block row must be skipped, not half-honored",
@@ -2570,15 +2421,14 @@ mod tests {
         }
     }
 
-    fn aliyun_row_against(endpoint: &str, extra: &str) -> DomainGuardrail {
+    #[cfg(feature = "openai-moderation")]
+    fn moderation_row_against(endpoint: &str, extra: &str) -> DomainGuardrail {
         parse(&format!(
             r#"{{
-                "name": "aliyun-monitor",
-                "kind": "aliyun_text_moderation",
-                "region": "cn-shanghai",
+                "name": "moderation-monitor",
+                "kind": "openai_moderation",
                 "endpoint": "{endpoint}",
-                "access_key_id": "ak",
-                "access_key_secret": "sk"{extra}
+                "api_key": "sk"{extra}
             }}"#,
         ))
     }
@@ -2607,38 +2457,17 @@ mod tests {
         // kind's own flattened config — the shape cp-api projects.
         const ASYMMETRIC: &str = r#""fail_open": true, "output_fail_open": false"#;
         let rows: Vec<(&str, String)> = vec![
-            (
-                "azure_content_safety",
-                format!(
-                    r#"{{"name":"n","kind":"azure_content_safety","endpoint":"https://e","api_key":"k",{ASYMMETRIC}}}"#
-                ),
-            ),
-            (
-                "azure_content_safety_text_moderation",
-                format!(
-                    r#"{{"name":"n","kind":"azure_content_safety_text_moderation","endpoint":"https://e","api_key":"k",{ASYMMETRIC}}}"#
-                ),
-            ),
-            (
-                "aliyun_text_moderation",
-                format!(
-                    r#"{{"name":"n","kind":"aliyun_text_moderation","region":"cn-shanghai","access_key_id":"ak","access_key_secret":"sk",{ASYMMETRIC}}}"#
-                ),
-            ),
-            (
-                "aliyun_ai_guardrail",
-                format!(
-                    r#"{{"name":"n","kind":"aliyun_ai_guardrail","region":"cn-shanghai","access_key_id":"ak","access_key_secret":"sk",{ASYMMETRIC}}}"#
-                ),
-            ),
+            #[cfg(feature = "lakera")]
             (
                 "lakera",
                 format!(r#"{{"name":"n","kind":"lakera","api_key":"k",{ASYMMETRIC}}}"#),
             ),
+            #[cfg(feature = "openai-moderation")]
             (
                 "openai_moderation",
                 format!(r#"{{"name":"n","kind":"openai_moderation","api_key":"k",{ASYMMETRIC}}}"#),
             ),
+            #[cfg(feature = "presidio")]
             (
                 "presidio",
                 format!(
@@ -2651,18 +2480,11 @@ mod tests {
                     r#"{{"name":"n","kind":"custom","script":"export function checkInput() {{ return {{ action: \"allow\" }}; }}",{ASYMMETRIC}}}"#
                 ),
             ),
-            #[cfg(feature = "bedrock")]
-            (
-                "bedrock",
-                format!(
-                    r#"{{"name":"n","kind":"bedrock","guardrail_id":"abcdefgh1234","guardrail_version":"DRAFT","region":"us-east-1","aws_credentials":{{"kind":"static","access_key_id":"AKIA","secret_access_key":"s"}},"latency_mode":{{"kind":"serial"}},{ASYMMETRIC}}}"#
-                ),
-            ),
         ];
 
         for (kind, json) in &rows {
             let row = parse(json);
-            let g = build_one(&row, None, &GuardrailEmbedderSlot::none())
+            let g = build_one(&row, &GuardrailEmbedderSlot::none())
                 .unwrap_or_else(|e| panic!("{kind} row must build: {e}"))
                 .unwrap_or_else(|| panic!("{kind} row must not be inert"));
             assert!(
@@ -2675,12 +2497,16 @@ mod tests {
             );
         }
         assert!(
-            rows.len() >= 8,
+            rows.len()
+                == 1 + usize::from(cfg!(feature = "lakera"))
+                    + usize::from(cfg!(feature = "openai-moderation"))
+                    + usize::from(cfg!(feature = "presidio")),
             "the table must not silently shrink to nothing"
         );
     }
 
     #[tokio::test]
+    #[cfg(feature = "openai-moderation")]
     async fn monitor_downgrades_provider_failure_block() {
         use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
         let server = MockServer::builder().start().await;
@@ -2688,11 +2514,11 @@ mod tests {
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
             .await;
-        let row = aliyun_row_against(
+        let row = moderation_row_against(
             &server.uri(),
             r#", "enforcement_mode": "monitor", "fail_open": false"#,
         );
-        let g = build_one(&row, None, &GuardrailEmbedderSlot::none())
+        let g = build_one(&row, &GuardrailEmbedderSlot::none())
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -2705,6 +2531,7 @@ mod tests {
     /// A monitor row that suppressed a Block still reports it, so the
     /// operator can see what would have happened.
     #[tokio::test]
+    #[cfg(feature = "openai-moderation")]
     async fn downgraded_unavailability_block_still_emits_would_block() {
         use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
         let server = MockServer::builder().start().await;
@@ -2712,8 +2539,8 @@ mod tests {
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
             .await;
-        let row = aliyun_row_against(&server.uri(), r#", "enforcement_mode": "monitor""#);
-        let g = build_one(&row, None, &GuardrailEmbedderSlot::none())
+        let row = moderation_row_against(&server.uri(), r#", "enforcement_mode": "monitor""#);
+        let g = build_one(&row, &GuardrailEmbedderSlot::none())
             .unwrap()
             .unwrap();
         let (verdict, hits) = g.check_input_observed(&req("hello")).await;
@@ -2722,9 +2549,9 @@ mod tests {
         assert_eq!(hits[0].action, "would_block");
         assert_eq!(
             hits[0].reason,
-            "aliyun_text_moderation guardrail evaluation unavailable (aliyun_5xx)"
+            "openai moderation unavailable (openai_moderation_5xx)"
         );
-        assert_eq!(hits[0].error_type, "aliyun_5xx");
+        assert_eq!(hits[0].error_type, "openai_moderation_5xx");
     }
 
     /// Monitor mode is unconditional: a provider outage is still only
@@ -2732,6 +2559,7 @@ mod tests {
     /// that makes a monitored row block — that is what `block` mode is
     /// for.
     #[tokio::test]
+    #[cfg(feature = "openai-moderation")]
     async fn monitor_never_blocks_on_provider_failure() {
         use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
         let server = MockServer::builder().start().await;
@@ -2739,8 +2567,8 @@ mod tests {
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
             .await;
-        let row = aliyun_row_against(&server.uri(), r#", "enforcement_mode": "monitor""#);
-        let g = build_one(&row, None, &GuardrailEmbedderSlot::none())
+        let row = moderation_row_against(&server.uri(), r#", "enforcement_mode": "monitor""#);
+        let g = build_one(&row, &GuardrailEmbedderSlot::none())
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -2767,7 +2595,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(&table, &GuardrailEmbedderSlot::none());
         assert_eq!(chain.len(), 0);
     }
 
@@ -2785,7 +2613,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(&table, &GuardrailEmbedderSlot::none());
         assert_eq!(chain.len(), 0, "empty list adds nothing to the chain");
     }
 
@@ -2819,7 +2647,7 @@ mod tests {
             ),
         ));
 
-        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(&table, &GuardrailEmbedderSlot::none());
         // Only the good row makes it in.
         assert_eq!(chain.len(), 1);
         let v = chain.check_input(&req("ok")).await;
@@ -2845,61 +2673,15 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(&table, &GuardrailEmbedderSlot::none());
         assert_eq!(chain.len(), 0, "out-of-range threshold row must be skipped");
-    }
-
-    /// Phase 2 contract: kind=bedrock rows materialise into the
-    /// runtime chain alongside keyword rows. We don't hit AWS in
-    /// this test (the request never makes it past chain
-    /// composition) — we just pin that both kinds compose into the
-    /// final chain length, and that the keyword Block still fires.
-    #[cfg(feature = "bedrock")]
-    #[tokio::test]
-    async fn bedrock_kind_materialises_alongside_keyword_in_chain() {
-        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
-        table.insert(entry(
-            "bedrock-row",
-            "g-1",
-            parse(
-                r#"{
-                    "name": "bedrock-row",
-                    "kind": "bedrock",
-                    "guardrail_id": "abcdefgh1234",
-                    "guardrail_version": "DRAFT",
-                    "region": "us-east-1",
-                    "aws_credentials": {
-                        "kind": "static",
-                        "access_key_id": "AKIA",
-                        "secret_access_key": "test-secret-plaintext"
-                    },
-                    "latency_mode": { "kind": "serial" }
-                }"#,
-            ),
-        ));
-        table.insert(entry(
-            "keyword-row",
-            "g-2",
-            parse(
-                r#"{
-                    "name": "keyword-row",
-                    "kind": "keyword",
-                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
-                }"#,
-            ),
-        ));
-        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
-        // Both rows compose. We don't probe the bedrock arm — its
-        // own tests cover the dispatch path; this one only pins the
-        // chain composition contract.
-        assert_eq!(chain.len(), 2);
     }
 
     #[tokio::test]
     async fn live_chain_rebuilds_on_snapshot_swap() {
         let initial = AisixSnapshot::new();
         let handle = SnapshotHandle::new(initial);
-        let live = LiveGuardrailChain::new(handle.clone(), None, GuardrailEmbedderSlot::none());
+        let live = LiveGuardrailChain::new(handle.clone(), GuardrailEmbedderSlot::none());
 
         // Empty snapshot → no rules → input passes.
         assert!(!live.check_input(&req("AKIA-EXAMPLE")).await.is_block());
@@ -2944,7 +2726,6 @@ mod tests {
         let status = ConfigStatus::new(aisix_core::SourceKind::Etcd);
         let live = LiveGuardrailChain::new_with_status(
             handle.clone(),
-            None,
             GuardrailEmbedderSlot::none(),
             Some(status.clone()),
         );
@@ -2991,7 +2772,6 @@ mod tests {
         let status = ConfigStatus::new(aisix_core::SourceKind::Etcd);
         let _live = LiveGuardrailChain::new_with_status(
             SnapshotHandle::new(broken),
-            None,
             GuardrailEmbedderSlot::none(),
             Some(status.clone()),
         );
@@ -3059,8 +2839,7 @@ mod tests {
     /// assertion fails intermittently (#519 B.4a).
     #[test]
     fn chain_order_is_created_at_ascending_with_id_tiebreak() {
-        let chain =
-            build_chain_from_snapshot(&shuffled_table(), None, &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(&shuffled_table(), &GuardrailEmbedderSlot::none());
         assert_eq!(chain.member_names(), EXPECTED_ORDER);
     }
 
@@ -3072,7 +2851,7 @@ mod tests {
         for (id, name) in [("g-3", "z"), ("g-1", "y"), ("g-2", "x")] {
             table.insert(entry(name, id, keyword_row(name, None)));
         }
-        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(&table, &GuardrailEmbedderSlot::none());
         assert_eq!(chain.member_names(), ["y", "x", "z"]);
     }
 
@@ -3112,7 +2891,6 @@ mod tests {
         let index = build_index_from_snapshot(
             &shuffled_table(),
             &attachments,
-            None,
             &GuardrailEmbedderSlot::none(),
         );
         let chain = index.resolve(&RequestContext {
@@ -3170,12 +2948,8 @@ mod tests {
             ),
         ));
 
-        let index = build_index_from_snapshot(
-            &guardrails,
-            &attachments,
-            None,
-            &GuardrailEmbedderSlot::none(),
-        );
+        let index =
+            build_index_from_snapshot(&guardrails, &attachments, &GuardrailEmbedderSlot::none());
         assert_eq!(index.len(), 1);
 
         let ctx = RequestContext {
@@ -3216,12 +2990,8 @@ mod tests {
             ),
         ));
 
-        let index = build_index_from_snapshot(
-            &guardrails,
-            &attachments,
-            None,
-            &GuardrailEmbedderSlot::none(),
-        );
+        let index =
+            build_index_from_snapshot(&guardrails, &attachments, &GuardrailEmbedderSlot::none());
         assert_eq!(index.len(), 0);
         // Verify the guardrail does not fire (not just that the index is empty).
         let ctx = RequestContext {
@@ -3265,12 +3035,8 @@ mod tests {
             ),
         ));
 
-        let index = build_index_from_snapshot(
-            &guardrails,
-            &attachments,
-            None,
-            &GuardrailEmbedderSlot::none(),
-        );
+        let index =
+            build_index_from_snapshot(&guardrails, &attachments, &GuardrailEmbedderSlot::none());
         // Exactly one entry — from the enabled attachment only.
         // The disabled attachment must NOT produce a second entry or trigger the fallback.
         assert_eq!(
@@ -3622,12 +3388,8 @@ mod tests {
         ));
         let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
 
-        let index = build_index_from_snapshot(
-            &guardrails,
-            &attachments,
-            None,
-            &GuardrailEmbedderSlot::none(),
-        );
+        let index =
+            build_index_from_snapshot(&guardrails, &attachments, &GuardrailEmbedderSlot::none());
         assert_eq!(
             index.len(),
             0,
@@ -3667,12 +3429,8 @@ mod tests {
             ),
         ));
 
-        let index = build_index_from_snapshot(
-            &guardrails,
-            &attachments,
-            None,
-            &GuardrailEmbedderSlot::none(),
-        );
+        let index =
+            build_index_from_snapshot(&guardrails, &attachments, &GuardrailEmbedderSlot::none());
         assert_eq!(index.len(), 0);
     }
 
@@ -3704,12 +3462,8 @@ mod tests {
             ),
         ));
 
-        let index = build_index_from_snapshot(
-            &guardrails,
-            &attachments,
-            None,
-            &GuardrailEmbedderSlot::none(),
-        );
+        let index =
+            build_index_from_snapshot(&guardrails, &attachments, &GuardrailEmbedderSlot::none());
         assert_eq!(index.len(), 0);
     }
 
@@ -3771,7 +3525,6 @@ mod tests {
         snap.guardrail_attachments = attachments;
         LiveGuardrailIndex::new_with_sink(
             SnapshotHandle::new(snap),
-            None,
             None,
             GuardrailEmbedderSlot::new(Arc::new(IdenticalEmbedder)),
         )
@@ -3842,7 +3595,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none())
+        let chain = build_chain_from_snapshot(&table, &GuardrailEmbedderSlot::none())
             .with_audit_log(Some(Arc::new(crate::GuardrailAuditLog::new())));
         assert!(chain.check_input(&req("AKIA-EXAMPLE")).await.is_block());
         assert!(chain.scores().is_empty());
@@ -3852,7 +3605,7 @@ mod tests {
     async fn live_index_rebuilds_on_snapshot_swap() {
         let initial = AisixSnapshot::new();
         let handle = SnapshotHandle::new(initial);
-        let live = LiveGuardrailIndex::new(handle.clone(), None);
+        let live = LiveGuardrailIndex::new(handle.clone());
 
         let ctx = RequestContext {
             passthrough_route_id: "",
@@ -3972,7 +3725,6 @@ mod tests {
         });
         let live = LiveGuardrailIndex::new_with_sink_and_status(
             handle.clone(),
-            None,
             None,
             GuardrailEmbedderSlot::new(Arc::new(IdenticalEmbedder)),
             Some(status.clone()),
@@ -4099,7 +3851,6 @@ mod tests {
         let live = LiveGuardrailIndex::new_with_sink_and_status(
             handle.clone(),
             None,
-            None,
             GuardrailEmbedderSlot::none(),
             Some(status.clone()),
         );
@@ -4180,7 +3931,7 @@ mod tests {
             parse_attachment(r#"{"guardrail_id":"g-1","scope_type":"env","priority":0}"#),
         ));
         let handle = SnapshotHandle::new(snap);
-        let live = LiveGuardrailIndex::new(handle.clone(), None);
+        let live = LiveGuardrailIndex::new(handle.clone());
         let first = live.current();
         assert_eq!(live.rebuilds(), 1);
 
@@ -4225,7 +3976,7 @@ mod tests {
             ));
         }
         let handle = SnapshotHandle::new(snap);
-        let live = LiveGuardrailIndex::new(handle.clone(), None);
+        let live = LiveGuardrailIndex::new(handle.clone());
         let before = live.current();
         assert_eq!(before.len(), 3);
         let members_before = before.instances();
@@ -4285,7 +4036,7 @@ mod tests {
         // Zero-config fast path: an empty index resolves to an empty
         // chain with an empty applied set — the same observable shape
         // the full resolve walk produces on an empty index.
-        let live = LiveGuardrailIndex::new(SnapshotHandle::new(AisixSnapshot::new()), None);
+        let live = LiveGuardrailIndex::new(SnapshotHandle::new(AisixSnapshot::new()));
         let chain = live.resolve(&RequestContext {
             passthrough_route_id: "",
             model_id: "m",
@@ -4365,7 +4116,6 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         let live = LiveGuardrailIndex::new_with_sink(
             SnapshotHandle::new(snap),
-            None,
             Some(sink.clone()),
             GuardrailEmbedderSlot::none(),
         );
@@ -4420,7 +4170,7 @@ mod tests {
         );
 
         // The plain `new` constructor keeps recording off.
-        let unsinked = LiveGuardrailIndex::new(SnapshotHandle::new(AisixSnapshot::new()), None);
+        let unsinked = LiveGuardrailIndex::new(SnapshotHandle::new(AisixSnapshot::new()));
         let _ = unsinked.resolve(&ctx).check_input(&req("hi")).await;
         assert!(sink.0.lock().unwrap().is_empty());
     }
@@ -4440,7 +4190,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(&table, &GuardrailEmbedderSlot::none());
         // input check fires...
         assert!(chain.check_input(&req("secret")).await.is_block());
         // ...but output check is a noop on this rule.
@@ -4493,7 +4243,7 @@ mod tests {
             ),
         ));
 
-        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(&table, &GuardrailEmbedderSlot::none());
         // `applied` mirrors the chain 1:1 (pushed in lockstep); the absolute
         // member order is a `ResourceTable::entries()` concern tested
         // elsewhere, so sort by hook before comparing to pin only that BOTH
@@ -4551,7 +4301,7 @@ mod tests {
             ),
         ));
 
-        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(&table, &GuardrailEmbedderSlot::none());
         assert_eq!(chain.len(), 1, "only the live row materialises");
         assert_eq!(
             chain.applied(),
@@ -4594,12 +4344,8 @@ mod tests {
             ),
         ));
 
-        let index = build_index_from_snapshot(
-            &guardrails,
-            &attachments,
-            None,
-            &GuardrailEmbedderSlot::none(),
-        );
+        let index =
+            build_index_from_snapshot(&guardrails, &attachments, &GuardrailEmbedderSlot::none());
         let chain = index.resolve(&RequestContext {
             passthrough_route_id: "",
             model_id: "m-A",
@@ -4643,12 +4389,8 @@ mod tests {
             ),
         ));
 
-        let index = build_index_from_snapshot(
-            &guardrails,
-            &attachments,
-            None,
-            &GuardrailEmbedderSlot::none(),
-        );
+        let index =
+            build_index_from_snapshot(&guardrails, &attachments, &GuardrailEmbedderSlot::none());
         let chain = index.resolve(&RequestContext {
             passthrough_route_id: "",
             model_id: "m-OTHER",

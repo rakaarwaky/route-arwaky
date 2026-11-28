@@ -1827,7 +1827,6 @@ pub struct UpstreamConfig {
     pub media_fetch: MediaFetchConfig,
 }
 
-
 /// When a chat request carries an image, audio or file part as a URL and
 /// the target upstream cannot read that URL itself, the gateway downloads
 /// it and sends the bytes inline. An upstream that reads the URL itself

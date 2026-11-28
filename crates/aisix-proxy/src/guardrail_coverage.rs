@@ -290,9 +290,9 @@ fn census_snapshot() -> AisixSnapshot {
     .expect("valid provider key");
     snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
 
-    for (id, name, provider, model_name, pk_id) in [
-        ("m-openai", "census-openai", "openai", "gpt-4o-mini", PK_ID),
-    ] {
+    for (id, name, provider, model_name, pk_id) in
+        [("m-openai", "census-openai", "openai", "gpt-4o-mini", PK_ID)]
+    {
         let model: aisix_core::Model = serde_json::from_value(serde_json::json!({
             "display_name": name,
             "provider": provider,
@@ -343,7 +343,7 @@ fn census_hub() -> Arc<aisix_gateway::Hub> {
 
 fn census_router() -> axum::Router {
     let handle = SnapshotHandle::new(census_snapshot());
-    let index = aisix_guardrails::LiveGuardrailIndex::new(handle.clone(), None);
+    let index = aisix_guardrails::LiveGuardrailIndex::new(handle.clone());
     let state = crate::ProxyState::new(handle, census_hub(), &cfg())
         .without_cache()
         .with_guardrail_index(index);
@@ -380,7 +380,7 @@ fn census_router_with(
     let guardrail: aisix_core::Guardrail = serde_json::from_value(row).expect("valid guardrail");
     crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-census", guardrail, 2));
     let handle = SnapshotHandle::new(snap);
-    let index = aisix_guardrails::LiveGuardrailIndex::new(handle.clone(), None);
+    let index = aisix_guardrails::LiveGuardrailIndex::new(handle.clone());
     let (tx, rx) = tokio::sync::mpsc::channel(32);
     let state = crate::ProxyState::new(handle, census_hub(), &cfg())
         .without_cache()
@@ -656,7 +656,7 @@ async fn surfaces_refused_with(row: Option<serde_json::Value>) -> Vec<&'static s
         crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-census", guardrail, 2));
     }
     let handle = SnapshotHandle::new(snap);
-    let index = aisix_guardrails::LiveGuardrailIndex::new(handle.clone(), None);
+    let index = aisix_guardrails::LiveGuardrailIndex::new(handle.clone());
     let state = crate::ProxyState::new(handle, census_hub(), &cfg())
         .without_cache()
         .with_guardrail_index(index);
