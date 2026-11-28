@@ -3,7 +3,7 @@
 //!
 //! One process, two roles:
 //!
-//! 1. **Mock upstream** — canned OpenAI / Anthropic dialect responses (JSON +
+//! 1. **Mock upstream** — canned OpenAI dialect responses (JSON +
 //!    SSE) on a local port; just enough surface for the gateway to dispatch
 //!    every training shape against it. Streaming responses are written frame
 //!    by frame over chunked transfer encoding so the gateway's SSE relay loop
@@ -16,7 +16,7 @@
 //! A PGO profile is a union of hotness, not a traffic-mix replica: each shape
 //! is driven in its own gateway process lifetime (see train.sh) and the
 //! resulting `.profraw` files are merged. Missing an entire hot path is the
-//! failure mode; skewed proportions are not (#967 measured the three-dialect
+//! failure mode; skewed proportions are not (#967 measured endpoint-mix
 //! dilution at −1.09%).
 //!
 //! Std-only on purpose: the release Docker build compiles this tool right
@@ -60,21 +60,20 @@ struct Shape {
     path: &'static str,
     /// `None` = body built at runtime (the padded mid-size one).
     body: Option<&'static str>,
-    anthropic_headers: bool,
 }
 
 /// The v1 training matrix (#967, extended at the 2026-08-13 scenario review):
-/// 3 dialects × {stream, non-stream} + mid body + quota gate + native
-/// anthropic passthrough + routing kind + embeddings. Error paths are
-/// deliberately untrained — they are cold in production and PGO treating
-/// them as cold is correct. Maintenance rule: this list mirrors the bench
-/// suites; when the product grows a new hot path, add a shape in the same PR.
+/// chat + responses, each {stream, non-stream}, + mid body + quota gate +
+/// routing kind + embeddings. Error paths are deliberately untrained — they
+/// are cold in production and PGO treating them as cold is correct.
+/// Maintenance rule: this list mirrors the bench suites; when the product
+/// grows a new hot path, add a shape in the same PR, and when a hot path is
+/// removed, drop its shape in the same PR.
 const SHAPES: &[Shape] = &[
     Shape {
         name: "chat-board",
         path: "/v1/chat/completions",
         body: Some(BOARD_BODY),
-        anthropic_headers: false,
     },
     Shape {
         name: "chat-stream",
@@ -82,41 +81,21 @@ const SHAPES: &[Shape] = &[
         body: Some(
             r#"{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"hello"}],"max_tokens":64}"#,
         ),
-        anthropic_headers: false,
     },
     Shape {
         name: "chat-mid",
         path: "/v1/chat/completions",
         body: None,
-        anthropic_headers: false,
-    },
-    Shape {
-        name: "bridge-messages",
-        path: "/v1/messages",
-        body: Some(
-            r#"{"model":"gpt-4o-mini","max_tokens":32,"messages":[{"role":"user","content":"hello"}]}"#,
-        ),
-        anthropic_headers: true,
-    },
-    Shape {
-        name: "bridge-messages-stream",
-        path: "/v1/messages",
-        body: Some(
-            r#"{"model":"gpt-4o-mini","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hello"}]}"#,
-        ),
-        anthropic_headers: true,
     },
     Shape {
         name: "responses",
         path: "/v1/responses",
         body: Some(r#"{"model":"gpt-4o-mini","input":"hello"}"#),
-        anthropic_headers: false,
     },
     Shape {
         name: "responses-stream",
         path: "/v1/responses",
         body: Some(r#"{"model":"gpt-4o-mini","input":"hello","stream":true}"#),
-        anthropic_headers: false,
     },
     Shape {
         name: "chat-ratelimit",
@@ -124,23 +103,6 @@ const SHAPES: &[Shape] = &[
         body: Some(
             r#"{"model":"gpt-4o-mini-rl","messages":[{"role":"user","content":"hello"}],"max_tokens":16}"#,
         ),
-        anthropic_headers: false,
-    },
-    Shape {
-        name: "native-messages",
-        path: "/v1/messages",
-        body: Some(
-            r#"{"model":"claude-pgo","max_tokens":32,"messages":[{"role":"user","content":"hello"}]}"#,
-        ),
-        anthropic_headers: true,
-    },
-    Shape {
-        name: "native-messages-stream",
-        path: "/v1/messages",
-        body: Some(
-            r#"{"model":"claude-pgo","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hello"}]}"#,
-        ),
-        anthropic_headers: true,
     },
     Shape {
         name: "chat-routing",
@@ -148,13 +110,11 @@ const SHAPES: &[Shape] = &[
         body: Some(
             r#"{"model":"gpt-router","messages":[{"role":"user","content":"hello"}],"max_tokens":16}"#,
         ),
-        anthropic_headers: false,
     },
     Shape {
         name: "embeddings",
         path: "/v1/embeddings",
         body: Some(r#"{"model":"text-embedding-mock","input":"hello world"}"#),
-        anthropic_headers: false,
     },
 ];
 
@@ -274,9 +234,8 @@ fn main() {
         let body = Arc::clone(&body);
         let ok = Arc::clone(&ok);
         let path = shape.path;
-        let anthropic = shape.anthropic_headers;
         workers.push(thread::spawn(move || -> Result<(), String> {
-            drive(&gateway, &api_key, path, anthropic, &body, n, &ok)
+            drive(&gateway, &api_key, path, &body, n, &ok)
         }));
     }
 
@@ -345,19 +304,13 @@ fn drive(
     gateway: &str,
     api_key: &str,
     path: &str,
-    anthropic: bool,
     body: &str,
     n: u64,
     ok: &AtomicU64,
 ) -> Result<(), String> {
-    let extra = if anthropic {
-        "anthropic-version: 2023-06-01\r\n"
-    } else {
-        ""
-    };
     let request = format!(
         "POST {path} HTTP/1.1\r\nhost: {gateway}\r\nauthorization: Bearer {api_key}\r\n\
-         {extra}content-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+         content-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
         body.len()
     );
     let (mut reader, mut writer) = connect(gateway)?;
@@ -479,13 +432,6 @@ fn mock_conn(stream: TcpStream) {
                     write_json(&mut writer, RESPONSES_JSON)
                 }
             }
-            "/v1/messages" => {
-                if stream_requested {
-                    write_sse(&mut writer, &anthropic_sse_frames())
-                } else {
-                    write_json(&mut writer, ANTHROPIC_JSON)
-                }
-            }
             "/v1/embeddings" => write_json(&mut writer, EMBEDDINGS_JSON),
             // Anything else is a routing bug in the training setup: answer
             // 404 so the driving request fails loudly instead of training a
@@ -569,8 +515,6 @@ const CHAT_JSON: &str = r#"{"id":"chatcmpl-pgo","object":"chat.completion","crea
 
 const RESPONSES_JSON: &str = r#"{"id":"resp-pgo","object":"response","status":"completed","model":"gpt-4o-mini","output":[{"type":"message","id":"msg-pgo","role":"assistant","content":[{"type":"output_text","text":"PGO training reply."}]}],"usage":{"input_tokens":9,"output_tokens":12,"total_tokens":21}}"#;
 
-const ANTHROPIC_JSON: &str = r#"{"id":"msg-pgo","type":"message","role":"assistant","model":"claude-pgo","content":[{"type":"text","text":"PGO training reply."}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":9,"output_tokens":12}}"#;
-
 const EMBEDDINGS_JSON: &str = r#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.01,-0.02,0.03,-0.04,0.05,-0.06,0.07,-0.08,0.09,-0.1,0.11,-0.12,0.13,-0.14,0.15,-0.16]}],"model":"text-embedding-mock","usage":{"prompt_tokens":3,"total_tokens":3}}"#;
 
 /// OpenAI chat SSE: role delta, N content deltas, a final chunk carrying
@@ -623,44 +567,3 @@ fn responses_sse_frames() -> Vec<String> {
     f
 }
 
-/// Anthropic Messages SSE: message_start → content_block deltas →
-/// message_delta (usage) → message_stop, per the Messages streaming format.
-fn anthropic_sse_frames() -> Vec<String> {
-    let mut f = Vec::with_capacity(STREAM_FRAMES);
-    f.push(concat!(
-        "event: message_start\n",
-        r#"data: {"type":"message_start","message":{"id":"msg-pgo","type":"message","role":"assistant","model":"claude-pgo","content":[],"stop_reason":null,"usage":{"input_tokens":9,"output_tokens":1}}}"#,
-        "\n\n"
-    )
-    .to_string());
-    f.push(concat!(
-        "event: content_block_start\n",
-        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
-        "\n\n"
-    )
-    .to_string());
-    for _ in 0..STREAM_FRAMES - 5 {
-        f.push(concat!(
-            "event: content_block_delta\n",
-            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"chunk "}}"#,
-            "\n\n"
-        )
-        .to_string());
-    }
-    f.push(
-        concat!(
-            "event: content_block_stop\n",
-            r#"data: {"type":"content_block_stop","index":0}"#,
-            "\n\n"
-        )
-        .to_string(),
-    );
-    f.push(concat!(
-        "event: message_delta\n",
-        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":43}}"#,
-        "\n\n"
-    )
-    .to_string());
-    f.push("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string());
-    f
-}

@@ -572,8 +572,7 @@ pub(crate) fn bridge_ctx(
 
 /// Build the outbound-header context for a dispatch path that constructs
 /// its upstream request directly instead of going through a `Bridge`
-/// (`/v1/messages`, `/v1/responses`, `/v1/messages/count_tokens`, audio,
-/// rerank, videos, jobs).
+/// (`/v1/responses`, audio, rerank, videos, jobs).
 ///
 /// The Bridge paths get the same thing from
 /// [`aisix_gateway::BridgeContext::header_ctx`]; both must resolve the
@@ -604,13 +603,13 @@ pub(crate) fn upstream_header_ctx<'a>(
 /// Whether the upstream's 200 response body is an SSE stream, rather than
 /// the single JSON document an upstream that ignored `stream: true` sends.
 ///
-/// `/v1/responses` and `/v1/messages` both pick their relay branch through
-/// this, and both used to pick it from the REQUEST's `stream` flag alone —
+/// `/v1/responses` picks its relay branch through
+/// this, and used to pick it from the REQUEST's `stream` flag alone —
 /// so a JSON body answering a streaming request entered the SSE hold-back:
 /// it has no frames, so nothing scanned it, and the seal pass appended a
 /// `\n\n` frame terminator to a document that is not SSE before releasing
 /// it under the upstream's own content type. Such a body belongs on the
-/// non-streaming buffered scan+mask path each of those functions already
+/// non-streaming buffered scan+mask path the function already
 /// has beside its streaming branch.
 ///
 /// Only an explicitly-JSON content type is treated as non-SSE. A missing
@@ -628,7 +627,7 @@ pub(crate) fn upstream_header_ctx<'a>(
 /// buffered arm then parses SSE text as JSON.
 ///
 /// That mislabelling is not hypothetical: eight of this crate's own
-/// `/v1/messages` streaming tests produce it by accident. Their mock sets
+/// streaming tests produce it by accident. Their mock sets
 /// `text/event-stream` and then `set_body_string` overwrites the header
 /// with `text/plain` (wiremock `response_template.rs` sets `self.mime`), so
 /// they serve a real SSE body under the wrong label — and every one of them

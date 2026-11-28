@@ -131,8 +131,7 @@ pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses:
 ///
 /// Kept in one place because the endpoint family had already drifted:
 /// `/v1/chat/completions` wrote this line on both its branches while
-/// `/v1/messages`, `/v1/responses` and `/v1/messages/count_tokens`
-/// emitted nothing at all on a failed attempt, at any level.
+/// `/v1/responses` emitted nothing at all on a failed attempt, at any level.
 ///
 /// The status list is on the line because the retry/failover decision is
 /// not reconstructable without it. A group configured to fail over on an

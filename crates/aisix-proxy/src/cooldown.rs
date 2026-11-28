@@ -145,8 +145,8 @@ pub fn decide_cooldown(
 /// body-decode failures that bypass the `!status.is_success()` branch.
 /// The audit on PR #268 (round 2) caught exactly that gap:
 /// transport / decode errors were threading through `?` without ever
-/// hitting `mark_cooldown`, so a TCP-reset against Anthropic via
-/// `/v1/messages` would leave the target healthy in routing.
+/// hitting `mark_cooldown`, so a TCP-reset against an upstream via a typed
+/// relay would leave the target healthy in routing.
 pub fn note_failure(
     tracker: &ModelRuntimeStatusTracker,
     model_id: &str,

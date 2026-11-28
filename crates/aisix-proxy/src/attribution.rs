@@ -554,7 +554,7 @@ impl Cell {
     /// hand back an already-rendered response (a passthrough route) or report a
     /// refusal as a success (a buffered output guardrail block); and the
     /// token counts, for every inline writer that never reads them itself
-    /// (`/v1/messages`, `/v1/embeddings`, `/v1/responses`, …). The line is
+    /// (`/v1/embeddings`, `/v1/responses`, …). The line is
     /// completed when the request ends, after the terminal event, so the
     /// event is known by then even where the line was built first.
     fn complete_from_terminal_event(&self, record: &mut aisix_obs::AccessLogRecord) {
@@ -1558,7 +1558,7 @@ pub(crate) fn relayed_error_body() -> Option<bytes::Bytes> {
 
 /// The `provider_request_id` of the request's terminal usage event, for a
 /// line written after it on a success that has no response object of its own
-/// to read one from (`/v1/messages/count_tokens`).
+/// to read one from (the realtime surfaces).
 pub(crate) fn terminal_provider_request_id() -> String {
     CURRENT
         .try_with(|a| a.lock().terminal_provider_request_id.clone())

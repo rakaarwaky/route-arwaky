@@ -66,7 +66,7 @@ impl EosOutputScan {
         text: &str,
         local_segments: Option<Vec<aisix_guardrails::ScanSegment>>,
     ) -> Vec<aisix_core::GuardrailMonitorHit> {
-        // The whole generated text, as chat and `/v1/messages` scan it: a
+        // The whole generated text, as chat scans it: a
         // monitor-only chain holds nothing back, so no hold cap applies.
         let synth = synth_chat_response(&self.upstream_model, text.to_string());
         let (verdict, mut hits) = aisix_guardrails::Guardrail::check_output_non_segment_observed(

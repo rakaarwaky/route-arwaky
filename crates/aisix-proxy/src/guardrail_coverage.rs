@@ -2,7 +2,7 @@
 //! [`crate::build_router`] mounts.
 //!
 //! This exists because the same defect kept landing on one sibling at a
-//! time. `/v1/messages/count_tokens` shipped with no chain at all;
+//! time. One surface shipped with no chain at all;
 //! `/v1/audio/*` and `/v1/images/edits` only when a `prompt` part happened
 //! to be present. Each was invisible because the test that
 //! was supposed to cover the family restated a hand-written list of
@@ -565,7 +565,7 @@ async fn enforced_surfaces_refuse_a_blocking_guardrail() {
 ///
 /// `guardrail_blocked_telemetry` already pins this invariant, but against a
 /// hand-written list of surfaces, and that is exactly how the gap it was
-/// written for came back: `/v1/messages/count_tokens` gained the chain
+/// written for came back: one surface gained the chain
 /// (#1064) and the flag (#1065) in the same release, was absent from the
 /// list, and emitted no usage event at all — so it refused correctly and
 /// the refusal was unfindable, on a route whose whole job is to ship the

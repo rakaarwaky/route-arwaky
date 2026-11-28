@@ -1,11 +1,11 @@
 //! What a caller-addressed model dispatches to, for the endpoints whose
 //! handlers walk the attempts themselves (`/v1/chat/completions`,
-//! `/v1/messages`, `/v1/messages/count_tokens`, `/v1/responses`).
+//! `/v1/responses`).
 //!
 //! A routing group expands into its members, a semantic router into the
 //! target it picks — and when that target is itself a routing group, into
 //! that group's members, governed by that group's knobs. [`plan`] is the
-//! one entry point for both, so the four endpoints take the same decision;
+//! one entry point for both, so the endpoints take the same decision;
 //! the knob accessors on [`DispatchPlan`] are what each attempt loop reads
 //! in place of the addressed entry's own `routing` block.
 

@@ -507,7 +507,7 @@ async fn dispatch(
                     }
 
                     // Apply the PK's `request.*` body overrides, matching the OpenAI bridge's
-                    // chat() path and /v1/messages passthrough (AISIX-Cloud#867 follow-up). The
+                    // chat() path (AISIX-Cloud#867 follow-up). The
                     // /v1/rerank path builds the request directly, so without this the override
                     // pipeline silently no-ops here. No-op when the PK carries none.
                     if let Some(r) = pk_entry.value.request.as_ref() {
@@ -2049,7 +2049,7 @@ mod tests {
     /// five per-PK telemetry attribution fields (provider_kind /
     /// provider_featured / branded_provider / pk_label) from the resolved
     /// ProviderKey's `telemetry_tags` — exactly like /v1/chat/completions,
-    /// /v1/messages, /v1/responses, and /v1/embeddings. Pre-fix the rerank
+    /// /v1/responses, and /v1/embeddings. Pre-fix the rerank
     /// handler left these at Default (wire NULL), so the dashboard's Logs
     /// detail couldn't show the upstream vendor + PK label for rerank spend.
     #[tokio::test]

@@ -7,8 +7,7 @@
 //! canonical [`ChatFormat`], so it can be dispatched through the same
 //! provider [`Bridge`](aisix_gateway::Bridge) `/v1/chat/completions` uses,
 //! and re-encodes the bridge's response back into the Responses API shape
-//! — non-streaming JSON and streaming SSE. This mirrors the cross-provider
-//! path of `/v1/messages` (`messages::cross_provider_dispatch`).
+//! — non-streaming JSON and streaming SSE.
 //!
 //! Only the Responses fields that map cleanly onto chat completions are
 //! carried (`instructions`, `input` — including its image / file / audio

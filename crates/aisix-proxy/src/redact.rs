@@ -361,9 +361,9 @@ pub async fn moderate_body(
 /// walk, so those texts are judged and never rewritten. Each text carries
 /// whether it sits in the latest-turn window.
 ///
-/// Without it the segment kinds — `bedrock`, `presidio`, `lakera`,
-/// `aliyun_ai_guardrail`, `custom` — never saw thinking content at all on
-/// `/v1/messages`: they answer `Allow` from `check_input_non_segment` by
+/// Without it the segment kinds — `presidio`, `lakera`,
+/// `custom` — never saw thinking content at all on the chat surface:
+/// they answer `Allow` from `check_input_non_segment` by
 /// design and take their real verdict from this pass, so a block policy on
 /// any of them was bypassable by moving the text into a thinking block.
 #[allow(clippy::too_many_arguments)]
@@ -1678,8 +1678,8 @@ impl BufferedSseSeal {
 ///
 /// A 200 body that is not SSE at all — what an upstream ignoring
 /// `stream: true` returns — used to reach here too, and was released with
-/// a `\n\n` appended to it. It no longer does: `/v1/responses` and
-/// `/v1/messages` choose their relay branch from the upstream's own
+/// a `\n\n` appended to it. It no longer does: `/v1/responses` chooses its
+/// relay branch from the upstream's own
 /// content type (`dispatch::upstream_body_is_sse`), so such a body takes
 /// the non-streaming buffered scan+mask path instead of this one.
 ///

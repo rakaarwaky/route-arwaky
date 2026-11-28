@@ -360,7 +360,7 @@ pub(crate) fn live_exporters(
 /// SEPARATE from `input_tokens`, so a prompt+completion sum silently
 /// undercounts cached traffic — the OpenAI bridge already folds them into
 /// `total_tokens` (#679) and the CP display total includes them (#906); this
-/// keeps the native `/v1/messages` and `/v1/responses` commits consistent
+/// keeps the native `/v1/responses` commit consistent
 /// (AISIX-Cloud#995). OpenAI's `cached_tokens` is a subset of
 /// `prompt_tokens` and is deliberately NOT an input here.
 pub(crate) fn total_tokens_with_cache(
@@ -827,8 +827,8 @@ pub(crate) fn emit_failed_attempts(
     );
 }
 
-/// [`emit_failed_attempts`] for a route whose callers speak a protocol
-/// other than OpenAI's — `/v1/messages/count_tokens` records `anthropic`.
+/// [`emit_failed_attempts`] with an explicit inbound-protocol override for
+/// a route whose callers speak a protocol other than OpenAI's.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_failed_attempts_as(
     state: &ProxyState,

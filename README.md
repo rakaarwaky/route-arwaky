@@ -25,7 +25,7 @@ forever.
 
 <br>
 
-<img src="assets/aisix-architecture.svg" alt="AISIX OSS architecture — one OpenAI- or Anthropic-compatible API in front of OpenAI, Anthropic, Gemini/Vertex, Bedrock, Azure OpenAI, and DeepSeek, with API key auth, rate and token limits, guardrails, caching, routing and failover, and observability in between" width="100%">
+<img src="assets/aisix-architecture.svg" alt="AISIX OSS architecture — one OpenAI-compatible API in front of OpenAI, DeepSeek, and any OpenAI-compatible endpoint, with API key auth, rate and token limits, guardrails, caching, routing and failover, and observability in between" width="100%">
 
 </div>
 
@@ -33,9 +33,9 @@ forever.
 
 **AISIX OSS** is the open-source product built around the Rust-native AISIX gateway. The
 gateway puts a single, OpenAI-compatible API in front of every LLM provider — OpenAI,
-Anthropic, Google Gemini, AWS Bedrock, Azure OpenAI, DeepSeek, and any OpenAI-compatible
-endpoint. It gives platform teams one place to route, govern, secure, and observe LLM
-traffic, with first-class SSE streaming and low gateway overhead.
+DeepSeek, and any OpenAI-compatible endpoint. It gives platform teams one place to route,
+govern, secure, and observe LLM traffic, with first-class SSE streaming and low gateway
+overhead.
 
 It runs as a **single static binary** — low cold-start, lock-free config reads, and hot
 configuration reloads with no restarts: declare resources in one `resources.yaml` and
@@ -135,9 +135,9 @@ For a multi-replica cluster, point the gateway at etcd instead — `resources_fi
 
 ## ✨ Why AISIX
 
-- **One API, every model.** Speak the OpenAI *or* Anthropic wire format in; the gateway
-  translates to whichever provider each model points at. Point an OpenAI or Claude SDK at
-  one `base_url` and switch models without changing code.
+- **One API, every model.** Speak the OpenAI wire format in; the gateway translates to
+  whichever provider each model points at. Point an OpenAI SDK at one `base_url` and
+  switch models without changing code.
 - **A real gateway, in Rust.** Single static binary, low cold-start, lock-free config reads
   on the hot path, native streaming.
 - **Open source, free forever.** Apache-2.0 licensed and built to run in your
@@ -149,16 +149,14 @@ For a multi-replica cluster, point the gateway at etcd instead — `resources_fi
 
 ## 🧩 Features — available today
 
-Covered by 183 end-to-end scenario files (496 cases) that run against real gateway processes.
+Covered by 364 end-to-end scenario files (2000+ cases) that run against real gateway
+processes.
 
 - **OpenAI-compatible proxy** (`:3000`) — `chat/completions`, `completions`, `responses`,
   `embeddings`, `rerank`, `images/{generations,edits}`, `audio/{speech,transcriptions,translations}`,
   `videos` (submit → poll → fetch), `files`, `batches`, `fine_tuning/jobs`, `realtime`,
   `GET /v1/models`, plus a root-level `/passthrough/:provider/*` escape hatch. Native SSE streaming,
   tool/function calling, JSON mode, vision/multimodal input, and reasoning-content support.
-- **Anthropic Messages API** — `POST /v1/messages` as a first-class route, working against
-  **any** configured upstream: requests and responses (including streaming) are translated
-  both ways when a model points at a non-Anthropic provider.
 - **Routing & failover** — virtual/routing models with six strategies: `round_robin`
   (smooth weighted round-robin), `consistent_hash` (session affinity keyed by header /
   cookie / API key / client IP), `failover`, plus metric-based `least_cost`,
@@ -176,21 +174,10 @@ Covered by 183 end-to-end scenario files (496 cases) that run against real gatew
   with the Redis backend.
 - **Guardrails** — content-policy enforcement on input and output, in-process or through a
   provider: keyword/regex, built-in PII detection and redaction, Presidio, Lakera, OpenAI
-  Moderation, AWS Bedrock Guardrails, Azure AI Content Safety (Prompt Shield + text
-  moderation), and two Alibaba Cloud services. A block returns `422 content_filter`;
+  Moderation, and custom scripting hooks. A block returns `422 content_filter`;
   monitor mode records what would have happened without blocking.
 - **Caching** — exact-match response cache with per-policy TTL and model/key scope matchers;
-  memory and Redis backends; cost-saved telemetry on every hit. Separately, **automatic
-  prompt caching** can be enabled per direct Anthropic model to inject cache breakpoints, so
-  callers get provider-side prompt discounts without changing their requests.
-- **MCP gateway** — front registered upstream MCP servers at `/mcp` with gateway-held
-  credentials, per-server tool namespaces, and per-caller access. It serves every
-  Streamable HTTP revision from `2025-03-26` through stateless `2026-07-28` without
-  downstream sessions. Upstreams use `initialize` by default or `server/discover` with
-  `protocol_version: "2026-07-28"`. CI runs the official MCP suite's applicable tools-only
-  protocol scenarios. Also exposes a REST API as MCP tools from its OpenAPI description.
-- **A2A agent gateway** — front A2A (Agent-to-Agent) agents at `/a2a/:agent`, serving each
-  agent's card with URLs rewritten to the gateway, over JSON-RPC 2.0.
+  memory and Redis backends; cost-saved telemetry on every hit.
 - **Inbound authentication** — caller API keys (SHA-256 hashed, model allowlists, expiry,
   rotation), or OIDC/JWT bearer tokens validated against registered providers (Entra ID,
   Okta, Google Workspace, or any OIDC issuer) with JWKS caching.
@@ -198,9 +185,9 @@ Covered by 183 end-to-end scenario files (496 cases) that run against real gatew
   events, OTLP/GenAI span export (Langfuse, Honeycomb, Grafana Cloud, or any OTLP receiver),
   plus dedicated Datadog and Aliyun SLS log exporters and object-storage (S3/GCS/Azure Blob)
   telemetry.
-- **Declarative configuration** — one `resources.yaml` carries all ten resource collections
-  (provider keys, models, caller keys, guardrails, MCP servers, A2A agents, cache policies,
-  observability exporters, rate-limit policies, OIDC providers) as the same documents the
+- **Declarative configuration** — one `resources.yaml` carries every resource collection
+  (provider keys, models, caller keys, guardrails, cache policies, observability exporters,
+  rate-limit policies, OIDC providers, passthrough routes) as the same documents the
   gateway reads from etcd, loaded by the same code. `aisix validate` checks a file offline;
   `SIGHUP` reloads it.
 - **Operational endpoints** — `/livez` and `/readyz` on the proxy listener; `/status/config`,
@@ -212,17 +199,12 @@ Covered by 183 end-to-end scenario files (496 cases) that run against real gatew
 
 ## 🔌 Supported providers
 
-AISIX dispatches through **five native adapter families** — distinct wire-protocol bridges,
-not one generic relabel. Whatever the upstream protocol, the client-facing API stays
-OpenAI-shaped.
+AISIX dispatches through the **OpenAI adapter family** — a distinct wire-protocol bridge,
+not a generic relabel. Whatever the upstream is, the client-facing API stays OpenAI-shaped.
 
 | Adapter family | Reaches | Wire shape · auth |
 |---|---|---|
 | `openai` | OpenAI **+ any OpenAI-compatible vendor** — DeepSeek, Groq, Mistral, Together, Fireworks, Perplexity, vLLM, Ollama, or self-hosted OpenAI-compatible endpoints | OpenAI chat completions · Bearer |
-| `anthropic` | Anthropic Claude | Anthropic Messages · `x-api-key` |
-| `bedrock` | AWS Bedrock — Anthropic, Meta Llama, Mistral, Cohere, Amazon Titan/Nova, AI21 | Bedrock Converse + `/invoke` · SigV4 |
-| `vertex` | Google Vertex AI (Gemini) | Vertex `:generateContent` · OAuth2 |
-| `azure-openai` | Azure OpenAI | Azure deployments · api-key / Entra ID |
 
 Plus specialized handling for vendor quirks (e.g. DeepSeek reasoning content) and dedicated
 **rerank / embeddings** vendors (Cohere, Jina). Details in
@@ -241,7 +223,7 @@ an API7-hosted commercial control plane.
       <sub><b>Overview</b> — traffic, latency, error rate &amp; spend at a glance</sub>
       <br><br>
       <img src="assets/console-models.png" alt="AISIX Enterprise and AISIX Cloud models — alias an upstream LLM per provider with model IDs and per-model rate limits" width="100%"><br>
-      <sub><b>Models</b> — one alias per upstream: OpenAI, Anthropic, Bedrock, DeepSeek…</sub>
+      <sub><b>Models</b> — one alias per upstream: OpenAI, DeepSeek…</sub>
       <br><br>
       <img src="assets/console-guardrails.png" alt="AISIX Enterprise and AISIX Cloud guardrails — pre-input and post-output content policies that block on violation" width="100%"><br>
       <sub><b>Guardrails</b> — pre-input &amp; post-output policies, block on violation</sub>
@@ -290,11 +272,9 @@ crates/
 ├── aisix-core           Config, snapshot, resource model, errors
 ├── aisix-etcd           Config providers (etcd, resources.yaml) + watch supervisor
 ├── aisix-gateway        Hub & bridge, SSE parser, provider trait
-├── aisix-proxy          /v1/*, /mcp, /a2a handlers, routing, middleware
+├── aisix-proxy          /v1/* handlers, routing, middleware
 ├── aisix-admin          Read-only resource surface + playground + OpenAPI
-├── aisix-provider-*     openai · anthropic · azure-openai · bedrock · vertex
-├── aisix-mcp            MCP gateway — server registry, tool ACL, transports
-├── aisix-a2a            A2A agent gateway — agent cards, JSON-RPC bridge
+├── aisix-provider-openai  the OpenAI wire-protocol bridge
 ├── aisix-ratelimit      fixed-window + token accounting + concurrency (local | redis)
 ├── aisix-cache          memory + redis backends
 ├── aisix-redis          shared Redis connection for cache + rate limits
@@ -313,9 +293,9 @@ Highlights on the [roadmap](ROADMAP.md); tracked live in
 - Prompt templates managed as gateway resources
 - Llama-Guard as a guardrail provider
 
-Shipped since this list was last written: the MCP gateway, the A2A agent gateway,
-OIDC/JWT inbound auth, Redis-backed distributed rate limiting, and the Lakera, Presidio,
-PII, and OpenAI Moderation guardrails — see **Features** above.
+Shipped since this list was last written: OIDC/JWT inbound auth, Redis-backed distributed
+rate limiting, and the Lakera, Presidio, PII, and OpenAI Moderation guardrails — see
+**Features** above.
 
 ## 🛠️ Development
 

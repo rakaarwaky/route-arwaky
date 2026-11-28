@@ -104,12 +104,11 @@ pub const M_LLM_REQUEST_DURATION: &str = "aisix_llm_request_duration_seconds";
 ///   stream refused by an output guardrail, or abandoned by the client,
 ///   before that point observes `upstream` only.
 ///
-/// On the two protocol bridges — `/v1/messages` to a non-Anthropic
-/// upstream and `/v1/responses` to a chat-protocol upstream — the
-/// client's first frame is the first content-bearing event, so
+/// On the protocol bridge — `/v1/responses` to a chat-protocol upstream —
+/// the client's first frame is the first content-bearing event, so
 /// `downstream` there also contains the wait for it (for a reasoning
 /// upstream, its thinking time); `downstream - upstream` is not pure
-/// gateway overhead on those paths. A query that does not filter on
+/// gateway overhead on that path. A query that does not filter on
 /// `side` blends both measurements.
 pub const M_LLM_TTFT: &str = "aisix_llm_time_to_first_token_seconds";
 /// Issue #890 req-4: token volume sliced by inbound client type — a
@@ -193,7 +192,7 @@ pub const M_PROXY_BODY_LIMIT_REJECTIONS_TOTAL: &str =
 /// `status="200"` sample in the request families.
 ///
 /// Scope: emitted from the Model-Group dispatch loops
-/// (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`) — the
+/// (`/v1/chat/completions`, `/v1/responses`) — the
 /// endpoints that keep per-attempt telemetry at all. The single-target
 /// handlers dispatch once per request and are already covered by the
 /// request families.
@@ -434,12 +433,11 @@ pub const M_REQUEST_E2E_LATENCY_SECONDS: &str = "aisix_request_e2e_latency_secon
 ///   stream refused by an output guardrail, or abandoned by the client,
 ///   before that point observes `upstream` only.
 ///
-/// On the two protocol bridges — `/v1/messages` to a non-Anthropic
-/// upstream and `/v1/responses` to a chat-protocol upstream — the
-/// client's first frame is the first content-bearing event, so
+/// On the protocol bridge — `/v1/responses` to a chat-protocol upstream —
+/// the client's first frame is the first content-bearing event, so
 /// `downstream` there also contains the wait for it (for a reasoning
 /// upstream, its thinking time); `downstream - upstream` is not pure
-/// gateway overhead on those paths. A query that does not filter on
+/// gateway overhead on that path. A query that does not filter on
 /// `side` blends both measurements.
 pub const M_REQUEST_TTFT_SECONDS: &str = "aisix_request_ttft_seconds";
 

@@ -93,11 +93,9 @@ pub struct ChatMessage {
     /// Raw content-block array when the caller sent
     /// `content: [{type, ...}, ...]`. `None` for the bare-string and
     /// `null` content shapes. Bridges that support content blocks
-    /// (the OpenAI-compat bridge) forward this verbatim to upstream.
-    /// The Anthropic /v1/messages inbound parse translates its own
-    /// block types INTO this OpenAI-shaped array (#722); bridges that
-    /// don't understand blocks consult only `content` (concatenated
-    /// text).
+    /// (the OpenAI-compat bridge) forward this verbatim to upstream;
+    /// bridges that don't understand blocks consult only `content`
+    /// (concatenated text).
     pub content_blocks: Option<Vec<Value>>,
     pub name: Option<String>,
     pub tool_call_id: Option<String>,
@@ -510,13 +508,13 @@ pub struct ChatFormat {
     /// written.
     #[serde(skip)]
     pub gateway_strict_schema: bool,
-    /// `top_k` from a `/v1/messages` caller. The OpenAI wire has no such
+    /// A caller-supplied `top_k` from a wire that carries the parameter.
+    /// The OpenAI wire has no such
     /// parameter, so it never rides `extra`; a bridge whose target takes a
-    /// top-k slot writes it there (Claude `top_k`, Converse Claude / Nova,
-    /// Gemini `topK`) and every other bridge leaves it unsent.
+    /// top-k slot writes it there and every other bridge leaves it unsent.
     #[serde(skip)]
     pub top_k: Option<u64>,
-    /// The exact `thinking.budget_tokens` of a `/v1/messages` caller whose
+    /// The exact `thinking.budget_tokens` of a caller whose
     /// thinking is `enabled`. `extra.reasoning_effort` still carries the
     /// tier bucketed from it, for targets that take only a tier; a target
     /// with a token-budget slot (Claude `thinking.budget_tokens`, Gemini 2.5
@@ -526,8 +524,8 @@ pub struct ChatFormat {
     pub thinking_budget_tokens: Option<u64>,
     /// Whether the caller's own request asked to see the model's thoughts,
     /// decided by each inbound protocol before `effort_mapping` runs. Unlike
-    /// `extra.reasoning_effort`, which an operator's mapping or a
-    /// `/v1/messages` caller's `output_config.effort` can also write, it says
+    /// `extra.reasoning_effort`, which an operator's mapping
+    /// can also write, it says
     /// who asked, for a target that returns thoughts only on request.
     #[serde(skip)]
     pub thoughts_requested: bool,

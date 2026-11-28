@@ -162,9 +162,8 @@ struct ResponseUsage {
     modality: aisix_gateway::ModalityTokens,
     cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     /// Anthropic `cache_creation_input_tokens` (cache write). Always 0 on
-    /// the verbatim OpenAI path; carried for the cross-provider bridge
-    /// path (#825) so an Anthropic-backed /v1/responses call bills cache
-    /// writes the same way /v1/messages does.
+    /// the verbatim OpenAI path; carried so a bridge-sourced usage event
+    /// bills cache writes the same way /v1/chat/completions does.
     cache_creation_tokens: u32,
     /// Anthropic `cache_read_input_tokens` (cache read). Always 0 on the
     /// verbatim OpenAI path (OpenAI surfaces cache hits via
@@ -622,14 +621,14 @@ async fn dispatch(
     crate::dispatch::check_ip_access(&model_entry.value, &client.source_ip)?;
 
     // #719: /v1/responses must run input guardrails like /v1/chat/completions
-    // and /v1/messages. Before this, user input reached the upstream without
+    // does. Before this, user input reached the upstream without
     // any configured content/DLP check, so a content block enforced on the
     // chat surface was bypassable simply by calling /v1/responses (the same
     // violent input that 422s on chat returned 200 with the content echoed
     // here). Translate the Responses-API body into the internal ChatFormat
     // and run the resolved input guardrail chain; a Block short-circuits
     // before dispatch. (Input Bypass is not applied to the outgoing
-    // Responses body — only Block is enforced, matching /v1/messages.)
+    // Responses body — only Block is enforced, matching /v1/chat/completions.)
     //
     // #542: run this BEFORE the rate-limit reservation so a content-policy
     // block doesn't burn an RPM slot (matching /v1/chat/completions).
@@ -639,9 +638,9 @@ async fn dispatch(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
-    // Arc so the chain can be cloned into the cross-provider streaming
+    // Arc so the chain can be cloned into the streaming
     // response body (which outlives this handler) for end-of-stream output
-    // guardrails (#825), mirroring /v1/messages.
+    // guardrails (#825), mirroring /v1/chat/completions.
     let resolved_chain = Arc::new(state.guardrail_index.resolve(&guardrail_ctx));
     *audit_out = resolved_chain.audit_log();
     if !resolved_chain.is_empty() {
@@ -1311,7 +1310,7 @@ async fn responses_to_target(
             }
 
             // Apply the PK's `request.*` overrides to the outbound body, matching the
-            // OpenAI bridge's chat() path and the /v1/messages passthrough. The
+            // OpenAI bridge's chat() path. The
             // verbatim /v1/responses path builds the request directly (bypassing the
             // Hub), so without this the override pipeline silently no-ops for Codex
             // traffic (AISIX-Cloud#867 follow-up). Apply order: renames → constraints
@@ -1696,7 +1695,7 @@ async fn responses_to_target(
             // could not be scanned. Dropping them silently would hand
             // the caller an empty 200 with no signal, and there is no
             // scanned content to release — refuse, the same shape the
-            // buffer-cap arm above and `/v1/messages` use. A buffer that
+            // buffer-cap arm above uses. A buffer that
             // was empty to begin with is an empty upstream response and
             // is left alone.
             if buf.is_empty() && seal.cut_anything() {
@@ -3301,9 +3300,8 @@ fn responses_sse_provider_request_id(bytes: &[u8]) -> String {
 /// Drain every complete SSE frame from `buf`, updating `acc` with the latest
 /// terminal-event usage (#808) and feeding each parsed event to the optional
 /// content capture (AISIX-Cloud#947). A frame ends at the first blank line;
-/// an incomplete trailing frame is left in `buf` for the next chunk. Reuses
-/// the shared SSE framing helpers from the `/v1/messages` passthrough so the
-/// two surfaces parse identically. Each frame is also appended to `out` with
+/// an incomplete trailing frame is left in `buf` for the next chunk. Uses
+/// the shared SSE framing helpers so every surface parses identically. Each frame is also appended to `out` with
 /// the client-facing `model` restamped onto the snapshot frames that carry
 /// one.
 ///
@@ -3574,7 +3572,7 @@ impl SseTextCapture {
 /// Drop guard that fires `on_complete` exactly once with the usage parsed from
 /// the stream's terminal SSE event — on normal end-of-stream AND on
 /// client-disconnect (the async-stream generator drops at its suspension
-/// point), mirroring the `/v1/messages` and chat.rs CompleteOnDrop pattern.
+/// point), mirroring the chat.rs CompleteOnDrop pattern.
 /// `None` means no terminal usage was seen (e.g. an abort before completion);
 /// the emit then records a zero-token 200 so the request still appears in the
 /// dashboard Logs. The second callback argument is the captured output text
@@ -4180,7 +4178,7 @@ fn apply_passthrough_headers(
 ///
 /// `provider_kind` / `provider_featured` / `branded_provider` / `pk_label` /
 /// `byo_label` are populated from the resolved target's ProviderKey
-/// `telemetry_tags` (AISIX-Cloud#867) — same lookup as `/v1/messages` and
+/// `telemetry_tags` (AISIX-Cloud#867) — same lookup as
 /// `/v1/chat/completions`, so Codex (`/v1/responses`) logs carry the upstream
 /// vendor + PK label the dashboard's Logs detail shows. Empty `provider_key_id`
 /// (pre-dispatch error) bypasses the lookup → wire NULL.
@@ -6923,10 +6921,10 @@ data: [DONE]\n\n";
     /// AISIX-Cloud#867: a streaming `/v1/responses` 200 (every Codex request,
     /// which always streams) MUST carry the resolved ProviderKey's telemetry
     /// attribution tags — provider_kind / provider_featured / branded_provider
-    /// / pk_label — exactly like `/v1/messages` and `/v1/chat/completions`.
+    /// / pk_label — exactly like `/v1/chat/completions`.
     /// Pre-fix the responses handler left these at default, so Codex logs were
-    /// missing the upstream vendor + PK label that Claude-Code (Anthropic SDK)
-    /// logs show. Fails before the fix (empty tags), passes after.
+    /// missing the upstream vendor + PK label that chat logs show.
+    /// Fails before the fix (empty tags), passes after.
     #[tokio::test]
     async fn streaming_path_emits_provider_telemetry_tags_issue_867() {
         use aisix_obs::UsageSink;
@@ -7596,7 +7594,7 @@ data: [DONE]\n\n";
     /// `reasoning` item DOES carry `content[]` with `text` parts, and the
     /// walk reads `content` off every item regardless of type — so without
     /// an explicit skip the model's own reasoning reached the output scan
-    /// on this surface while the chat and `/v1/messages` surfaces excluded
+    /// on this surface while the chat surface excluded
     /// it.
     #[test]
     fn responses_output_scan_excludes_generated_reasoning() {

@@ -26,7 +26,7 @@
 //! the clean one.
 //!
 //! The list below is hand-written, and AISIX-Cloud#1435 is what a
-//! hand-written list costs: `/v1/messages/count_tokens` gained the chain
+//! hand-written list costs: one surface gained the chain
 //! and the flag in the same release, was not on it, and emitted no usage
 //! event at all. So the "no surface may be missing" half now lives in
 //! `guardrail_coverage`, whose set is parsed out of the router — add a

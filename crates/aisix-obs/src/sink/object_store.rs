@@ -244,7 +244,7 @@ fn upstream_client_options() -> object_store::ClientOptions {
 /// `None` is the operator's "off" (config `0`), not "use whatever the
 /// library defaults to" — so `connect_timeout` has to be disabled
 /// explicitly or `ClientOptions` puts its own 5s back, the same trap the
-/// Bedrock stack steps around. `pool_idle_timeout` has no disable entry
+/// AWS SDK stack steps around. `pool_idle_timeout` has no disable entry
 /// point here, so `0` leaves reqwest's 90s instead of the never-expire
 /// the reqwest clients get; that is the pre-existing behaviour and the
 /// conservative direction, but it is a divergence.
@@ -867,7 +867,7 @@ mod tests {
 
     /// `None` on these fields is the operator's "off" — `upstream_http`'s
     /// loader maps config `0` to it, and every reqwest client and the
-    /// Bedrock SDK read it as unbounded. `ClientOptions` reads an unset
+    /// AWS SDK read it as unbounded. `ClientOptions` reads an unset
     /// `connect_timeout` as "use mine" and would put 5s back, so a dial
     /// the operator disabled would still be aborted, and only on the
     /// export path.

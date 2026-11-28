@@ -8,8 +8,8 @@
 //! (the trace/group key) and are ordered by `index` — each attempt
 //! is its own per-call log event.
 //!
-//! The type lives in its own module so `/v1/chat/completions`,
-//! `/v1/messages`, and `/v1/responses` cannot drift apart on how they
+//! The type lives in its own module so `/v1/chat/completions` and
+//! `/v1/responses` cannot drift apart on how they
 //! classify and emit attempts.
 //!
 //! [`RoutingTelemetry::record`] is the single place an attempt is
@@ -257,8 +257,7 @@ pub(crate) struct AccessLogRouting<'a> {
 }
 
 /// Winning-attempt / failed-attempt classification stamped onto an
-/// emitted `UsageEvent` (#655). Used by the `/v1/messages` and
-/// `/v1/responses` emit helpers, which (unlike chat's `UsageExtras`)
+/// emitted `UsageEvent` (#655). Used by the `/v1/responses` emit helper, which (unlike chat's `UsageExtras`)
 /// carry the attempt fields as a small standalone bundle.
 #[derive(Default, Clone)]
 pub(crate) struct AttemptInfo {
@@ -479,7 +478,7 @@ pub(crate) fn access_log_error(err: &ProxyError) -> (&'static str, String) {
 
 /// Bounded error class + short message for a per-attempt record, derived
 /// from a `ProxyError`: its [`error_class`] and [`gateway_error_message`].
-/// Shared by the `/v1/messages` and `/v1/responses` dispatch loops.
+/// Shared by the `/v1/responses` dispatch loop.
 pub(crate) fn attempt_error_from_proxy(err: &ProxyError) -> (String, String) {
     (error_class(err).to_string(), gateway_error_message(err))
 }
@@ -575,7 +574,7 @@ pub(crate) fn relayed_failure(status: u16, body: &[u8]) -> (&'static str, String
 
 /// Whether a failed attempt actually reached its upstream — the
 /// `AttemptRecord::dispatched` value for the `ProxyError`-typed dispatch
-/// loops (`/v1/messages`, `/v1/responses`), mirroring
+/// loop (`/v1/responses`), mirroring
 /// [`BridgeError::reached_upstream`] for the `BridgeError`-typed one.
 ///
 /// `ContentFiltered` is `true` because only the **output** hook can fire

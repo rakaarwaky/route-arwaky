@@ -887,7 +887,7 @@ impl<'a> TargetGate<'a> {
 /// with the winning target's model layers folded in (AISIX-Cloud#1087), and
 /// leave both `None` so no later site commits them again.
 ///
-/// `/v1/messages` and `/v1/responses` call this as soon as the attempt's
+/// `/v1/responses` calls this as soon as the attempt's
 /// usage is known, before the output guardrail is awaited, as chat does:
 /// the upstream already spent the tokens, and a caller that hangs up during
 /// the check drops the handler before it could commit, so the reservation
@@ -909,7 +909,7 @@ pub(crate) async fn commit_answered_attempt(
 /// Seconds until the offending window reopens, for a
 /// [`TargetGate::reserve`] rejection. `chat.rs` funnels its rejection
 /// through a `BridgeError`, which would otherwise drop the hint the
-/// `/v1/messages` and `/v1/responses` loops keep by carrying the
+/// `/v1/responses` loop keeps by carrying the
 /// `ProxyError::RateLimit` itself — so every endpoint's all-targets-exhausted
 /// 429 lands with the same `Retry-After`.
 pub(crate) fn retry_after_of(err: &ProxyError) -> Option<u64> {

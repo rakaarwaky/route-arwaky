@@ -341,8 +341,7 @@ struct HeartbeatBody<'a> {
     version: &'a str,
     /// Guardrail `kind` discriminators this node can serve (#519 B.6).
     /// Always present so cp-api can hide / flag kinds the DP can't
-    /// serve. Fixed at compile time — a build without the `bedrock`
-    /// feature does not advertise `bedrock`.
+    /// serve. Fixed at compile time.
     supported_guardrail_kinds: &'static [&'static str],
     /// Highest etcd/kine revision the watch supervisor has applied
     /// (#519 B.3). `0` = snapshot not loaded yet. cp-api compares this

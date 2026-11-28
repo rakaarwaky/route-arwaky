@@ -1322,7 +1322,7 @@ mod tests {
     /// stamp the per-PK telemetry attribution fields (provider_kind /
     /// provider_featured / branded_provider / pk_label) on the emitted
     /// UsageEvent, sourced from the resolved ProviderKey's `telemetry_tags`
-    /// — exactly like /v1/chat/completions, /v1/messages, /v1/responses, and
+    /// — exactly like /v1/chat/completions, /v1/responses, and
     /// /v1/embeddings. Pre-fix these five fields were left at Default, so
     /// image-generation spend showed up unattributed in cp-api analytics.
     #[tokio::test]
