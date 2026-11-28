@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { request as httpRequest } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
@@ -6,12 +6,10 @@ import {
   ProxyClient,
   SeedClient,
   spawnApp,
-  startMcpUpstream,
   startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
   waitForSlsLog,
-  type McpUpstream,
   type MockSls,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -47,7 +45,6 @@ describe("exporters record the request and upstream response headers they list",
   let upstream: OpenAiUpstream | undefined;
   let broken: OpenAiUpstream | undefined;
   let flaky: OpenAiUpstream | undefined;
-  let mcp: McpUpstream | undefined;
   let sls: MockSls | undefined;
   let otlp: MockOtlp | undefined;
   let app: SpawnedApp | undefined;
@@ -129,7 +126,6 @@ describe("exporters record the request and upstream response headers they list",
         { responseHeaders: { "x-upstream-region": "second-try" } },
       ],
     });
-    mcp = await startMcpUpstream("urh");
 
     app = await spawnApp({
       extraEnv: {
@@ -200,17 +196,11 @@ describe("exporters record the request and upstream response headers they list",
       auth_mode: "header_key",
       auth_header_name: "x-gw-key",
     });
-    await seed.update("mcp_servers", randomUUID(), {
-      name: "urh",
-      url: mcp.url,
-      enabled: true,
-    });
     // Seeded last: it authenticating implies everything above is live.
     await seed.createApiKey({
       key_hash: hash(PLAINTEXT),
       allowed_models: ["*"],
       allowed_routes: ["*"],
-      mcp_access: { allow: ["*"] },
     });
     const proxy = new ProxyClient(app.proxyUrl, PLAINTEXT);
     await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
@@ -221,7 +211,6 @@ describe("exporters record the request and upstream response headers they list",
     await upstream?.close();
     await broken?.close();
     await flaky?.close();
-    await mcp?.close();
     await sls?.close();
     await otlp?.close();
   });
@@ -310,9 +299,6 @@ describe("exporters record the request and upstream response headers they list",
     expect(map(row, "request_headers")).toEqual({ "x-sub-user": "frank" });
     expect(map(row, "upstream_response_headers")).toEqual({ "x-upstream-region": "broken-region" });
   });
-
-  // `/mcp` resolves its caller without the extractor the other families
-  // share, so it captures the request headers on its own path.
 });
 
 async function waitForSpan(

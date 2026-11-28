@@ -6,11 +6,9 @@ import {
   SeedClient,
   slsLogsFor,
   spawnApp,
-  startMcpUpstream,
   startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
-  type McpUpstream,
   type MockSls,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -125,7 +123,6 @@ describe("is_final_attempt marks the one last row of a request", () => {
   let etcdReachable = false;
   let app: SpawnedApp | undefined;
   let sls: MockSls | undefined;
-  let mcp: McpUpstream | undefined;
   let slow: OpenAiUpstream | undefined;
   let trickle: OpenAiUpstream | undefined;
   const upstreams: OpenAiUpstream[] = [];
@@ -278,27 +275,12 @@ describe("is_final_attempt marks the one last row of a request", () => {
       target_url: okBase,
       provider_key_id: okPk.id,
     });
-    await seed.update("a2a_agents", randomUUID(), {
-      name: "fm-agent",
-      url: okBase,
-      protocol_version: "1.0",
-      auth_type: "none",
-      enabled: true,
-    });
-    mcp = await startMcpUpstream("fmmcp");
-    await seed.update("mcp_servers", randomUUID(), {
-      name: "fmmcp",
-      url: mcp.url,
-      enabled: true,
-    });
 
     // Seeded last: the key authenticating implies the whole set is live.
     await seed.createApiKey({
       key_hash: createHash("sha256").update(CALLER).digest("hex"),
       allowed_models: ["*"],
       allowed_routes: ["fm-route"],
-      allowed_agents: ["*"],
-      allowed_mcp_servers: ["*"],
     });
     await waitConfigPropagation(async () => {
       const res = await fetch(`${app!.proxyUrl}/v1/models`, { headers: auth });
@@ -310,7 +292,6 @@ describe("is_final_attempt marks the one last row of a request", () => {
   afterAll(async () => {
     await app?.exit();
     await sls?.close();
-    await mcp?.close();
     for (const u of upstreams) await u.close();
     await Promise.all(
       servers.map((s) => new Promise((r) => {

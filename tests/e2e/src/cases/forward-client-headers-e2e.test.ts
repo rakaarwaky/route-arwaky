@@ -5,12 +5,8 @@ import {
   ProxyClient,
   SeedClient,
   spawnApp,
-  startA2aUpstream,
-  startMcpUpstream,
   startOpenAiUpstream,
   waitConfigPropagation,
-  type A2aUpstream,
-  type McpUpstream,
   type OpenAiUpstream,
   type ReceivedRequest,
   type SpawnedApp,
@@ -25,22 +21,14 @@ import {
 // hands that service the end user's own credentials and context — the
 // service keeps reading the header it always read.
 //
-// Four faces build their outbound headers in completely different code,
+// Two faces build their outbound headers in completely different code,
 // which is why each gets its own coverage here:
 //
 //   1. /v1/*             — ProviderKey `request.forward_client_headers`,
-//                          on the shared bridge pipeline AND on the
-//                          Anthropic bridge, which assembles its request
-//                          separately.
-//   2. /mcp              — the `mcp_server` field, on both `type: mcp`
-//                          (Streamable HTTP upstream) and `type: openapi`
-//                          (generated tools calling a REST API).
-//   3. /passthrough/*    — the `passthrough_route` field, where the
+//                          on the shared bridge pipeline.
+//   2. /passthrough/*    — the `passthrough_route` field, where the
 //                          default is the opposite (forward everything)
 //                          and the list OVERRIDES a strip.
-//   4. /a2a/*            — the `a2a_agent` field, on the JSON-RPC call,
-//                          its streaming variant, and the agent-card
-//                          fetch, which is an upstream hop of its own.
 //
 // And beside them, the sub-dispatch paths of the model kinds that do NOT
 // go through the one convergence point the faces above share: an
@@ -60,15 +48,11 @@ const CALLER_HASH = createHash("sha256").update(CALLER_KEY).digest("hex");
 
 const FORWARD_MODEL = "fwd-openai-model";
 const PLAIN_MODEL = "fwd-plain-model";
-const ANTHROPIC_MODEL = "fwd-anthropic-model";
 const ENSEMBLE_MODEL = "fwd-ensemble-model";
 const ENSEMBLE_MEMBER_A = "fwd-ensemble-member-a";
 const ENSEMBLE_MEMBER_B = "fwd-ensemble-member-b";
 const ENSEMBLE_JUDGE = "fwd-ensemble-judge";
 const ROUTE_PREFIX = "/passthrough/fwd";
-const A2A_AGENT = "fwdagent";
-const A2A_PLAIN_AGENT = "fwdplainagent";
-const A2A_GATEWAY_SECRET = "gateway-held-a2a-secret";
 const GATEWAY_KEY_HEADER = "x-gw-key";
 const CUSTOM_HEADER = "x-user-jwt";
 const CALLER_CREDENTIAL = "Bearer callers-own-credential";
@@ -85,38 +69,9 @@ const CALLER_SLOTS: Record<string, string> = {
 };
 const PLAIN_HEADER = "x-plain-context";
 
-const ANTHROPIC_BODY = {
-  id: "msg_01",
-  type: "message",
-  role: "assistant",
-  content: [{ type: "text", text: "hi" }],
-  model: "claude-3-5-haiku-20241022",
-  stop_reason: "end_turn",
-  usage: { input_tokens: 5, output_tokens: 4 },
-};
-
-/** The OpenAPI document exposing the upstream's `/v1/models` as one tool. */
-function systemServerSpec(): Record<string, unknown> {
-  return {
-    openapi: "3.0.0",
-    info: { title: "system-server", version: "1" },
-    paths: {
-      "/models": {
-        get: {
-          operationId: "listmodels",
-          responses: { "200": { description: "ok" } },
-        },
-      },
-    },
-  };
-}
-
 describe("forward_client_headers e2e: one capability across every proxy face", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let anthropicUpstream: OpenAiUpstream | undefined;
-  let mcpUpstream: McpUpstream | undefined;
-  let a2aUpstream: A2aUpstream | undefined;
   let etcdReachable = false;
 
   const since = (mark: number): ReceivedRequest[] =>
@@ -152,68 +107,12 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
       }),
     });
 
-  const mcpPost = async (
-    body: unknown,
-    headers: Record<string, string> = {},
-  ): Promise<Record<string, any> | undefined> => {
-    const res = await fetch(`${app!.proxyUrl}/mcp`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${CALLER_KEY}`,
-        "content-type": "application/json",
-        accept: "application/json, text/event-stream",
-        ...headers,
-      },
-      body: JSON.stringify(body),
-    });
-    const text = await res.text();
-    // A handshake that fails here would surface as the header assertion
-    // finding nothing at the upstream, which says nothing about why.
-    if (!res.ok) throw new Error(`MCP POST ${res.status}: ${text.slice(0, 400)}`);
-    if (!text) return undefined;
-    try {
-      return JSON.parse(text);
-    } catch {
-      throw new Error(`MCP POST returned unparseable JSON: ${text.slice(0, 400)}`);
-    }
-  };
-
-  /** Spec-faithful per-operation handshake; the endpoint is stateless. */
-  const callTool = async (
-    tool: string,
-    headers: Record<string, string> = {},
-  ): Promise<void> => {
-    await mcpPost(
-      {
-        jsonrpc: "2.0",
-        id: 1,
-        method: "initialize",
-        params: {
-          protocolVersion: "2025-11-25",
-          capabilities: {},
-          clientInfo: { name: "forward-client-headers-e2e", version: "0.1" },
-        },
-      },
-      headers,
-    );
-    await mcpPost({ jsonrpc: "2.0", method: "notifications/initialized" }, headers);
-    await mcpPost(
-      { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: tool, arguments: { text: "hi" } } },
-      headers,
-    );
-  };
-
   beforeAll(async () => {
     const etcd = new EtcdClient();
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
-    anthropicUpstream = await startOpenAiUpstream({ nonStreamBody: ANTHROPIC_BODY });
-    mcpUpstream = await startMcpUpstream("fwd");
-    // No `token`: this stub gates on the gateway's bearer when given one, and
-    // the point here is to READ what arrived rather than to be refused for it.
-    a2aUpstream = await startA2aUpstream();
     app = await spawnApp({});
     const seed = new SeedClient(etcd, app.etcdPrefix);
 
@@ -272,24 +171,6 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
       },
     });
 
-    // The Anthropic bridge assembles its upstream request by hand rather
-    // than through the shared pipeline — the classic place a per-request
-    // mechanism goes silently missing. Its credential slot is `x-api-key`.
-    const anthropicPk = await seed.createProviderKey({
-      display_name: "fwd-anthropic-pk",
-      api_key: "sk-mock-anthropic",
-      api_base: `${anthropicUpstream.baseUrl}/v1`,
-      provider: "anthropic",
-      adapter: "anthropic",
-      request: { forward_client_headers: [CUSTOM_HEADER, "x-api-key"] },
-    });
-    await seed.createModel({
-      display_name: ANTHROPIC_MODEL,
-      provider: "anthropic",
-      model_name: "claude-sonnet-4",
-      provider_key_id: anthropicPk.id,
-    });
-
     // `gateway_key` + `inject`: the gateway CONSUMES `authorization` to
     // identify the caller and strips it, and `strip_headers` removes the
     // custom slot too. Both strips are what the list overrides.
@@ -308,23 +189,6 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
       provider_key_id: routePk.id,
       forward_client_headers: [CUSTOM_HEADER, "authorization"],
     });
-    // Anthropic under `inject`: the route injects `anthropic-version`,
-    // which is in no strip set, so a caller sending its own (every
-    // Anthropic SDK does) is the duplicate-header case.
-    const anthropicRoutePk = await seed.createProviderKey({
-      display_name: "fwd-route-anthropic-pk",
-      api_key: GATEWAY_SECRET,
-      provider: "anthropic",
-      api_base: upstream.baseUrl,
-    });
-    await seed.createPassthroughRoute({
-      name: "fwd-route-anthropic",
-      path_prefix: `${ROUTE_PREFIX}-anthropic`,
-      target_url: upstream.baseUrl,
-      auth_mode: "gateway_key",
-      credential_mode: "inject",
-      provider_key_id: anthropicRoutePk.id,
-    });
     await seed.createPassthroughRoute({
       name: "fwd-route-plain",
       path_prefix: `${ROUTE_PREFIX}-plain`,
@@ -332,45 +196,6 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
       auth_mode: "gateway_key",
       credential_mode: "inject",
       provider_key_id: routePk.id,
-    });
-
-    // A REST API exposed as MCP tools, and a real MCP upstream: two
-    // different outbound builders behind one endpoint.
-    await seed.update("mcp_servers", randomUUID(), {
-      name: "systemserver",
-      type: "openapi",
-      url: `${upstream.baseUrl}/v1`,
-      spec: systemServerSpec(),
-      auth_type: "bearer",
-      secret: "gateway-held-mcp-secret",
-      forward_client_headers: [CUSTOM_HEADER, "authorization"],
-    });
-    await seed.update("mcp_servers", randomUUID(), {
-      name: "nativeserver",
-      type: "mcp",
-      url: mcpUpstream.url,
-      forward_client_headers: [CUSTOM_HEADER, "*"],
-    });
-
-    // Two A2A agents behind one stub: one opted in, one with the default.
-    // `"*"` beside the named entries is what proves the version announcement
-    // resists a glob rather than simply never matching a pattern.
-    await seed.update("a2a_agents", randomUUID(), {
-      name: A2A_AGENT,
-      url: a2aUpstream.url,
-      protocol_version: "1.0",
-      auth_type: "bearer",
-      secret: A2A_GATEWAY_SECRET,
-      forward_client_headers: [CUSTOM_HEADER, "authorization", "*"],
-      enabled: true,
-    });
-    await seed.update("a2a_agents", randomUUID(), {
-      name: A2A_PLAIN_AGENT,
-      url: a2aUpstream.url,
-      protocol_version: "1.0",
-      auth_type: "bearer",
-      secret: A2A_GATEWAY_SECRET,
-      enabled: true,
     });
 
     const callerKeyId = randomUUID();
@@ -427,15 +252,6 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
         ...overrides,
       });
     }
-    await seed.createPassthroughRoute({
-      name: "fwd-route-inject-anthropic-named",
-      path_prefix: `${ROUTE_PREFIX}-inject-anthropic-named`,
-      target_url: upstream.baseUrl,
-      auth_mode: "gateway_key",
-      credential_mode: "inject",
-      provider_key_id: anthropicRoutePk.id,
-      forward_client_headers: ["x-api-key"],
-    });
     for (const [suffix, overrides] of [
       ["byo", {}],
       ["byo-glob", { forward_client_headers: ["x-*"] }],
@@ -495,8 +311,6 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
       key_hash: CALLER_HASH,
       allowed_models: ["*"],
       allowed_routes: ["*"],
-      allowed_agents: ["*"],
-      mcp_access: { allow: ["*"] },
     });
     const proxy = new ProxyClient(app.proxyUrl, CALLER_KEY);
     await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
@@ -505,9 +319,6 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
   afterAll(async () => {
     await app?.exit();
     await upstream?.close();
-    await anthropicUpstream?.close();
-    await mcpUpstream?.close();
-    await a2aUpstream?.close();
   });
 
   test("a named header reaches an LLM upstream that opted in", async () => {
@@ -764,45 +575,6 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
 
 
 
-  /** A JSON-RPC call to an agent through the gateway. */
-  const a2aCall = async (
-    agent: string,
-    method: string,
-    headers: Record<string, string> = {},
-  ): Promise<Response> =>
-    fetch(`${app!.proxyUrl}/a2a/${agent}`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${CALLER_KEY}`,
-        "content-type": "application/json",
-        ...headers,
-      },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: "fwd-1",
-        method,
-        params: {
-          message: {
-            role: "user",
-            parts: [{ kind: "text", text: "probe" }],
-            messageId: "m-fwd",
-          },
-        },
-      }),
-    });
-
-  /**
-   * Every request the A2A stub saw since `mark` under `httpMethod` — the card
-   * fetch is a GET and the JSON-RPC call a POST, and one test drives both.
-   */
-  const a2aSince = (mark: number, httpMethod: "GET" | "POST") =>
-    a2aUpstream!.requests.slice(mark).filter((r) => r.httpMethod === httpMethod);
-
-
-
-
-
-
   test("an ensemble's panel and judge each forward on their own upstream", async () => {
     if (!etcdReachable) return;
     const mark = upstream!.receivedRequests.length;
@@ -881,7 +653,6 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
     // A credential slot needs its own name for the same reason, and this
     // is the shape the bug actually took: the caller's live AWS session
     // token arriving at an upstream that has no business holding one.
-    // This upstream is not Bedrock, so nothing downstream would strip it.
     for (const name of ["x-amz-security-token", "x-amz-date", "x-amz-content-sha256"]) {
       expect(seen.headers[name], `${name} reached the upstream under a glob`).toBeUndefined();
     }

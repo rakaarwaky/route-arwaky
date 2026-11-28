@@ -6,12 +6,10 @@ import {
   ProxyClient,
   SeedClient,
   spawnApp,
-  startA2aUpstream,
   startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
   waitForSlsLog,
-  type A2aUpstream,
   type MockSls,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -21,8 +19,7 @@ import {
 // mask back is reported, not silent.
 //
 // A passthrough route relays the caller's body and the provider's reply as
-// bytes, and so do a job's body, a realtime frame, an A2A message and a video
-// prompt. A mask rule that matches there cannot rewrite
+// bytes, and so do a job's body, a realtime frame and a video prompt. A mask rule that matches there cannot rewrite
 // anything: the content is forwarded unmodified. Before this, the enforcing
 // row left no trace at all — the event read exactly like a request with no
 // PII in it — and the monitor row previewed `would_mask`, promising a
@@ -47,7 +44,6 @@ const ENFORCE = "pmu-enforce";
 const MONITOR = "pmu-monitor";
 const ROUTE = "pmu-tunnel";
 const STREAM_ROUTE = "pmu-stream-tunnel";
-const AGENT = "pmu-a2a";
 
 // Two addresses in every caller-authored body, one in every provider reply,
 // so a count that merely says "something matched" cannot pass.
@@ -113,7 +109,6 @@ async function startRealtimeUpstream(): Promise<RealtimeUpstream> {
 describe("a pii mask rule where content cannot be rewritten is reported, not silent", () => {
   let app: SpawnedApp | undefined;
   let sls: MockSls | undefined;
-  let a2a: A2aUpstream | undefined;
   let realtime: RealtimeUpstream | undefined;
   let chatUp: OpenAiUpstream | undefined;
   let streamUp: OpenAiUpstream | undefined;
@@ -140,7 +135,6 @@ describe("a pii mask rule where content cannot be rewritten is reported, not sil
     });
     upstreams.push(chatUp, streamUp, videoUp);
     realtime = await startRealtimeUpstream();
-    a2a = await startA2aUpstream({ wireShape: "0.3" });
 
     app = await spawnApp({
       extraEnv: {
@@ -197,13 +191,6 @@ describe("a pii mask rule where content cannot be rewritten is reported, not sil
       target_url: `${streamUp.baseUrl}/v1`,
       provider_key_id: streamPk.id,
     });
-    await seed.update("a2a_agents", randomUUID(), {
-      name: AGENT,
-      url: a2a.url,
-      protocol_version: "0.3",
-      auth_type: "none",
-      enabled: true,
-    });
     for (const [name, mode] of [
       [ENFORCE, "block"],
       [MONITOR, "monitor"],
@@ -223,7 +210,6 @@ describe("a pii mask rule where content cannot be rewritten is reported, not sil
       key_hash: sha256(KEY),
       allowed_models: ["*"],
       allowed_routes: ["*"],
-      allowed_agents: ["*"],
     });
     const proxy = new ProxyClient(app.proxyUrl, KEY);
     await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
@@ -233,7 +219,6 @@ describe("a pii mask rule where content cannot be rewritten is reported, not sil
     await app?.exit();
     await Promise.all(upstreams.map((u) => u.close()));
     await realtime?.close();
-    await a2a?.close();
     await sls?.close();
   });
 

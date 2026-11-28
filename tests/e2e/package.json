@@ -18,7 +18,6 @@
     "ws": "8.21.0"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.32.1",
     "openai": "4.65.0",
     "undici": "6.29.1",
     "yaml": "2.8.3"

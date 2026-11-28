@@ -1,15 +1,13 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
   SeedClient,
   spawnApp,
-  startMcpUpstream,
   startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
   waitForSlsLog,
-  type McpUpstream,
   type MockSls,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -66,7 +64,6 @@ describe("what a blocked row says the guardrails did ignores the exporter's mode
   let etcdReachable = false;
   let sls: MockSls | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let mcp: McpUpstream | undefined;
   const apps = new Map<Mode, SpawnedApp>();
 
   beforeAll(async () => {
@@ -75,7 +72,6 @@ describe("what a blocked row says the guardrails did ignores the exporter's mode
     if (!etcdReachable) return;
     sls = await startMockSls();
     upstream = await startOpenAiUpstream({ status: 400, errorBody: { error: { message: "unused" } } });
-    mcp = await startMcpUpstream("paritymcp");
 
     for (const mode of ["full", "metadata_only"] as const) {
       const app = await spawnApp({
@@ -114,12 +110,6 @@ describe("what a blocked row says the guardrails did ignores the exporter's mode
           provider_key_id: pk.id,
         });
       }
-      const mcpId = randomUUID();
-      await seed.update("mcp_servers", mcpId, {
-        name: "paritymcp",
-        url: mcp.url,
-        enabled: true,
-      });
       for (const guardrail of [
         {
           name: "parity-mask",
@@ -138,18 +128,11 @@ describe("what a blocked row says the guardrails did ignores the exporter's mode
           patterns: [{ kind: "literal", value: BLOCK_WORD }],
         },
       ]) {
-        const created = await seed.createGuardrail(guardrail);
-        await seed.update("guardrail_attachments", randomUUID(), {
-          guardrail_id: created.id,
-          scope_type: "mcp_server",
-          scope_id: mcpId,
-          priority: 100,
-        });
+        await seed.createGuardrail(guardrail);
       }
       await seed.createApiKey({
         key_hash: createHash("sha256").update(CALLER).digest("hex"),
         allowed_models: ["*"],
-        allowed_mcp_servers: ["*"],
       });
       await waitConfigPropagation(async () => {
         const res = await fetch(`${app.proxyUrl}/v1/models`, {
@@ -165,7 +148,6 @@ describe("what a blocked row says the guardrails did ignores the exporter's mode
     for (const app of apps.values()) await app.exit();
     await sls?.close();
     await upstream?.close();
-    await mcp?.close();
   });
 
   async function send(mode: Mode, make: () => Request): Promise<Row> {

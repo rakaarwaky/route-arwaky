@@ -1,15 +1,13 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
   SeedClient,
   spawnApp,
-  startMcpUpstream,
   startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
   waitForSlsLog,
-  type McpUpstream,
   type MockSls,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -20,12 +18,8 @@ import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 // console Logs and budgets read — even when there is nothing to bill:
 //   - a Cohere rerank, whose upstream reports search units and no tokens;
 //   - a request the gateway answers 501 itself because the provider lacks
-//     the capability, so no upstream call is made;
-//   - an MCP tool call whose upstream result the gateway cannot read back
-//     (it outgrows the body cap), answered 502 after the call went out.
+//     the capability, so no upstream call is made.
 // Each records zero tokens.
-//
-// The body cap is lowered so the MCP tool result outgrows it.
 const BODY_LIMIT = 65_536;
 
 const CALLER = "sk-usage-event-every-request";
@@ -52,7 +46,6 @@ describe("a usage event for every request", () => {
   let app: SpawnedApp | undefined;
   let sls: MockSls | undefined;
   let cohere: OpenAiUpstream | undefined;
-  let mcp: McpUpstream | undefined;
   let otlp: MockOtlp | undefined;
   let etcdReachable = false;
 
@@ -64,9 +57,6 @@ describe("a usage event for every request", () => {
     sls = await startMockSls();
     otlp = await startMockOtlp();
     cohere = await startOpenAiUpstream({ nonStreamBody: COHERE_RERANK });
-    mcp = await startMcpUpstream("big", {
-      reportContent: { summary: "done", log: "x".repeat(4 * BODY_LIMIT), structuredLog: "ok" },
-    });
     app = await spawnApp({
       requestBodyLimitBytes: BODY_LIMIT,
       clientTypeRules: [{ pattern: "^every-request-client/", client: "every-request-client" }],
@@ -123,30 +113,8 @@ describe("a usage event for every request", () => {
       provider_key_id: coherePk.id,
     });
 
-    // A guardrail on the MCP server makes the gateway read the tool result
-    // back before relaying it.
-    const mcpServerId = randomUUID();
-    await seed.update("mcp_servers", mcpServerId, { name: "big", url: mcp.url, enabled: true });
-    const monitor = await seed.createGuardrail(
-      {
-        name: "every-request-mcp-monitor",
-        enabled: true,
-        hook_point: "output",
-        enforcement_mode: "monitor",
-        kind: "keyword",
-        patterns: [{ kind: "literal", value: "never-present-literal" }],
-      },
-      { attach: false },
-    );
-    await seed.update("guardrail_attachments", randomUUID(), {
-      guardrail_id: monitor.id,
-      scope_type: "mcp_server",
-      scope_id: mcpServerId,
-      priority: 100,
-    });
-
     // Seeded last: its key authenticating implies the whole seed is live.
-    await seed.createApiKey({ key_hash: CALLER_HASH, allowed_models: ["*"], mcp_access: { allow: ["*"] } });
+    await seed.createApiKey({ key_hash: CALLER_HASH, allowed_models: ["*"] });
     await waitConfigPropagation(async () => {
       const res = await fetch(`${app!.proxyUrl}/v1/models`, { headers: auth });
       await res.arrayBuffer();
@@ -157,7 +125,6 @@ describe("a usage event for every request", () => {
   afterAll(async () => {
     await app?.exit();
     await cohere?.close();
-    await mcp?.close();
     await sls?.close();
     await otlp?.close();
   });
