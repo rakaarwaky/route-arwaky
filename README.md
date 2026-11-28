@@ -1,6 +1,6 @@
-<div align="center">
+# README — AISIX OSS
 
-# AISIX OSS
+<div align="center">
 
 ### The open-source, Rust-native AI gateway for LLMs and AI agents
 
@@ -12,30 +12,25 @@ forever.
 *Built by the original creators of [Apache APISIX](https://apisix.apache.org/).*
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Built with Rust](https://img.shields.io/badge/Built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
+[![Built with Rust](https://img.shields.io/badge/Built_with_Rust-orange.svg)](https://www.rust-lang.org/)
 [![Docs](https://img.shields.io/badge/docs-read-3aa757.svg)](https://docs.api7.ai/ai-gateway/)
-[![Discord](https://img.shields.io/badge/Discord-join-5865F2.svg)](https://discord.gg/dUmRZ7Rvf)
+[![Discord](https://img.shields.io/badge/Discord-join_5865F2.svg)](https://discord.gg/dUmRZ7Rvf)
 [![Website](https://img.shields.io/badge/website-api7.ai-1a73e8.svg)](https://api7.ai/ai-gateway)
 
-[**Start free**](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=ai-gateway) ·
-[**Documentation**](https://docs.api7.ai/ai-gateway/) ·
-[**Quickstart**](https://docs.api7.ai/ai-gateway/getting-started/gateway-quickstart) ·
-[**AISIX Enterprise and AISIX Cloud**](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud) ·
-[**Roadmap**](ROADMAP.md)
-
-<br>
-
-<img src="assets/aisix-architecture.svg" alt="AISIX OSS architecture — one OpenAI-compatible API in front of OpenAI, DeepSeek, and any OpenAI-compatible endpoint, with API key auth, rate and token limits, guardrails, caching, routing and failover, and observability in between" width="100%">
+**[Start free](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=ai-gateway)** ·
+**[Documentation](https://docs.api7.ai/ai-gateway/)** ·
+**[Quickstart](https://docs.api7.ai/ai-gateway/getting-started/gateway-quickstart)** ·
+**[AISIX Enterprise and AISIX Cloud](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud)**
 
 </div>
 
----
+## Project Overview
 
 **AISIX OSS** is the open-source product built around the Rust-native AISIX gateway. The
 gateway puts a single, OpenAI-compatible API in front of every LLM provider — OpenAI,
-DeepSeek, and any OpenAI-compatible endpoint. It gives platform teams one place to route,
-govern, secure, and observe LLM traffic, with first-class SSE streaming and low gateway
-overhead.
+Anthropic, Google Gemini, AWS Bedrock, Azure OpenAI, DeepSeek, and any OpenAI-compatible
+endpoint. It gives platform teams one place to route, govern, secure, and observe LLM
+traffic, with first-class SSE streaming and low gateway overhead.
 
 It runs as a **single static binary** — low cold-start, lock-free config reads, and hot
 configuration reloads with no restarts: declare resources in one `resources.yaml` and
@@ -44,7 +39,7 @@ gateway in your infrastructure, or connect it to **AISIX Enterprise** or
 **[AISIX Cloud](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud)**
 for centralized management with team governance, budgets, audit, and a dashboard.
 
-> **AISIX OSS (this repo)** is the open-source product. It runs without a control plane
+> AISIX OSS (this repo) is the open-source product. It runs without a control plane
 > using declarative configuration or etcd. The same gateway binary serves as the data
 > plane in the commercial products: customers host the control plane with **AISIX
 > Enterprise**, while API7 hosts it with **AISIX Cloud**. In all three products, the
@@ -52,88 +47,7 @@ for centralized management with team governance, budgets, audit, and a dashboard
 > pass through either control plane. The proxy API is identical throughout.
 > **[Talk to us about AISIX Enterprise or AISIX Cloud →](https://api7.ai/contact?utm_source=github&utm_medium=readme&utm_campaign=cloud)**
 
-## ⚡ Quickstart
-
-One container. No control plane, no database, no configuration store — the gateway reads
-every dynamic resource from one declarative `resources.yaml`.
-
-```yaml
-# config.yaml
-resources_file: /etc/aisix/resources.yaml
-proxy:
-  addr: "0.0.0.0:3000"
-admin:
-  enabled: false          # a declarative gateway needs no admin listener
-observability:
-  metrics:
-    prometheus:
-      enabled: true
-      addr: "0.0.0.0:9090"
-```
-
-```yaml
-# resources.yaml — every entry is an id plus the resource's document
-_format_version: "2"
-
-provider_keys:
-  - id: 0b6f3c1e-2f0a-4c5e-9d55-7d1a8b0c2e11
-    display_name: openai-main
-    provider: openai
-    api_key: ${OPENAI_API_KEY}        # interpolated from the environment
-
-models:
-  - id: 6efd592d-a73b-573d-8e2c-e9e103692f92
-    display_name: my-model
-    provider: openai
-    model_name: gpt-4o-mini
-    provider_key_id: 0b6f3c1e-2f0a-4c5e-9d55-7d1a8b0c2e11
-
-api_keys:
-  - id: 4a1c9e2b-7d3f-4b6a-8c5e-1f2a3b4c5d6e
-    display_name: local-dev
-    key_hash: ${CALLER_API_KEY_SHA256}  # sha256 hex of the caller key; the plaintext is never stored
-    allowed_model_ids: ["6efd592d-a73b-573d-8e2c-e9e103692f92"]
-```
-
-```bash
-export OPENAI_API_KEY="YOUR_PROVIDER_KEY"
-export CALLER_API_KEY="YOUR_CALLER_KEY"
-export CALLER_API_KEY_SHA256="$(printf %s "$CALLER_API_KEY" | sha256sum | cut -d' ' -f1)"
-
-docker run -d --name aisix \
-  -v "$(pwd)/config.yaml:/etc/aisix/config.yaml:ro" \
-  -v "$(pwd)/resources.yaml:/etc/aisix/resources.yaml:ro" \
-  -e OPENAI_API_KEY -e CALLER_API_KEY_SHA256 \
-  -p 3000:3000 -p 127.0.0.1:9090:9090 \
-  ghcr.io/api7/aisix:latest        # proxy → :3000, metrics + status → :9090
-#                                  ^ the metrics/status listener is unauthenticated;
-#                                    keep it on loopback or a private network
-```
-
-Then call the gateway exactly like OpenAI:
-
-```bash
-curl http://localhost:3000/v1/chat/completions \
-  -H "Authorization: Bearer $CALLER_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"my-model","messages":[{"role":"user","content":"hello"}]}'
-```
-
-Edit `resources.yaml` and send `SIGHUP` (`docker kill -s HUP aisix`) to apply changes with
-no restart. The file is loaded exactly as etcd is: a resource that does not load is dropped
-and reported on `/status/config` while the rest serve, and a file that cannot be read at all
-keeps the last configuration serving. Check a file before booting with
-`aisix validate --resources resources.yaml`.
-
-Full walkthrough: the
-[Gateway Quickstart](https://docs.api7.ai/ai-gateway/getting-started/gateway-quickstart) ·
-every field: the [resources file reference](https://docs.api7.ai/ai-gateway/reference/resources-file)
-(still being updated for format `"2"`; each entry's fields are the resource's document, see
-[`schemas/resources/`](schemas/resources/)).
-For a multi-replica cluster, point the gateway at etcd instead — `resources_file` and
-`etcd` are mutually exclusive.
-
-## ✨ Why AISIX
+### Why AISIX
 
 - **One API, every model.** Speak the OpenAI wire format in; the gateway translates to
   whichever provider each model points at. Point an OpenAI SDK at one `base_url` and
@@ -147,7 +61,7 @@ For a multi-replica cluster, point the gateway at etcd instead — `resources_fi
   and observability ship in the box. (Budgets and spend caps are AISIX Enterprise and
   AISIX Cloud features — the gateway enforces the control plane's decisions.)
 
-## 🧩 Features — available today
+### Features — available today
 
 Covered by 364 end-to-end scenario files (2000+ cases) that run against real gateway
 processes.
@@ -197,7 +111,7 @@ processes.
   declaratively — through the `resources_file` (reloaded on SIGHUP) or direct etcd
   writes — not through the admin listener; its former write endpoints were removed.
 
-## 🔌 Supported providers
+### Supported providers
 
 AISIX dispatches through the **OpenAI adapter family** — a distinct wire-protocol bridge,
 not a generic relabel. Whatever the upstream is, the client-facing API stays OpenAI-shaped.
@@ -210,7 +124,7 @@ Plus specialized handling for vendor quirks (e.g. DeepSeek reasoning content) an
 **rerank / embeddings** vendors (Cohere, Jina). Details in
 [adapter protocol families](https://docs.api7.ai/ai-gateway/providers/adapters).
 
-## ☁️ Choose an AISIX Product
+### Choose an AISIX Product
 
 Same gateway binary, same proxy API — in every form the gateway runs in your environment.
 **AISIX Enterprise** adds a customer-hosted commercial control plane. **AISIX Cloud** adds
@@ -262,7 +176,7 @@ an API7-hosted commercial control plane.
 **[Talk to API7](https://api7.ai/contact?utm_source=github&utm_medium=readme&utm_campaign=cloud)** about
 AISIX Enterprise or AISIX Cloud, or **[book a demo](https://api7.ai/contact?utm_source=github&utm_medium=readme&utm_campaign=demo)**.
 
-## 🏗️ Architecture
+### Architecture
 
 A single Cargo workspace; the `aisix-server` crate builds one binary named `aisix` that
 wires the crates together.
@@ -283,7 +197,7 @@ crates/
 └── aisix-server         the `aisix` binary — bootstrap + CLI
 ```
 
-## 🗺️ Roadmap
+### Roadmap highlights
 
 Highlights on the [roadmap](ROADMAP.md); tracked live in
 [issues](https://github.com/api7/aisix/issues):
@@ -297,10 +211,86 @@ Shipped since this list was last written: OIDC/JWT inbound auth, Redis-backed di
 rate limiting, and the Lakera, Presidio, PII, and OpenAI Moderation guardrails — see
 **Features** above.
 
-## 🛠️ Development
+## Prerequisites
 
-Prerequisites: the Rust toolchain pinned in `rust-toolchain.toml`. Docker is only needed
-for the tests that exercise etcd, Redis, or provider emulators.
+- The Rust toolchain pinned in `rust-toolchain.toml` (rustup picks it up automatically).
+- Docker — only for the tests that exercise etcd, Redis, or provider emulators.
+
+## Quick Start
+
+| Step | Action | Command |
+|------|--------|---------|
+| 1 | Check out and build the workspace | `git clone https://github.com/api7/aisix && cd aisix && cargo build --release` |
+| 2 | Declare the config and resources files | copy `config.example.yaml` → `config.yaml`; declare `resources.yaml` (see below) |
+| 3 | Run the gateway | `docker run -d --name aisix -v "$(pwd)/config.yaml:/etc/aisix/config.yaml:ro" -v "$(pwd)/resources.yaml:/etc/aisix/resources.yaml:ro" -e OPENAI_API_KEY -e CALLER_API_KEY_SHA256 -p 3000:3000 -p 127.0.0.1:9090:9090 ghcr.io/api7/aisix:latest` |
+| 4 | Call it like OpenAI | `curl http://localhost:3000/v1/chat/completions -H "Authorization: Bearer $CALLER_API_KEY" -H "Content-Type: application/json" -d '{"model":"my-model","messages":[{"role":"user","content":"hello"}]}'` |
+
+One container. No control plane, no database, no configuration store — the gateway reads
+every dynamic resource from one declarative `resources.yaml`.
+
+```yaml
+# config.yaml
+resources_file: /etc/aisix/resources.yaml
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  enabled: false          # a declarative gateway needs no admin listener
+observability:
+  metrics:
+    prometheus:
+      enabled: true
+      addr: "0.0.0.0:9090"
+```
+
+```yaml
+# resources.yaml — every entry is an id plus the resource's document
+_format_version: "2"
+
+provider_keys:
+  - id: 0b6f3c1e-2f0a-4c5e-9d55-7d1a8b0c2e11
+    display_name: openai-main
+    provider: openai
+    api_key: ${OPENAI_API_KEY}        # interpolated from the environment
+
+models:
+  - id: 6efd592d-a73b-573d-8e2c-e9e103692f92
+    display_name: my-model
+    provider: openai
+    model_name: gpt-4o-mini
+    provider_key_id: 0b6f3c1e-2f0a-4c5e-9d55-7d1a8b0c2e11
+
+api_keys:
+  - id: 4a1c9e2b-7d3f-4b6a-8c5e-1f2a3b4c5d6e
+    display_name: local-dev
+    key_hash: ${CALLER_API_KEY_SHA256}  # sha256 hex of the caller key; the plaintext is never stored
+    allowed_model_ids: ["6efd592d-a73b-573d-8e2c-e9e103692f92"]
+```
+
+```bash
+export OPENAI_API_KEY="YOUR_PROVIDER_KEY"
+export CALLER_API_KEY="YOUR_CALLER_KEY"
+export CALLER_API_KEY_SHA256="$(printf %s "$CALLER_API_KEY" | sha256sum | cut -d' ' -f1)"
+
+# proxy → :3000, metrics + status → :9090
+#                                          ^ the metrics/status listener is unauthenticated;
+#                                            keep it on loopback or a private network
+```
+
+Edit `resources.yaml` and send `SIGHUP` (`docker kill -s HUP aisix`) to apply changes with
+no restart. The file is loaded exactly as etcd is: a resource that does not load is dropped
+and reported on `/status/config` while the rest serve, and a file that cannot be read at all
+keeps the last configuration serving. Check a file before booting with
+`aisix validate --resources resources.yaml`.
+
+Full walkthrough: the
+[Gateway Quickstart](https://docs.api7.ai/ai-gateway/getting-started/gateway-quickstart) ·
+every field: the [resources file reference](https://docs.api7.ai/ai-gateway/reference/resources-file)
+(still being updated for format `"2"`; each entry's fields are the resource's document, see
+[`schemas/resources/`](schemas/resources/)).
+For a multi-replica cluster, point the gateway at etcd instead — `resources_file` and
+`etcd` are mutually exclusive.
+
+### Development
 
 ```bash
 cargo check --workspace
@@ -319,7 +309,17 @@ cargo run -p aisix-server --bin aisix -- --config config.local.yaml
 cargo run -p aisix-server --bin aisix -- validate --resources resources.yaml
 ```
 
-## 💬 Community
+## Reference
+
+| Artifact | Purpose | Link |
+|----------|---------|------|
+| README | What the tool does, every command, install | [README.md](README.md) |
+| CONTRIBUTING | Branch, commit, and PR conventions | [CONTRIBUTING.md](CONTRIBUTING.md) |
+| ARCHITECTURE | Layer contract for every crate | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| ROADMAP | What ships next, in order | [ROADMAP.md](ROADMAP.md) |
+| PRD | What the product does and why | [PRD.md](PRD.md) |
+
+### Community
 
 - **Discord** — [discord.gg/dUmRZ7Rvf](https://discord.gg/dUmRZ7Rvf)
 - **Issues & discussions** — [github.com/api7/aisix/issues](https://github.com/api7/aisix/issues)
@@ -328,6 +328,6 @@ cargo run -p aisix-server --bin aisix -- validate --resources resources.yaml
 
 If AISIX is useful to you, a ⭐ helps other engineers find it.
 
-## 📄 License
+### License
 
 [Apache 2.0](LICENSE).
