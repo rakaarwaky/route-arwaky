@@ -4,8 +4,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aisix_core::resource::ResourceEntry;
-use aisix_core::snapshot::SnapshotHandle;
+use aisix_core::taxonomy_resource_vo::ResourceEntry;
+use aisix_core::taxonomy_snapshot_vo::SnapshotHandle;
 use aisix_core::{AisixSnapshot, ApiKey, Model, ProviderKey, ProxyConfig};
 use aisix_gateway::Hub;
 use aisix_provider_openai::OpenAiBridge;

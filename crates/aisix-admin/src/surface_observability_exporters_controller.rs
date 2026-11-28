@@ -1,0 +1,32 @@
+//! Read handlers for `/admin/v1/observability_exporters`: list and
+//! get-by-id, same shape as [`crate::surface_models_controller`].
+
+use aisix_core::taxonomy_resource_vo::ResourceEntry;
+use aisix_core::ObservabilityExporter;
+use axum::extract::{Path, State};
+use axum::Json;
+
+use crate::surface_auth_controller::AdminAuth;
+use crate::surface_api_error_view::AdminError;
+use crate::surface_admin_state_router::AdminState;
+
+pub async fn list_observability_exporters(
+    _auth: AdminAuth,
+    State(state): State<AdminState>,
+) -> Result<Json<Vec<ResourceEntry<ObservabilityExporter>>>, AdminError> {
+    let entries = state.store.list_observability_exporters().await?;
+    Ok(Json(entries))
+}
+
+pub async fn get_observability_exporter(
+    _auth: AdminAuth,
+    Path(id): Path<String>,
+    State(state): State<AdminState>,
+) -> Result<Json<ResourceEntry<ObservabilityExporter>>, AdminError> {
+    let entry = state
+        .store
+        .get_observability_exporter(&id)
+        .await?
+        .ok_or(AdminError::NotFound)?;
+    Ok(Json(entry))
+}

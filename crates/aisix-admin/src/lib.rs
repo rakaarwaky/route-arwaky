@@ -36,32 +36,32 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
-mod apikeys_handlers;
-mod auth;
-mod cache_policies_handlers;
-mod error;
-pub mod etcd_store;
-pub mod file_store;
-mod guardrails_handlers;
-mod health_handler;
-mod models_handlers;
-mod models_status_handler;
-mod observability_exporters_handlers;
-mod openapi;
-mod passthrough_routes_handlers;
-mod playground_handler;
-mod provider_keys_handlers;
-mod state;
-pub mod store;
+mod surface_apikeys_controller;
+mod surface_auth_controller;
+mod surface_cache_policies_controller;
+mod surface_api_error_view;
+pub mod surface_etcd_store;
+pub mod surface_file_store;
+mod surface_guardrails_controller;
+mod surface_health_controller;
+mod surface_models_controller;
+mod surface_models_status_controller;
+mod surface_observability_exporters_controller;
+mod surface_openapi_router;
+mod surface_passthrough_routes_controller;
+mod surface_playground_controller;
+mod surface_provider_keys_controller;
+mod surface_admin_state_router;
+pub mod surface_config_store;
 
-pub use auth::AdminAuth;
-pub use error::{AdminError, ErrorBody};
-pub use etcd_store::EtcdConfigStore;
-pub use file_store::FileManagedStore;
-pub use state::AdminState;
-pub use store::{ConfigStore, InMemoryStore, StoreError};
+pub use surface_auth_controller::AdminAuth;
+pub use surface_api_error_view::{AdminError, ErrorBody};
+pub use surface_etcd_store::EtcdConfigStore;
+pub use surface_file_store::FileManagedStore;
+pub use surface_admin_state_router::AdminState;
+pub use surface_config_store::{ConfigStore, InMemoryStore, StoreError};
 
-use aisix_core::config::PrometheusConfig;
+use aisix_core::taxonomy_config_vo::PrometheusConfig;
 use aisix_core::ConfigStatus;
 use aisix_obs::Metrics;
 use aisix_proxy::ModelRuntimeStatusTracker;
@@ -90,7 +90,7 @@ pub struct ModelsStatusState {
 }
 
 pub fn admin_openapi_json() -> &'static str {
-    openapi::merged_openapi()
+    surface_openapi_router::merged_openapi()
 }
 
 pub fn build_router(state: AdminState) -> Router {
@@ -98,94 +98,94 @@ pub fn build_router(state: AdminState) -> Router {
     // parsing surfaces at boot, not at first `/admin/openapi.json`
     // request. `merged_openapi` caches into an `OnceLock`; the
     // subsequent handler call is a free lookup.
-    let _ = openapi::merged_openapi();
+    let _ = surface_openapi_router::merged_openapi();
 
     let router = Router::new()
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
         // OpenAPI scalar UI is unauthenticated like /livez — admin
         // listener is private in production.
-        .route("/admin/openapi.json", get(openapi::openapi_json))
-        .route("/admin/openapi-scalar", get(openapi::openapi_scalar))
+        .route("/admin/openapi.json", get(surface_openapi_router::openapi_json))
+        .route("/admin/openapi-scalar", get(surface_openapi_router::openapi_scalar))
         .route(
             "/admin/v1/models",
-            get(models_handlers::list_models),
+            get(surface_models_controller::list_models),
         )
         .route(
             "/admin/v1/models/:id",
-            get(models_handlers::get_model),
+            get(surface_models_controller::get_model),
         )
         .route(
             "/admin/v1/models/status",
-            get(models_status_handler::get_models_status),
+            get(surface_models_status_controller::get_models_status),
         )
         // Caller API keys are served at the canonical `api_keys` path —
         // the resource's configuration key — and at the former `apikeys`
         // spelling. Same handlers; existing callers keep working.
         .route(
             "/admin/v1/api_keys",
-            get(apikeys_handlers::list_apikeys),
+            get(surface_apikeys_controller::list_apikeys),
         )
         .route(
             "/admin/v1/api_keys/:id",
-            get(apikeys_handlers::get_apikey),
+            get(surface_apikeys_controller::get_apikey),
         )
         .route(
             "/admin/v1/apikeys",
-            get(apikeys_handlers::list_apikeys),
+            get(surface_apikeys_controller::list_apikeys),
         )
         .route(
             "/admin/v1/apikeys/:id",
-            get(apikeys_handlers::get_apikey),
+            get(surface_apikeys_controller::get_apikey),
         )
         .route(
             "/admin/v1/provider_keys",
-            get(provider_keys_handlers::list_provider_keys),
+            get(surface_provider_keys_controller::list_provider_keys),
         )
         .route(
             "/admin/v1/provider_keys/:id",
-            get(provider_keys_handlers::get_provider_key),
+            get(surface_provider_keys_controller::get_provider_key),
         )
         .route(
             "/admin/v1/passthrough_routes",
-            get(passthrough_routes_handlers::list_passthrough_routes),
+            get(surface_passthrough_routes_controller::list_passthrough_routes),
         )
         .route(
             "/admin/v1/passthrough_routes/:id",
-            get(passthrough_routes_handlers::get_passthrough_route),
+            get(surface_passthrough_routes_controller::get_passthrough_route),
         )
         .route(
             "/admin/v1/guardrails",
-            get(guardrails_handlers::list_guardrails),
+            get(surface_guardrails_controller::list_guardrails),
         )
         .route(
             "/admin/v1/guardrails/:id",
-            get(guardrails_handlers::get_guardrail),
+            get(surface_guardrails_controller::get_guardrail),
         )
         .route(
             "/admin/v1/cache_policies",
-            get(cache_policies_handlers::list_cache_policies),
+            get(surface_cache_policies_controller::list_cache_policies),
         )
         .route(
             "/admin/v1/cache_policies/:id",
-            get(cache_policies_handlers::get_cache_policy),
+            get(surface_cache_policies_controller::get_cache_policy),
         )
         .route(
             "/admin/v1/observability_exporters",
-            get(observability_exporters_handlers::list_observability_exporters),
+            get(surface_observability_exporters_controller::list_observability_exporters),
         )
         .route(
             "/admin/v1/observability_exporters/:id",
-            get(observability_exporters_handlers::get_observability_exporter),
+            get(surface_observability_exporters_controller::get_observability_exporter),
         )
         // Health — per-model upstream health levels (0/1/2).
-        .route("/admin/v1/health", get(health_handler::get_health))
+        .route("/admin/v1/health", get(surface_health_controller::get_health))
         // Playground: forwards in-process to the proxy router (no network hop).
         // Accepts a *proxy* API key (not an admin key); auth is enforced by the
         // proxy middleware stack that runs inside the forwarded request.
         .route(
             "/playground/chat/completions",
-            post(playground_handler::playground_chat_completions),
+            post(surface_playground_controller::playground_chat_completions),
         );
 
     router.with_state(state)
@@ -279,7 +279,7 @@ struct DebugState {
 async fn heap_profile_handler(
     axum::extract::State(state): axum::extract::State<DebugState>,
 ) -> Response {
-    use aisix_obs::heap_profile::{dump_pprof, DumpError};
+    use aisix_obs::surface_heap_profile_action::{dump_pprof, DumpError};
     use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
     use axum::response::IntoResponse;
 
@@ -412,7 +412,7 @@ fn status_models_store_failure() -> Response {
 
 /// `GET /status/models` — the per-model runtime health view (cooldown /
 /// background-check state) as an operational read on the status listener.
-/// Renders through [`models_status_handler::render_models_status`], the
+/// Renders through [`surface_models_status_controller::render_models_status`], the
 /// same render (and the same store + tracker handles) behind
 /// `GET /admin/v1/models/status`, so the two responses are identical
 /// while both exist. Unauthenticated like `/status/config` — it exposes
@@ -447,7 +447,7 @@ async fn status_models_handler(
             return status_models_store_failure();
         }
     };
-    axum::Json(models_status_handler::render_models_status(
+    axum::Json(surface_models_status_controller::render_models_status(
         all_models,
         state.models_status.runtime_status_tracker.as_deref(),
     ))
@@ -467,11 +467,11 @@ fn normalized_prometheus_path(path: &str) -> String {
 }
 
 /// Takes no [`AdminState`], for the same reason the proxy listener's
-/// does not: see [`aisix_proxy::health::livez_response`].
+/// does not: see [`aisix_proxy::surface_health_controller::livez_response`].
 async fn livez(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    aisix_proxy::health::livez_response(params.contains_key("verbose"))
+    aisix_proxy::surface_health_controller::livez_response(params.contains_key("verbose"))
 }
 
 async fn readyz(
@@ -481,8 +481,8 @@ async fn readyz(
     let config_block = state
         .watch_status
         .as_ref()
-        .and_then(|ws| aisix_proxy::health::config_readiness_block(ws.snapshot().last_apply_age));
-    aisix_proxy::health::readyz_response(
+        .and_then(|ws| aisix_proxy::surface_health_controller::config_readiness_block(ws.snapshot().last_apply_age));
+    aisix_proxy::surface_health_controller::readyz_response(
         &state.livez_state,
         config_block,
         params.contains_key("verbose"),
@@ -492,7 +492,7 @@ async fn readyz(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aisix_core::snapshot::SnapshotHandle;
+    use aisix_core::taxonomy_snapshot_vo::SnapshotHandle;
     use aisix_core::{AdminConfig, AisixSnapshot};
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
@@ -782,7 +782,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_ready_is_503_before_config_and_200_after() {
-        use aisix_core::config_status::{
+        use aisix_core::taxonomy_config_status_vo::{
             AppliedSnapshot, ConfigStatus, LoadObservation, SourceKind,
         };
         let cs = ConfigStatus::new(SourceKind::Etcd);
@@ -842,7 +842,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_config_serves_the_derived_view() {
-        use aisix_core::config_status::{
+        use aisix_core::taxonomy_config_status_vo::{
             AppliedSnapshot, ConfigStatus, LoadObservation, SourceKind,
         };
         let cs = ConfigStatus::new(SourceKind::Etcd);
@@ -863,7 +863,7 @@ mod tests {
                 seen_at: chrono::Utc::now(),
                 serving_stale_since: None,
             }],
-            partially_compatible: vec![aisix_core::config_status::PartialCompatResource {
+            partially_compatible: vec![aisix_core::taxonomy_config_status_vo::PartialCompatResource {
                 resource_kind: "api_keys".into(),
                 field: "quota_profile".into(),
                 count: 2,
@@ -910,7 +910,7 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_scrape_reflects_config_status_series() {
-        use aisix_core::config_status::{
+        use aisix_core::taxonomy_config_status_vo::{
             AppliedSnapshot, ConfigStatus, LoadObservation, SourceKind,
         };
         let cs = ConfigStatus::new(SourceKind::Etcd);
@@ -959,7 +959,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_models_serves_the_admin_view_byte_for_byte() {
-        use aisix_core::resource::ResourceEntry;
+        use aisix_core::taxonomy_resource_vo::ResourceEntry;
         use aisix_core::Model;
         use aisix_proxy::ModelRuntimeStatusTracker;
         use std::time::Duration;
@@ -1066,7 +1066,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_models_store_failure_never_leaks_backend_detail() {
-        use aisix_core::resource::ResourceEntry;
+        use aisix_core::taxonomy_resource_vo::ResourceEntry;
         use aisix_core::{
             ApiKey, CachePolicy, Guardrail, Model, ObservabilityExporter, PassthroughRoute,
             ProviderKey,
@@ -1139,7 +1139,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn status_models_answers_the_fixed_500_when_the_store_hangs() {
-        use aisix_core::resource::ResourceEntry;
+        use aisix_core::taxonomy_resource_vo::ResourceEntry;
         use aisix_core::{
             ApiKey, CachePolicy, Guardrail, Model, ObservabilityExporter, PassthroughRoute,
             ProviderKey,
@@ -1380,7 +1380,7 @@ mod tests {
 
     #[tokio::test]
     async fn openapi_apikey_schema_excludes_max_budget_usd() {
-        let resp = openapi::openapi_json().await;
+        let resp = surface_openapi_router::openapi_json().await;
         let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let parsed: serde_json::Value =
             serde_json::from_slice(&bytes).expect("OPENAPI_JSON must parse");
@@ -1488,7 +1488,7 @@ mod tests {
 
     #[tokio::test]
     async fn models_status_returns_direct_and_routing_rows() {
-        use aisix_core::resource::ResourceEntry;
+        use aisix_core::taxonomy_resource_vo::ResourceEntry;
         use aisix_core::Model;
         use aisix_proxy::ModelRuntimeStatusTracker;
 

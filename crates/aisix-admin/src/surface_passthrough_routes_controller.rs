@@ -1,0 +1,35 @@
+//! Read handlers for `/admin/v1/passthrough_routes`: list and get-by-id,
+//! same shape as [`crate::surface_models_controller`]. Cross-field coupling
+//! (match dimensions, target shape, per-mode required companions) lives in
+//! the canonical schema, enforced by the loader every configuration source
+//! goes through.
+
+use aisix_core::taxonomy_resource_vo::ResourceEntry;
+use aisix_core::PassthroughRoute;
+use axum::extract::{Path, State};
+use axum::Json;
+
+use crate::surface_auth_controller::AdminAuth;
+use crate::surface_api_error_view::AdminError;
+use crate::surface_admin_state_router::AdminState;
+
+pub async fn list_passthrough_routes(
+    _auth: AdminAuth,
+    State(state): State<AdminState>,
+) -> Result<Json<Vec<ResourceEntry<PassthroughRoute>>>, AdminError> {
+    let entries = state.store.list_passthrough_routes().await?;
+    Ok(Json(entries))
+}
+
+pub async fn get_passthrough_route(
+    _auth: AdminAuth,
+    Path(id): Path<String>,
+    State(state): State<AdminState>,
+) -> Result<Json<ResourceEntry<PassthroughRoute>>, AdminError> {
+    let entry = state
+        .store
+        .get_passthrough_route(&id)
+        .await?
+        .ok_or(AdminError::NotFound)?;
+    Ok(Json(entry))
+}

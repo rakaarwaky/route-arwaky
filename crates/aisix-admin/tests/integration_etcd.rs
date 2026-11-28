@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aisix_admin::{build_router, AdminState, ConfigStore, EtcdConfigStore};
-use aisix_core::snapshot::SnapshotHandle;
+use aisix_core::taxonomy_snapshot_vo::SnapshotHandle;
 use aisix_core::{AdminConfig, AisixSnapshot};
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
@@ -450,7 +450,7 @@ async fn admin_writes_are_refused_against_real_etcd() {
 // resource table is populated. This catches:
 //
 //   - subkey constant drift between the documented key layout and the
-//     match arms in `aisix_etcd::loader::build_snapshot`
+//     match arms in `aisix_etcd::surface_config_loader_action::build_snapshot`
 //   - JSON shape drift between the canonical documents and the
 //     loader's serde parse (e.g. a field rename that misses one side)
 //   - schema validation drift — the loader re-validates on read; if a
@@ -557,7 +557,7 @@ async fn loader_picks_up_every_direct_write() {
         stats.unknown_kind, 0,
         "loader didn't recognise a kind in the documented key layout — \
          likely a subkey drift against the match arms in \
-         aisix_etcd::loader: {stats:?}"
+         aisix_etcd::surface_config_loader_action: {stats:?}"
     );
     assert_eq!(stats.accepted, 6, "expected 6 entries; got {stats:?}");
 
