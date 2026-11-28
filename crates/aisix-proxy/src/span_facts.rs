@@ -11,7 +11,7 @@
 //! attempts resolved theirs, and must not move the cell's "last target".
 
 use aisix_core::{AisixSnapshot, ApiSurface, Model, ProviderKey};
-use aisix_obs::{genai_provider_name, InternalCallPurpose, UpstreamFacts, UsageEvent};
+use aisix_obs::{genai_provider_name, UpstreamFacts, UsageEvent};
 
 /// The event's upstream, or `None` when it names none the snapshot holds:
 /// a pre-dispatch failure on a Model Group, a deleted row, a route with no
@@ -105,29 +105,14 @@ fn request_model(model: &Model, event: &UsageEvent) -> Option<String> {
 
 /// The base URL the attempt was sent to, by the same resolution the
 /// dispatch paths use. `None` where the upstream URL is not a function of
-/// the key alone (Bedrock's and Vertex's regional endpoints) or the key
-/// cannot be resolved.
+/// the key alone or the key cannot be resolved.
 fn upstream_base(
     model: &Model,
     pk: &ProviderKey,
     operation: &str,
     declares_additional_tools: bool,
 ) -> Option<String> {
-    use aisix_core::Adapter;
-    if matches!(
-        pk.adapter,
-        Some(Adapter::Bedrock) | Some(Adapter::Vertex) | Some(Adapter::AzureOpenai)
-    ) {
-        return pk
-            .api_base
-            .as_deref()
-            .map(str::trim)
-            .filter(|b| !b.is_empty())
-            .map(str::to_string);
-    }
     let native = match operation {
-        "messages" | "count_tokens" => Some(ApiSurface::Messages)
-            .filter(|s| crate::dispatch::serves_natively_with(model, Some(pk), *s)),
         "responses" => Some(ApiSurface::Responses).filter(|_| {
             crate::dispatch::responses_served_natively_with(
                 model,
@@ -211,11 +196,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            upstream_base(&model, &pk, "responses", "openai", false).as_deref(),
+            upstream_base(&model, &pk, "responses", false).as_deref(),
             Some("https://native.example/v1")
         );
         assert_eq!(
-            upstream_base(&model, &pk, "responses", "openai", true).as_deref(),
+            upstream_base(&model, &pk, "responses", true).as_deref(),
             Some("https://chat.example/v1")
         );
     }

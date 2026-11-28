@@ -241,14 +241,6 @@ pub(crate) fn realtime_session_model(path: &[PathSeg]) -> bool {
     path.len() == 2 && path[0].is_key("session") && path[1].is_key("model")
 }
 
-/// `message.model` on an Anthropic `message_start` frame.
-///
-/// The path alone identifies the frame: `message_start` is the only Anthropic
-/// event whose payload nests a `message` object, so no type check is needed.
-pub(crate) fn anthropic_message_model(path: &[PathSeg]) -> bool {
-    path.len() == 2 && path[0].is_key("message") && path[1].is_key("model")
-}
-
 /// `response.model` on a Responses-API snapshot frame.
 ///
 /// Exact-depth, so it selects the six events that carry a whole `response`
@@ -278,18 +270,17 @@ mod tests {
         restamp_body(&mut body, "ds-native");
         assert!(body.get("model").is_none());
     }
-
     #[test]
-    fn restamp_sse_frame_rewrites_message_start_and_leaves_the_rest_byte_identical() {
-        let frame = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-x-20250101\",\"usage\":{\"input_tokens\":1e2}}}\n\n";
-        let out = restamp_sse_frame(frame, "my-claude", anthropic_message_model)
-            .expect("message_start carries message.model");
+    fn restamp_sse_frame_rewrites_the_snapshot_and_leaves_the_rest_byte_identical() {
+        let frame = b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-4o-20250101\",\"usage\":{\"input_tokens\":1e2}}}\n\n";
+        let out = restamp_sse_frame(frame, "my-alias", responses_snapshot_model)
+            .expect("response.created carries response.model");
         let out = String::from_utf8(out).unwrap();
-        assert!(out.contains("\"model\":\"my-claude\""));
+        assert!(out.contains("\"model\":\"my-alias\""));
         // Everything outside the spliced value survives as written — the
         // event line, the key order, and the number spelling a
         // `serde_json` round-trip would have canonicalised to `100.0`.
-        assert!(out.starts_with("event: message_start\ndata: {\"type\":\"message_start\""));
+        assert!(out.starts_with("event: response.created\ndata: {\"type\":\"response.created\""));
         assert!(out.contains("\"input_tokens\":1e2"));
         assert!(out.ends_with("}}}\n\n"));
     }
@@ -301,17 +292,17 @@ mod tests {
     /// addressed.
     #[test]
     fn restamp_sse_frame_rewrites_a_payload_split_over_several_data_lines() {
-        let frame = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\n\
-                      data: \"model\":\"claude-x-20250101\",\"usage\":{\"input_tokens\":1e2}}}\n\n";
-        let out = restamp_sse_frame(frame, "my-claude", anthropic_message_model)
-            .expect("a multi-line message_start still carries message.model");
+        let frame = b"event: response.created\ndata: {\"type\":\"response.created\",\n\
+                      data: \"response\":{\"model\":\"gpt-4o-20250101\",\"usage\":{\"input_tokens\":1e2}}}\n\n";
+        let out = restamp_sse_frame(frame, "my-alias", responses_snapshot_model)
+            .expect("a multi-line response.created still carries response.model");
         let out = String::from_utf8(out).unwrap();
-        assert!(out.contains("\"model\":\"my-claude\""), "{out}");
-        assert!(!out.contains("claude-x-20250101"), "{out}");
+        assert!(out.contains("\"model\":\"my-alias\""), "{out}");
+        assert!(!out.contains("gpt-4o-20250101"), "{out}");
         // The framing survives: both `data:` lines stay lines, and every
         // byte the splice did not replace is as the provider wrote it.
         assert_eq!(out.matches("\ndata: ").count(), 2, "{out}");
-        assert!(out.starts_with("event: message_start\ndata: {\"type\":\"message_start\""));
+        assert!(out.starts_with("event: response.created\ndata: {\"type\":\"response.created\""));
         assert!(out.contains("\"input_tokens\":1e2"));
         assert!(out.ends_with("}}}\n\n"));
     }
@@ -320,51 +311,33 @@ mod tests {
     /// payload every other reader sees, so it restamps like any other.
     #[test]
     fn restamp_sse_frame_rewrites_a_payload_whose_first_data_line_is_empty() {
-        let frame = b"event: message_start\ndata:\n\
-                      data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-x\"}}\n\n";
-        let out = restamp_sse_frame(frame, "my-claude", anthropic_message_model)
+        let frame = b"event: response.created\ndata:\n\
+                      data: {\"type\":\"response.created\",\"response\":{\"model\":\"gpt-4o\"}}\n\n";
+        let out = restamp_sse_frame(frame, "my-alias", responses_snapshot_model)
             .expect("the empty first line is part of the payload, not a reason to skip it");
         let out = String::from_utf8(out).unwrap();
-        assert!(out.contains("\"model\":\"my-claude\""), "{out}");
+        assert!(out.contains("\"model\":\"my-alias\""), "{out}");
         assert!(
-            out.starts_with("event: message_start\ndata:\ndata: "),
+            out.starts_with("event: response.created\ndata:\ndata: "),
             "{out}"
         );
         // And the joined payload is exactly what every other consumer reads.
         assert_eq!(
             crate::redact::frame_payload(frame).as_deref(),
-            Some("\n{\"type\":\"message_start\",\"message\":{\"model\":\"claude-x\"}}"),
+            Some("\n{\"type\":\"response.created\",\"response\":{\"model\":\"gpt-4o\"}}"),
         );
-    }
-
-    /// The same frame, restamped from the buffered pass rather than the
-    /// streaming relay — a block-capable output guardrail takes that branch.
-    #[test]
-    fn restamp_sse_buffer_rewrites_a_payload_split_over_several_data_lines() {
-        let buf = b"event: response.created\ndata: {\"type\":\"response.created\",\n\
-                    data: \"response\":{\"model\":\"up-1\"}}\n\n\
-                    data: [DONE]\n\n";
-        let out = String::from_utf8(restamp_sse_buffer(
-            buf,
-            "my-alias",
-            responses_snapshot_model,
-        ))
-        .unwrap();
-        assert!(out.contains("\"model\":\"my-alias\""), "{out}");
-        assert!(!out.contains("up-1"), "{out}");
-        assert!(out.ends_with("data: [DONE]\n\n"), "{out}");
     }
 
     #[test]
     fn restamp_sse_frame_skips_frames_without_the_path() {
-        // `message_delta` has no `message` object; `content_block_delta` has
-        // no model anywhere. Both forward verbatim.
+        // An output-text delta carries no `response` object; the terminal
+        // `[DONE]` sentinel carries nothing at all. Both forward verbatim.
         for frame in [
-            &b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n"[..],
-            &b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hi\"}}\n\n"[..],
+            &b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n"[..],
+            &b"event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\",\"text\":\"hi\"}\n\n"[..],
             &b"data: [DONE]\n\n"[..],
         ] {
-            assert!(restamp_sse_frame(frame, "my-claude", anthropic_message_model).is_none());
+            assert!(restamp_sse_frame(frame, "my-alias", responses_snapshot_model).is_none());
         }
     }
 

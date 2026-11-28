@@ -149,20 +149,6 @@ pub(crate) fn any_enabled_provider(snapshot: &AisixSnapshot) -> bool {
     !snapshot.oidc_providers.is_empty() && snapshot.oidc_providers.any(|e| e.value.enabled)
 }
 
-/// True when the snapshot has at least one enabled provider that
-/// verifies against a fetched key set — the gate for the OAuth
-/// protected-resource surface, which exists to name authorization
-/// servers a client can go and get a token from. A shared-secret
-/// provider has none to name: its callers are issued their tokens out
-/// of band, so it is not advertised and cannot on its own bring the
-/// discovery surface up.
-pub(crate) fn any_enabled_jwks_provider(snapshot: &AisixSnapshot) -> bool {
-    !snapshot.oidc_providers.is_empty()
-        && snapshot
-            .oidc_providers
-            .any(|e| e.value.enabled && e.value.is_jwks_mode())
-}
-
 fn b64url_json(segment: &str) -> Option<serde_json::Value> {
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(segment)
@@ -553,45 +539,6 @@ pub(crate) fn resolve_identity(
     })
 }
 
-/// Verify an ID token the gateway itself obtained at `prov` on behalf of OAuth
-/// client `client_id`: the provider's signature and issuer, and an audience of
-/// that client rather than the provider's accepted `audiences`, which are about
-/// tokens presented to the gateway. `Err` is a denial reason.
-pub(crate) async fn verify_login_id_token(
-    prov: &OidcProvider,
-    token: &str,
-    client_id: &str,
-) -> Result<serde_json::Value, &'static str> {
-    let header = jsonwebtoken::decode_header(token).map_err(|_| "jwt_malformed")?;
-    let mut for_client = prov.clone();
-    for_client.audiences = vec![client_id.to_owned()];
-    verify_against_jwks(&for_client, token, &header)
-        .await
-        .map_err(|(reason, _)| reason)
-}
-
-/// What a session keeps of an ID token: every claim, so that a claim mapping or
-/// bound claim added after sign-in reads the same token a JWT caller would
-/// present, less those that describe the token rather than the person. `iss`
-/// stays: it is what binds the session to the identity provider that issued it.
-pub(crate) fn session_claims(claims: &serde_json::Value) -> serde_json::Value {
-    const ABOUT_THE_TOKEN: [&str; 8] = [
-        "exp",
-        "iat",
-        "nbf",
-        "auth_time",
-        "jti",
-        "nonce",
-        "at_hash",
-        "c_hash",
-    ];
-    let mut kept = claims.clone();
-    if let Some(object) = kept.as_object_mut() {
-        object.retain(|name, _| !ABOUT_THE_TOKEN.contains(&name.as_str()));
-    }
-    kept
-}
-
 /// Authenticate a JWT-shaped bearer. Called from the auth choke point
 /// once [`looks_like_jwt`] and [`any_enabled_provider`] both hold, with
 /// the snapshot the gate already loaded (avoids a second atomic load;
@@ -758,14 +705,7 @@ pub(crate) async fn authenticate_jwt(
     Ok(AuthenticatedKey::for_jwt(
         snapshot,
         entry,
-        JwtIdentity::new(
-            subject,
-            prov.name.clone(),
-            prov.issuer.clone(),
-            prov.identity_claim.clone(),
-            claim_mapping,
-            Arc::from(token),
-        ),
+        JwtIdentity::new(subject, prov.name.clone(), claim_mapping),
         prov,
         &claims,
     ))
@@ -2738,50 +2678,5 @@ jyxumGxNpoIV8LlzsMsaWQ==
         let claims =
             validate_with_keys(&token, Algorithm::RS256, &base_provider(), &candidates).unwrap();
         assert_eq!(claims["sub"], "agent-1");
-    }
-
-    #[test]
-    fn an_enabled_hmac_provider_alone_does_not_advertise_an_authorization_server() {
-        let snapshot = AisixSnapshot::new();
-        snapshot.oidc_providers.insert(ResourceEntry::new(
-            "p-hmac",
-            hmac_provider(serde_json::json!({})),
-            1,
-        ));
-        // It still activates JWT authentication …
-        assert!(any_enabled_provider(&snapshot));
-        // … but has no authorization server to publish.
-        assert!(!any_enabled_jwks_provider(&snapshot));
-
-        snapshot
-            .oidc_providers
-            .insert(ResourceEntry::new("p-jwks", base_provider(), 1));
-        assert!(any_enabled_jwks_provider(&snapshot));
-    }
-}
-
-#[cfg(test)]
-mod session_claims_tests {
-    use super::*;
-
-    #[test]
-    fn everything_about_the_person_is_kept_and_nothing_about_the_token() {
-        let claims = serde_json::json!({
-            "iss": "https://idp.example.com",
-            "sub": "alice",
-            "email": "alice@example.com",
-            "org": {"team": "x", "exp": 1},
-            "exp": 1, "iat": 1, "nbf": 1, "auth_time": 1,
-            "jti": "j", "nonce": "n", "at_hash": "a", "c_hash": "c",
-        });
-        assert_eq!(
-            session_claims(&claims),
-            serde_json::json!({
-                "iss": "https://idp.example.com",
-                "sub": "alice",
-                "email": "alice@example.com",
-                "org": {"team": "x", "exp": 1},
-            })
-        );
     }
 }

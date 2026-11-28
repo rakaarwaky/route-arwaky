@@ -23,7 +23,6 @@ use aisix_core::resource::ResourceEntry;
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AisixSnapshot, ApiKey, Model, ProxyConfig};
 use aisix_gateway::Hub;
-use aisix_provider_anthropic::AnthropicBridge;
 use aisix_provider_openai::OpenAiBridge;
 use aisix_proxy::{build_router, ProxyState};
 use axum::body::Body;
@@ -87,7 +86,6 @@ fn live() -> isize {
 const MARGIN: f64 = 0.1;
 
 const PK_ID: &str = "11111111-1111-1111-1111-111111111111";
-const ANTHROPIC_PK_ID: &str = "22222222-2222-2222-2222-222222222222";
 
 /// A mock upstream that consumes each request body chunk by chunk without
 /// keeping it, reports how many bytes it read, and — while the test holds
@@ -140,11 +138,7 @@ fn start_upstream() -> HeldUpstream {
                     let _ = held.wait_for(|holding| !*holding).await;
                 }
                 if streaming.load(Ordering::SeqCst) {
-                    let (first, last) = if path.ends_with("/messages") {
-                        (SSE_MESSAGES_START, SSE_MESSAGES_END)
-                    } else {
-                        (SSE_RESPONSES_START, SSE_RESPONSES_END)
-                    };
+                    let (first, last) = (SSE_RESPONSES_START, SSE_RESPONSES_END);
                     let stream = async_stream::stream! {
                         yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(first.as_bytes()));
                         stream_held
@@ -201,16 +195,6 @@ const SSE_RESPONSES_END: &str = concat!(
     "\"response\":{\"id\":\"resp_stream\",\"status\":\"completed\",",
     "\"output\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n",
 );
-const SSE_MESSAGES_START: &str = concat!(
-    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{",
-    "\"id\":\"msg_stream\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],",
-    "\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
-);
-const SSE_MESSAGES_END: &str = concat!(
-    "event: message_delta\ndata: {\"type\":\"message_delta\",",
-    "\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
-    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
-);
 
 const SSE_CHAT_RESPONSE: &str = concat!(
     "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",",
@@ -222,17 +206,7 @@ const SSE_CHAT_RESPONSE: &str = concat!(
 );
 
 fn upstream_response(path: &str) -> serde_json::Value {
-    if path.ends_with("/messages") {
-        serde_json::json!({
-            "id": "msg_upstream",
-            "type": "message",
-            "role": "assistant",
-            "model": "claude-sonnet-4-5",
-            "content": [{"type": "text", "text": "ok"}],
-            "stop_reason": "end_turn",
-            "usage": {"input_tokens": 2, "output_tokens": 1}
-        })
-    } else if path.ends_with("/responses") {
+    if path.ends_with("/responses") {
         serde_json::json!({
             "id": "resp_upstream",
             "object": "response",
@@ -270,13 +244,12 @@ fn upstream_response(path: &str) -> serde_json::Value {
 
 fn snapshot(api_base: &str, capture_content: bool) -> AisixSnapshot {
     let snap = AisixSnapshot::new();
-    for (pk_id, provider) in [(PK_ID, "openai"), (ANTHROPIC_PK_ID, "anthropic")] {
-        let pk: aisix_core::ProviderKey = serde_json::from_str(&format!(
-            r#"{{"display_name":"{provider}-up","api_key":"sk-upstream","api_base":"{api_base}","provider":"{provider}","adapter":"{provider}"}}"#
-        ))
-        .unwrap();
-        snap.provider_keys.insert(ResourceEntry::new(pk_id, pk, 1));
-    }
+    let (pk_id, provider) = (PK_ID, "openai");
+    let pk: aisix_core::ProviderKey = serde_json::from_str(&format!(
+        r#"{{"display_name":"{provider}-up","api_key":"sk-upstream","api_base":"{api_base}","provider":"{provider}","adapter":"{provider}"}}"#
+    ))
+    .unwrap();
+    snap.provider_keys.insert(ResourceEntry::new(pk_id, pk, 1));
     for (id, name, provider, upstream, pk_id) in [
         ("model-chat", "vision", "openai", "gpt-4o", PK_ID),
         (
@@ -285,13 +258,6 @@ fn snapshot(api_base: &str, capture_content: bool) -> AisixSnapshot {
             "openai",
             "text-embedding-3-small",
             PK_ID,
-        ),
-        (
-            "model-claude",
-            "claude",
-            "anthropic",
-            "claude-sonnet-4-5",
-            ANTHROPIC_PK_ID,
         ),
         ("model-rerank", "reranker", "openai", "rerank-v3", PK_ID),
         ("model-speech", "speaker", "openai", "tts-1", PK_ID),
@@ -304,7 +270,7 @@ fn snapshot(api_base: &str, capture_content: bool) -> AisixSnapshot {
         snap.models.insert(ResourceEntry::new(id, model, 1));
     }
     let key: ApiKey = serde_json::from_str(&format!(
-        r#"{{"key_hash":"{}","allowed_models":["vision","embedder","claude","reranker","speaker","effort","panel"]}}"#,
+        r#"{{"key_hash":"{}","allowed_models":["vision","embedder","reranker","speaker","effort","panel"]}}"#,
         ApiKey::hash_bearer("sk-caller")
     ))
     .unwrap();
@@ -339,7 +305,6 @@ fn snapshot(api_base: &str, capture_content: bool) -> AisixSnapshot {
 fn router(api_base: &str, capture_content: bool) -> Router {
     let hub = Arc::new(Hub::new());
     hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
-    hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
     let cfg = ProxyConfig {
         addr: "127.0.0.1:0".into(),
         request_body_limit_bytes: 256 * 1024 * 1024,
@@ -425,44 +390,6 @@ fn ensemble_body(size: (usize, usize)) -> String {
     chat_body_for("panel", size)
 }
 
-/// An Anthropic request addressed to the OpenAI model: translated into
-/// the gateway's chat format for the OpenAI bridge on every attempt.
-fn messages_to_openai_body(size: (usize, usize)) -> String {
-    messages_body_for("vision", size)
-}
-
-/// A Responses request addressed to the Anthropic model, which does not
-/// serve the Responses API: translated for the Anthropic bridge. That
-/// bridge does not carry images across, so the bulk here is text.
-fn responses_to_anthropic_body((parts, part_bytes): (usize, usize)) -> String {
-    let content: Vec<_> = (0..parts)
-        .map(|i| serde_json::json!({"type": "input_text", "text": base64_blob(part_bytes, i)}))
-        .collect();
-    serde_json::json!({
-        "model": "claude",
-        "max_output_tokens": 64,
-        "input": [{"role": "user", "content": content}]
-    })
-    .to_string()
-}
-
-/// An OpenAI-shape request addressed to the Anthropic model, so the
-/// Anthropic bridge translates it into an owned Anthropic request. That
-/// bridge does not carry images across, so the bulk here is text, sent as
-/// plain string messages.
-fn chat_to_anthropic_body((messages, message_bytes): (usize, usize)) -> String {
-    let messages: Vec<_> = (0..messages)
-        .map(|i| {
-            let role = if i % 2 == 0 { "user" } else { "assistant" };
-            serde_json::json!({"role": role, "content": base64_blob(message_bytes, i)})
-        })
-        .chain(std::iter::once(
-            serde_json::json!({"role": "user", "content": "Summarise the above."}),
-        ))
-        .collect();
-    serde_json::json!({"model": "claude", "max_tokens": 64, "messages": messages}).to_string()
-}
-
 fn chat_body_for(model: &str, (images, image_bytes): (usize, usize)) -> String {
     let mut content = vec![serde_json::json!({"type": "text", "text": "Describe these images."})];
     for i in 0..images {
@@ -473,26 +400,6 @@ fn chat_body_for(model: &str, (images, image_bytes): (usize, usize)) -> String {
     }
     serde_json::json!({
         "model": model,
-        "messages": [{"role": "user", "content": content}]
-    })
-    .to_string()
-}
-
-fn messages_body(size: (usize, usize)) -> String {
-    messages_body_for("claude", size)
-}
-
-fn messages_body_for(model: &str, (images, image_bytes): (usize, usize)) -> String {
-    let mut content = vec![serde_json::json!({"type": "text", "text": "Describe these images."})];
-    for i in 0..images {
-        content.push(serde_json::json!({
-            "type": "image",
-            "source": {"type": "base64", "media_type": "image/jpeg", "data": base64_blob(image_bytes, i)}
-        }));
-    }
-    serde_json::json!({
-        "model": model,
-        "max_tokens": 64,
         "messages": [{"role": "user", "content": content}]
     })
     .to_string()
@@ -727,11 +634,6 @@ async fn request_body_is_held_at_most_twice_while_upstream_is_pending() {
     let families = [
         Family::new("chat -> openai", "/v1/chat/completions", chat_body),
         Family::new(
-            "chat -> anthropic",
-            "/v1/chat/completions",
-            chat_to_anthropic_body,
-        ),
-        Family::new(
             "chat, text-block content",
             "/v1/chat/completions",
             chat_text_blocks_body,
@@ -758,26 +660,8 @@ async fn request_body_is_held_at_most_twice_while_upstream_is_pending() {
             )
         },
         Family::new("embeddings", "/v1/embeddings", embeddings_body),
-        // Relayed to an Anthropic upstream as-is: the route builds the
-        // outbound body itself rather than through a provider bridge.
-        Family::new("messages passthrough", "/v1/messages", messages_body),
-        Family::new(
-            "messages -> openai (bridged)",
-            "/v1/messages",
-            messages_to_openai_body,
-        ),
-        Family::new(
-            "count_tokens passthrough",
-            "/v1/messages/count_tokens",
-            messages_body,
-        ),
         // Served natively by the OpenAI upstream, likewise built by the route.
         Family::new("responses passthrough", "/v1/responses", responses_body),
-        Family::new(
-            "responses -> anthropic (bridged)",
-            "/v1/responses",
-            responses_to_anthropic_body,
-        ),
         Family::new("rerank", "/v1/rerank", rerank_body),
         Family::new("speech", "/v1/audio/speech", speech_body),
         // Only `model` changes on the way out, so the outbound body is
@@ -789,24 +673,6 @@ async fn request_body_is_held_at_most_twice_while_upstream_is_pending() {
         // shrunk, and LARGE's 16 equal blocks land on a doubling, so other
         // sizes may peak higher. A whole-request clone costs 1x above either
         // bound.
-        Family {
-            peak: Some(2.0 + MARGIN),
-            capture_content: false,
-            ..Family::new(
-                "messages passthrough (no content capture)",
-                "/v1/messages",
-                messages_body,
-            )
-        },
-        Family {
-            peak: Some(2.0 + MARGIN),
-            capture_content: false,
-            ..Family::new(
-                "count_tokens passthrough (no content capture)",
-                "/v1/messages/count_tokens",
-                messages_body,
-            )
-        },
         Family {
             peak: Some(2.0 + MARGIN),
             capture_content: false,
@@ -869,10 +735,11 @@ async fn request_body_is_held_at_most_twice_while_upstream_is_pending() {
         );
         report.push((family, m, peak));
     }
-    let streaming_families = [
-        Family::new("responses stream", "/v1/responses", responses_body),
-        Family::new("messages stream", "/v1/messages", messages_body),
-    ];
+    let streaming_families = [Family::new(
+        "responses stream",
+        "/v1/responses",
+        responses_body,
+    )];
     let mut stream_failures = Vec::new();
     for family in &streaming_families {
         // Prompt capture retains its own full string; these cases isolate

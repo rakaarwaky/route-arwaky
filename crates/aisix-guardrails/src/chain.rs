@@ -2994,7 +2994,7 @@ mod tests {
             ],
             vec![
                 AppliedGuardrail {
-                    kind: "bedrock".to_owned(),
+                    kind: "custom".to_owned(),
                     hook: "both".to_owned(),
                 },
                 applied_kw(),
@@ -3022,7 +3022,7 @@ mod tests {
             sink.take(),
             vec![Recorded {
                 guardrail: "seg-masker".to_owned(),
-                kind: "bedrock".to_owned(),
+                kind: "custom".to_owned(),
                 phase: "input",
                 result: "masked",
                 error_type: None,

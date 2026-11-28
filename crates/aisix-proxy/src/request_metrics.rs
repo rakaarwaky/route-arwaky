@@ -153,11 +153,6 @@ pub(crate) struct Owned {
 }
 
 impl Owned {
-    /// The owning form of [`Caller::new`].
-    pub(crate) fn from_auth(auth: &AuthenticatedKey) -> Self {
-        Self::from_caller(Caller::new(auth))
-    }
-
     pub(crate) fn from_caller(c: Caller<'_>) -> Self {
         let known = |v: &str| (v != UNKNOWN).then(|| v.to_owned());
         Self {

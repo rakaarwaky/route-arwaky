@@ -2,20 +2,17 @@
 //! [`Bridge`] based on the target [`ProviderKey`]'s vendor identity and
 //! wire-shape adapter. There is no per-`Provider`-enum lookup — vendor
 //! identity is an open string (`ProviderKey.provider`) and routing
-//! falls through a closed 5-value `Adapter` family enum.
+//! falls through a closed `Adapter` family enum.
 //!
 //! Hubs are constructed once at startup (spec §1 step 7 — before the
 //! proxy router is built) and hold:
 //!
 //! - `specialized_bridges` — keyed on `ProviderKey.provider` (vendor
-//!   string, e.g. `"deepseek"`, `"cohere"`). Used when a specific
-//!   vendor needs handling that diverges from its wire-shape default
-//!   (e.g. DeepSeek's `reasoning_content` lift, Cohere's chat-compat
-//!   namespace).
-//! - `family_bridges` — keyed on [`Adapter`] (wire shape: `openai`,
-//!   `anthropic`, `bedrock`, `vertex`, `azure-openai`). The default
-//!   bridge for any vendor whose `ProviderKey.adapter` matches that
-//!   wire shape and has no specialized override.
+//!   string). Used when a specific vendor needs handling that diverges
+//!   from its wire-shape default.
+//! - `family_bridges` — keyed on [`Adapter`] (wire shape: `openai`). The
+//!   default bridge for any vendor whose `ProviderKey.adapter` matches
+//!   that wire shape and has no specialized override.
 //!
 //! [`Hub::dispatch_two_tier`] looks up specialized first, then falls
 //! back to the family bridge. A new catalog vendor admitted by cp-api
@@ -56,10 +53,9 @@ pub const UPSTREAM_PROTOCOL_UNKNOWN: &str = "unknown";
 /// per request (`usage_attr::ResolvedPk`) and has no Hub in hand.
 pub fn upstream_protocol(pk: &ProviderKey) -> &'static str {
     match pk.provider.as_str() {
-        // The two vendors `build_hub()` registers a specialized bridge
-        // for. Both speak their own name on the wire.
+        // The vendor `build_hub()` registers a specialized bridge for;
+        // it speaks its own name on the wire.
         "openai" => Adapter::Openai.wire_protocol(),
-        "anthropic" => Adapter::Anthropic.wire_protocol(),
         _ => pk
             .adapter
             .map(Adapter::wire_protocol)
@@ -75,7 +71,7 @@ pub fn upstream_protocol(pk: &ProviderKey) -> &'static str {
 #[derive(Default)]
 pub struct Hub {
     /// Wire-shape default bridges. Keyed on [`Adapter`] — the closed
-    /// 5-value protocol family enum. Every catalog vendor whose
+    /// protocol family enum. Every catalog vendor whose
     /// `ProviderKey.adapter` matches one of these resolves here if
     /// no specialized override is registered.
     family_bridges: DashMap<Adapter, Arc<dyn Bridge>>,
@@ -368,7 +364,6 @@ mod tests {
             hub.get_specialized("deepseek").unwrap().name(),
             "specialized"
         );
-        assert!(hub.family_bridge_for(Adapter::Anthropic).is_none());
         assert!(hub.get_specialized("openai").is_none());
     }
 }

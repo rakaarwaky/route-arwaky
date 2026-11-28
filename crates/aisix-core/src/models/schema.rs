@@ -1077,8 +1077,14 @@ fn split_semantic_modes(node: &mut serde_json::Map<String, Value>) {
         "allOf": [embedder_clause],
         "required": ["match"],
         "properties": {
-            "match": {"type": "object"},
-            "routes": {"items": {"required": ["examples"]}}
+            "match": {
+                "type": "object",
+                "description": "Matching parameters shared across the routes: similarity metric, per-example aggregation, and the default similarity threshold. Required.",
+            },
+            "routes": {
+                "items": {"required": ["examples"]},
+                "description": "Routes evaluated for each request. At least one is required, and every route names its example utterances.",
+            }
         }
     });
     match node.get_mut("allOf").and_then(Value::as_array_mut) {
@@ -1705,39 +1711,6 @@ fn set_property_description(
         .and_then(Value::as_object_mut)
     {
         prop.entry("description".to_string())
-            .or_insert_with(|| Value::String(description.to_string()));
-    }
-}
-
-/// Like [`set_property_enum`] but for the `items` of an array property.
-fn set_property_items_enum(
-    branch: &mut serde_json::Map<String, Value>,
-    field: &str,
-    values: Value,
-) {
-    if let Some(items) = branch
-        .get_mut("properties")
-        .and_then(|p| p.get_mut(field))
-        .and_then(|f| f.get_mut("items"))
-        .and_then(Value::as_object_mut)
-    {
-        items.insert("enum".to_string(), values);
-    }
-}
-
-fn set_property_items_description(
-    branch: &mut serde_json::Map<String, Value>,
-    field: &str,
-    description: &str,
-) {
-    if let Some(items) = branch
-        .get_mut("properties")
-        .and_then(|p| p.get_mut(field))
-        .and_then(|f| f.get_mut("items"))
-        .and_then(Value::as_object_mut)
-    {
-        items
-            .entry("description".to_string())
             .or_insert_with(|| Value::String(description.to_string()));
     }
 }
@@ -2612,6 +2585,14 @@ mod tests {
     /// The embedding contract holds on the READ path too: `match`, the
     /// embedding model and each route's `examples` are required by the
     /// schema rather than by the type.
+    fn assert_rejected_on_both(v: &Value, why: &str) {
+        assert!(validate_model(v).is_err(), "strict accepted {why}: {v}");
+        assert!(
+            validate_model_lenient(v).is_err(),
+            "lenient accepted {why}: {v}"
+        );
+    }
+
     #[test]
     fn model_semantic_embedding_requirements_hold_on_both_sets() {
         let base = || {

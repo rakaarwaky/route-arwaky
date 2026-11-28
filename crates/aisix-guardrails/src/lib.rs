@@ -33,6 +33,11 @@ mod pii;
 #[cfg(feature = "presidio")]
 mod presidio;
 mod semantic;
+#[cfg(any(
+    feature = "lakera",
+    feature = "openai-moderation",
+    feature = "presidio",
+))]
 mod too_large;
 
 use aisix_core::models::GuardrailMonitorHit;
@@ -42,6 +47,11 @@ use async_trait::async_trait;
 /// Max bytes of an upstream guardrail-provider error body to echo into a log
 /// line. Mirrors nginx's single-error-line cap (`NGX_MAX_ERROR_STR` = 2048) so
 /// a verbose HTML error page or stack trace can't blow up the log.
+#[cfg(any(
+    feature = "lakera",
+    feature = "openai-moderation",
+    feature = "presidio",
+))]
 pub(crate) const MAX_ERROR_BODY_LOG_BYTES: usize = 2048;
 
 /// Truncate a guardrail-provider error body for logging: at most
@@ -49,6 +59,11 @@ pub(crate) const MAX_ERROR_BODY_LOG_BYTES: usize = 2048;
 /// multi-byte character is never split. Returned verbatim otherwise — the
 /// whole point is to surface the provider's actual reason (e.g. Aliyun's
 /// `InvalidAccessKeyId.NotFound`) that a bare status code hides.
+#[cfg(any(
+    feature = "lakera",
+    feature = "openai-moderation",
+    feature = "presidio",
+))]
 pub(crate) fn truncate_error_body_for_log(body: &str) -> &str {
     if body.len() <= MAX_ERROR_BODY_LOG_BYTES {
         return body;
@@ -1305,6 +1320,11 @@ mod tests {
     }
     use std::collections::BTreeSet;
 
+    #[cfg(any(
+        feature = "lakera",
+        feature = "openai-moderation",
+        feature = "presidio",
+    ))]
     #[test]
     fn truncate_error_body_short_passes_through() {
         assert_eq!(truncate_error_body_for_log("boom"), "boom");
@@ -1313,6 +1333,11 @@ mod tests {
         assert_eq!(truncate_error_body_for_log(&at_cap), at_cap);
     }
 
+    #[cfg(any(
+        feature = "lakera",
+        feature = "openai-moderation",
+        feature = "presidio",
+    ))]
     #[test]
     fn truncate_error_body_caps_length() {
         let big = "a".repeat(MAX_ERROR_BODY_LOG_BYTES + 500);
@@ -1320,6 +1345,11 @@ mod tests {
         assert_eq!(out.len(), MAX_ERROR_BODY_LOG_BYTES);
     }
 
+    #[cfg(any(
+        feature = "lakera",
+        feature = "openai-moderation",
+        feature = "presidio",
+    ))]
     #[test]
     fn truncate_error_body_never_splits_a_char() {
         // '€' is 3 bytes; place a run of them so the byte cap lands mid-char.

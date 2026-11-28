@@ -1951,52 +1951,82 @@ mod tests {
         // The `.expect(1)` on both mocks asserts exactly two upstream calls.
     }
 
+    /// A bridge that speaks chat only: `/v1/embeddings` falls through to
+    /// the trait default's `UnsupportedCapability(Embeddings)` — the 501
+    /// path, without needing a removed provider adapter.
+    struct EmbedLessBridge;
+
+    #[async_trait::async_trait]
+    impl aisix_gateway::Bridge for EmbedLessBridge {
+        fn name(&self) -> &'static str {
+            "embed-less"
+        }
+        async fn chat(
+            &self,
+            _req: &aisix_gateway::ChatFormat,
+            _ctx: &aisix_gateway::BridgeContext,
+        ) -> Result<aisix_gateway::ChatResponse, aisix_gateway::BridgeError> {
+            unreachable!("not exercised")
+        }
+        async fn chat_stream(
+            &self,
+            _req: &aisix_gateway::ChatFormat,
+            _ctx: &aisix_gateway::BridgeContext,
+        ) -> Result<aisix_gateway::ChatChunkStream, aisix_gateway::BridgeError> {
+            unreachable!("not exercised")
+        }
+    }
+
+    fn unsupported_capability_snapshot() -> AisixSnapshot {
+        let pk: aisix_core::ProviderKey = serde_json::from_str(
+            r#"{"display_name":"chat-only-up","api_key":"sk-x-test","provider":"chat-only"}"#,
+        )
+        .unwrap();
+        let model: Model = serde_json::from_str(
+            r#"{"display_name":"chat-only-embed","provider":"chat-only","model_name":"x-1","provider_key_id":"22222222-2222-2222-2222-222222222222"}"#,
+        )
+        .unwrap();
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(ResourceEntry::new(
+            "22222222-2222-2222-2222-222222222222",
+            pk,
+            1,
+        ));
+        snap.models
+            .insert(ResourceEntry::new("m-chat-only", model, 1));
+        snap
+    }
+
     /// A 501 emits a zero-token event, and one reached after a mask carries
     /// that attribution (#1083).
-    /// Triggers the path by routing /v1/embeddings at an Anthropic-backed
-    /// model; `AnthropicBridge` doesn't override `Bridge::embed()` so the
-    /// trait default returns `BridgeError::Config(...)` → 501.
+    /// Triggers the path by routing /v1/embeddings at a chat-only bridge:
+    /// it doesn't override `Bridge::embed()`, so the trait default returns
+    /// `BridgeError::Config(...)` → 501.
     #[tokio::test]
     async fn provider_lacking_embed_emits_a_zero_token_event() {
         use aisix_obs::UsageSink;
-        use aisix_provider_anthropic::AnthropicBridge;
 
-        const ANTHROPIC_PK_ID: &str = "22222222-2222-2222-2222-222222222222";
-
-        let anthropic_pk_json = r#"{"display_name":"anthropic-up","api_key":"sk-ant-test","provider":"anthropic","adapter":"anthropic"}"#;
-        let anthropic_pk: aisix_core::ProviderKey =
-            serde_json::from_str(anthropic_pk_json).unwrap();
-        let anthropic_pk_entry = ResourceEntry::new(ANTHROPIC_PK_ID, anthropic_pk, 1);
-
-        let anthropic_model_json = format!(
-            r#"{{"display_name":"claude-embed","provider":"anthropic","model_name":"claude-3-haiku-20240307","provider_key_id":"{ANTHROPIC_PK_ID}"}}"#
-        );
-        let anthropic_model: Model = serde_json::from_str(&anthropic_model_json).unwrap();
-        let anthropic_model_entry = ResourceEntry::new("m-anthropic", anthropic_model, 1);
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys.insert(anthropic_pk_entry);
-        snap.models.insert(anthropic_model_entry);
+        let snap = unsupported_capability_snapshot();
         snap.apikeys.insert(apikey_entry(&["*"]));
         crate::seed_env_scoped_guardrail(&snap, masking_input_guardrail());
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
-        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        hub.register_specialized("chat-only", Arc::new(EmbedLessBridge));
         let handle = SnapshotHandle::new(snap);
         let state = crate::ProxyState::new(handle, hub, &cfg())
             .without_cache()
             .with_usage_sink(UsageSink::new(tx));
         let app = crate::build_router(state);
 
-        let body = serde_json::json!({"model": "claude-embed", "input": "hello"});
+        let body = serde_json::json!({"model": "chat-only-embed", "input": "hello"});
         let resp = tower::ServiceExt::oneshot(app.clone(), make_req(body))
             .await
             .unwrap();
         assert_eq!(
             resp.status(),
             StatusCode::NOT_IMPLEMENTED,
-            "Anthropic-backed /v1/embeddings must surface as 501 \
+            "chat-only /v1/embeddings must surface as 501 \
              (default Bridge::embed returns BridgeError::Config)",
         );
 
@@ -2011,7 +2041,7 @@ mod tests {
         assert!(ev.guardrail_enforced_hits.is_empty(), "{ev:?}");
 
         let body = serde_json::json!({
-            "model": "claude-embed",
+            "model": "chat-only-embed",
             "input": "build version: 9.9.9"
         });
         let resp = tower::ServiceExt::oneshot(app, make_req(body))

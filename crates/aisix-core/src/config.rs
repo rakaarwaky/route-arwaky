@@ -2911,7 +2911,13 @@ admin:
             return;
         }
 
-        let f = write_yaml(ENV_TEST_CONFIG);
+        // `etcd.endpoints` from ENV_TEST_CONFIG would collide with the
+        // overridden resources_file (the two sources are mutually
+        // exclusive), so this test's file selects the file source itself
+        // and the env var must displace it.
+        let f = write_yaml(
+            "resources_file: \"/etc/aisix/resources.yaml\"\nproxy:\n  addr: \"0.0.0.0:3000\"\nadmin:\n  addr: \"127.0.0.1:3001\"\n  admin_keys: [\"k1\"]\n",
+        );
         let cfg = Config::load_from_path(Some(f.path())).unwrap();
         assert_eq!(
             cfg.resources_file.as_deref(),

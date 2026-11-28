@@ -1841,17 +1841,24 @@ mod tests {
         assert_eq!(pk.labels().id, PK_ID);
         assert_eq!(pk.labels().protocol, "openai");
 
-        // A key whose vendor has no specialized bridge takes its
-        // adapter's wire value.
-        let json = r#"{"display_name":"byo-anthropic","api_key":"sk","provider":"byo","adapter":"anthropic"}"#;
+        // The only adapter left is `openai`, so a byo key without one
+        // has neither a specialized bridge nor an adapter wire value to
+        // read the protocol off.
+        let json = r#"{"display_name":"byo","api_key":"sk","provider":"byo"}"#;
         let byo: ProviderKey = serde_json::from_str(json).unwrap();
         let snap = AisixSnapshot::new();
         snap.provider_keys.insert(ResourceEntry::new(PK_ID, byo, 1));
         assert_eq!(
             ResolvedPk::resolve(&snap, PK_ID).labels().protocol,
-            "anthropic",
+            "unknown",
             "an open vendor string cannot stand in for the adapter"
         );
+
+        // And a removed adapter name is rejected outright.
+        assert!(serde_json::from_str::<ProviderKey>(
+            r#"{"display_name":"byo-anthropic","api_key":"sk","provider":"byo","adapter":"anthropic"}"#
+        )
+        .is_err());
     }
 
     /// …and the usage-event counter's label set is built off that same
@@ -2213,10 +2220,10 @@ mod tests {
                 }
             }
         }
-        // The crate's real count is twenty; a floor keeps the scan from
+        // The crate's real count is seventeen; a floor keeps the scan from
         // passing vacuously if it stops matching.
         assert!(
-            stamped >= 20,
+            stamped >= 17,
             "the occurred_at scan found only {stamped} stamps"
         );
         assert!(

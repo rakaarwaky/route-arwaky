@@ -210,85 +210,6 @@ pub struct SchemaLimits {
     pub inline_internal_refs: bool,
 }
 
-/// What Anthropic's structured outputs accept, per the "JSON Schema
-/// limitations" section of their structured-outputs guide. Bedrock
-/// documents the same subset for both its Converse `outputConfig` and
-/// the Anthropic Messages `/invoke` body, so both edges use this.
-///
-/// Internal `$ref` / `$defs` / `definitions` are supported by both and
-/// are left in place. Recursive schemas and external `$ref`s are not,
-/// and nothing this can do would make them legal, so they are left for
-/// the upstream to reject.
-pub const ANTHROPIC_SCHEMA_LIMITS: SchemaLimits = SchemaLimits {
-    noted_constraints: &[
-        "minimum",
-        "maximum",
-        "exclusiveMinimum",
-        "exclusiveMaximum",
-        "multipleOf",
-        "minLength",
-        "maxLength",
-        "maxItems",
-        "uniqueItems",
-    ],
-    dropped_keywords: &[],
-    allowed_min_items: Some(&[0, 1]),
-    relax_one_of: true,
-    inline_internal_refs: false,
-};
-
-/// What Gemini's older `responseSchema` dialect accepts. It is an
-/// OpenAPI 3.0 `Schema` object, not JSON Schema: unknown members are
-/// rejected by name, there is no `$ref`, and the applicator keywords
-/// have no equivalent. Numeric and string bounds *are* part of that
-/// dialect, so unlike Anthropic they survive.
-pub const GEMINI_OPENAPI_SCHEMA_LIMITS: SchemaLimits = SchemaLimits {
-    noted_constraints: &[
-        "exclusiveMinimum",
-        "exclusiveMaximum",
-        "multipleOf",
-        "uniqueItems",
-    ],
-    // Everything the `Schema` type has no member for, taken from
-    // Google's own discovery document rather than from prose:
-    // `GET https://generativelanguage.googleapis.com/$discovery/rest?version=v1beta`,
-    // whose `schemas.Schema.properties` is exactly `anyOf`, `default`,
-    // `description`, `enum`, `example`, `format`, `items`, `maxItems`,
-    // `maxLength`, `maxProperties`, `maximum`, `minItems`, `minLength`,
-    // `minProperties`, `minimum`, `nullable`, `pattern`, `properties`,
-    // `propertyOrdering`, `required`, `title`, `type`. Anything else is
-    // rejected by name, so it cannot simply ride along.
-    dropped_keywords: &[
-        "additionalProperties",
-        "allOf",
-        "not",
-        "if",
-        "then",
-        "else",
-        "const",
-        "contains",
-        "patternProperties",
-        "prefixItems",
-        "propertyNames",
-        "dependentSchemas",
-        "dependentRequired",
-        "unevaluatedProperties",
-        "unevaluatedItems",
-        "readOnly",
-        "writeOnly",
-        "deprecated",
-        "contentEncoding",
-        "contentMediaType",
-        "$schema",
-        "$id",
-        "$comment",
-        "$anchor",
-    ],
-    allowed_min_items: None,
-    relax_one_of: true,
-    inline_internal_refs: true,
-};
-
 /// Narrow `schema` to what `limits` says the provider accepts.
 pub fn apply_schema_limits(schema: &mut serde_json::Value, limits: &SchemaLimits) {
     if limits.inline_internal_refs {
@@ -671,6 +592,65 @@ pub fn response_into_fake_stream_chunks(resp: ChatResponse) -> Vec<ChatChunk> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Test fixtures for the walker behaviors below: one limit set that
+    /// keeps internal `$ref` in place and one that inlines them, with the
+    /// constraint/noting shape both exercise.
+    const KEEP_REFS_LIMITS: SchemaLimits = SchemaLimits {
+        noted_constraints: &[
+            "minimum",
+            "maximum",
+            "exclusiveMinimum",
+            "exclusiveMaximum",
+            "multipleOf",
+            "minLength",
+            "maxLength",
+            "maxItems",
+            "uniqueItems",
+        ],
+        dropped_keywords: &[],
+        allowed_min_items: Some(&[0, 1]),
+        relax_one_of: true,
+        inline_internal_refs: false,
+    };
+    const INLINE_REFS_LIMITS: SchemaLimits = SchemaLimits {
+        noted_constraints: &[
+            "exclusiveMinimum",
+            "exclusiveMaximum",
+            "multipleOf",
+            "uniqueItems",
+        ],
+        dropped_keywords: &[
+            "additionalProperties",
+            "allOf",
+            "not",
+            "if",
+            "then",
+            "else",
+            "const",
+            "contains",
+            "patternProperties",
+            "prefixItems",
+            "propertyNames",
+            "dependentSchemas",
+            "dependentRequired",
+            "unevaluatedProperties",
+            "unevaluatedItems",
+            "readOnly",
+            "writeOnly",
+            "deprecated",
+            "contentEncoding",
+            "contentMediaType",
+            "$schema",
+            "$id",
+            "$comment",
+            "$anchor",
+        ],
+        allowed_min_items: None,
+        relax_one_of: true,
+        inline_internal_refs: true,
+    };
+
     use super::*;
 
     fn person_schema() -> serde_json::Value {
@@ -759,86 +739,13 @@ mod tests {
     // ── provider schema subsets ───────────────────────────────────
 
     #[test]
-    fn anthropic_limits_strip_every_unsupported_constraint_and_say_so() {
-        let mut schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "age": {
-                    "type": "integer",
-                    "description": "the age",
-                    "minimum": 1,
-                    "maximum": 120,
-                    "exclusiveMinimum": 0,
-                    "exclusiveMaximum": 121,
-                    "multipleOf": 1,
-                },
-                "name": {"type": "string", "minLength": 2, "maxLength": 20},
-                "tags": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "minItems": 3,
-                    "maxItems": 9,
-                    "uniqueItems": true,
-                },
-            },
-        });
-        apply_schema_limits(&mut schema, &ANTHROPIC_SCHEMA_LIMITS);
-
-        let age = &schema["properties"]["age"];
-        for keyword in [
-            "minimum",
-            "maximum",
-            "exclusiveMinimum",
-            "exclusiveMaximum",
-            "multipleOf",
-        ] {
-            assert!(age.get(keyword).is_none(), "{keyword} must be stripped");
-        }
-        // An existing description keeps its own text and gains the note.
-        assert_eq!(
-            age["description"],
-            concat!(
-                "the age (minimum: 1, maximum: 120, exclusiveMinimum: 0, ",
-                "exclusiveMaximum: 121, multipleOf: 1)"
-            )
-        );
-
-        let name = &schema["properties"]["name"];
-        assert!(name.get("minLength").is_none());
-        assert!(name.get("maxLength").is_none());
-        // No description to begin with: the note becomes one.
-        assert_eq!(name["description"], "minLength: 2, maxLength: 20");
-
-        let tags = &schema["properties"]["tags"];
-        assert!(tags.get("maxItems").is_none());
-        assert!(tags.get("uniqueItems").is_none());
-        // `minItems` is supported only at 0 and 1, so 3 goes too.
-        assert!(tags.get("minItems").is_none());
-        assert_eq!(
-            tags["description"],
-            "maxItems: 9, uniqueItems: true, minItems: 3"
-        );
-    }
-
-    #[test]
-    fn anthropic_limits_keep_the_min_items_values_the_provider_takes() {
-        for kept in [0, 1] {
-            let mut schema =
-                serde_json::json!({"type": "array", "items": {"type": "string"}, "minItems": kept});
-            apply_schema_limits(&mut schema, &ANTHROPIC_SCHEMA_LIMITS);
-            assert_eq!(schema["minItems"], kept, "minItems {kept} is supported");
-            assert!(schema.get("description").is_none());
-        }
-    }
-
-    #[test]
     fn one_of_is_relaxed_to_any_of_rather_than_dropped() {
         // Neither provider documents `oneOf`; dropping it would take the
         // alternatives with it, so the branches move to `anyOf`.
         let mut schema = serde_json::json!({
             "oneOf": [{"type": "string"}, {"type": "integer"}],
         });
-        apply_schema_limits(&mut schema, &ANTHROPIC_SCHEMA_LIMITS);
+        apply_schema_limits(&mut schema, &KEEP_REFS_LIMITS);
         assert!(schema.get("oneOf").is_none());
         assert_eq!(
             schema["anyOf"],
@@ -855,7 +762,7 @@ mod tests {
             "properties": {"pet": {"$ref": "#/$defs/Pet"}},
             "$defs": {"Pet": {"type": "object", "properties": {"kind": {"type": "string"}}}},
         });
-        apply_schema_limits(&mut schema, &ANTHROPIC_SCHEMA_LIMITS);
+        apply_schema_limits(&mut schema, &KEEP_REFS_LIMITS);
         assert_eq!(schema["properties"]["pet"]["$ref"], "#/$defs/Pet");
         assert!(schema["$defs"]["Pet"].is_object());
     }
@@ -871,7 +778,7 @@ mod tests {
             "$defs": {"Pet": {"type": "object", "properties": {"kind": {"type": "string"}}}},
             "definitions": {"Pet": {"type": "string"}},
         });
-        apply_schema_limits(&mut schema, &GEMINI_OPENAPI_SCHEMA_LIMITS);
+        apply_schema_limits(&mut schema, &INLINE_REFS_LIMITS);
         assert_eq!(schema["properties"]["pet"]["type"], "object");
         assert_eq!(
             schema["properties"]["pet"]["properties"]["kind"]["type"],
@@ -891,7 +798,7 @@ mod tests {
             "properties": {"remote": {"$ref": "https://example.com/Pet.json"}},
             "$defs": {"Pet": {"type": "string"}},
         });
-        apply_schema_limits(&mut schema, &GEMINI_OPENAPI_SCHEMA_LIMITS);
+        apply_schema_limits(&mut schema, &INLINE_REFS_LIMITS);
         assert_eq!(
             schema["properties"]["remote"]["$ref"],
             "https://example.com/Pet.json"
@@ -906,49 +813,11 @@ mod tests {
                 },
             },
         });
-        apply_schema_limits(&mut recursive, &GEMINI_OPENAPI_SCHEMA_LIMITS);
+        apply_schema_limits(&mut recursive, &INLINE_REFS_LIMITS);
         // Expansion stops at the depth cap rather than looping; the
         // innermost `$ref` survives and Vertex rejects it.
         let json = recursive.to_string();
         assert!(json.contains("#/$defs/Node"), "{json}");
-    }
-
-    #[test]
-    fn gemini_limits_drop_the_applicators_the_dialect_has_no_member_for() {
-        let mut schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "a": {"type": "string", "const": "x", "multipleOf": 2, "uniqueItems": true},
-            },
-            "allOf": [{"type": "object"}],
-            "not": {"type": "null"},
-            "if": {"type": "object"},
-            "then": {"type": "object"},
-            "else": {"type": "object"},
-            "patternProperties": {"^a": {"type": "string"}},
-            "prefixItems": [{"type": "string"}],
-        });
-        apply_schema_limits(&mut schema, &GEMINI_OPENAPI_SCHEMA_LIMITS);
-        for dropped in [
-            "allOf",
-            "not",
-            "if",
-            "then",
-            "else",
-            "patternProperties",
-            "prefixItems",
-        ] {
-            assert!(schema.get(dropped).is_none(), "{dropped} must be dropped");
-        }
-        let a = &schema["properties"]["a"];
-        assert!(a.get("const").is_none());
-        assert!(a.get("multipleOf").is_none());
-        assert_eq!(a["description"], "multipleOf: 2, uniqueItems: true");
-        // Bounds ARE part of the OpenAPI dialect, so they survive.
-        let mut bounded = serde_json::json!({"type": "integer", "minimum": 1, "maximum": 9});
-        apply_schema_limits(&mut bounded, &GEMINI_OPENAPI_SCHEMA_LIMITS);
-        assert_eq!(bounded["minimum"], 1);
-        assert_eq!(bounded["maximum"], 9);
     }
 
     #[test]
@@ -971,8 +840,8 @@ mod tests {
             },
         });
         for (label, limits) in [
-            ("anthropic", &ANTHROPIC_SCHEMA_LIMITS),
-            ("gemini", &GEMINI_OPENAPI_SCHEMA_LIMITS),
+            ("keep-refs", &KEEP_REFS_LIMITS),
+            ("inline-refs", &INLINE_REFS_LIMITS),
         ] {
             let mut schema = document.clone();
             apply_schema_limits(&mut schema, limits);
@@ -1006,7 +875,7 @@ mod tests {
         assert_eq!(sealed["items"][0]["additionalProperties"], false);
 
         let mut narrowed = document.clone();
-        apply_schema_limits(&mut narrowed, &ANTHROPIC_SCHEMA_LIMITS);
+        apply_schema_limits(&mut narrowed, &KEEP_REFS_LIMITS);
         assert!(narrowed["items"][0]["properties"]["a"]
             .get("maxLength")
             .is_none());
@@ -1040,7 +909,7 @@ mod tests {
 
         let mut narrowed = schema.clone();
         let started = std::time::Instant::now();
-        apply_schema_limits(&mut narrowed, &GEMINI_OPENAPI_SCHEMA_LIMITS);
+        apply_schema_limits(&mut narrowed, &INLINE_REFS_LIMITS);
         let elapsed = started.elapsed();
 
         assert!(
@@ -1074,7 +943,7 @@ mod tests {
                 "Leaf": {"type": "string"},
             },
         });
-        apply_schema_limits(&mut schema, &GEMINI_OPENAPI_SCHEMA_LIMITS);
+        apply_schema_limits(&mut schema, &INLINE_REFS_LIMITS);
         assert!(schema.get("$defs").is_none());
         assert_eq!(
             schema["properties"]["a"]["properties"]["leaf"]["type"],
@@ -1172,7 +1041,7 @@ mod tests {
 
             let mut schema = serde_json::json!({});
             schema[key] = value;
-            apply_schema_limits(&mut schema, &ANTHROPIC_SCHEMA_LIMITS);
+            apply_schema_limits(&mut schema, &KEEP_REFS_LIMITS);
 
             let leaf = schema
                 .pointer(&format!("{pointer}/properties/n"))
@@ -1204,7 +1073,7 @@ mod tests {
         });
 
         let mut narrowed = schema.clone();
-        apply_schema_limits(&mut narrowed, &GEMINI_OPENAPI_SCHEMA_LIMITS);
+        apply_schema_limits(&mut narrowed, &INLINE_REFS_LIMITS);
 
         // Sent exactly as the caller wrote it, references intact; the
         // provider says why it cannot take them.
@@ -1230,7 +1099,7 @@ mod tests {
             "$defs": {"Doc": {"type": "string", "description": text}},
         });
         let mut narrowed = schema;
-        apply_schema_limits(&mut narrowed, &GEMINI_OPENAPI_SCHEMA_LIMITS);
+        apply_schema_limits(&mut narrowed, &INLINE_REFS_LIMITS);
         assert!(narrowed.get("$defs").is_none());
         assert_eq!(narrowed["properties"]["a"]["type"], "string");
         assert_eq!(narrowed["properties"]["b"]["type"], "string");

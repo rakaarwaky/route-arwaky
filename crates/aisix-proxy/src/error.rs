@@ -347,11 +347,8 @@ pub enum ProxyError {
 /// `guardrail_bypassed_reason`: there it means the output scan was skipped.
 /// `unscannable_body` — the body could not be walked, so the guardrail was
 /// never offered the content to scan.
-/// `mask_writeback_failed` — a mask verdict could not be spliced back into
-/// the body, so the request is refused rather than forwarded unmasked.
 pub(crate) const TAG_OUTPUT_BUFFER_EXCEEDED: &str = "output_buffer_exceeded";
 pub(crate) const TAG_UNSCANNABLE_BODY: &str = "unscannable_body";
-pub(crate) const TAG_MASK_WRITEBACK_FAILED: &str = "mask_writeback_failed";
 
 /// The caller-visible message for a guardrail `Block` verdict.
 ///
@@ -403,6 +400,17 @@ pub(crate) fn guardrail_block_error(
     ProxyError::ContentFiltered {
         message: guardrail_block_message(side, guardrail_name, unavailable),
         unavailable: unavailable.map(str::to_owned),
+    }
+}
+
+/// The `error.code` of the Anthropic-shape SSE `event: error` frame that
+/// ends a passthrough stream classified as an Anthropic Messages envelope
+/// ([`crate::passthrough_route::guardrail_error_frame`]).
+pub(crate) fn anthropic_guardrail_code(unavailable: Option<&str>) -> &'static str {
+    if unavailable.is_some() {
+        "guardrail_unavailable"
+    } else {
+        "content_filter"
     }
 }
 
@@ -659,12 +667,10 @@ impl ProxyError {
 /// Build the customer-visible envelope for an upstream HTTP error.
 ///
 /// **4xx**: delegate to [`crate::error_translate::render_openai_envelope`],
-/// which (a) passes OpenAI-wire fields verbatim, (b) translates
-/// Anthropic / Bedrock / Vertex / Gemini taxonomy via per-wire
-/// tables so the OpenAI-shape `error.type` and `error.code` carry the
-/// retry semantics SDKs depend on. (`error_translate` keeps those
-/// upstream-wire tables — they describe what an upstream says, not
-/// what this gateway serves.)
+/// which passes the OpenAI-wire upstream error fields verbatim so the
+/// OpenAI-shape `error.type` and `error.code` carry the retry semantics
+/// SDKs depend on. (`error.type` stays the DP-stable token — see
+/// `error_translate`.)
 ///
 /// **5xx and synthesised errors** (`UpstreamWire::Unknown`): the generic
 /// `upstream_error` envelope carrying the upstream's own message.
@@ -690,7 +696,7 @@ fn render_bridge_upstream_envelope(
     let is_4xx = (400..500).contains(&status);
     if is_4xx && !matches!(wire, aisix_gateway::UpstreamWire::Unknown) {
         return ErrorEnvelope {
-            error: crate::error_translate::render_openai_envelope(parsed, wire, message),
+            error: crate::error_translate::render_openai_envelope(parsed, message),
         };
     }
     ErrorEnvelope::new(message.to_string(), "upstream_error")

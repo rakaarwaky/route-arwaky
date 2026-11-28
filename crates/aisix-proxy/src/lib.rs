@@ -118,7 +118,7 @@ use axum::extract::State;
 use axum::http::{header, HeaderValue, Request};
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{any, get, post};
+use axum::routing::{get, post};
 use axum::Router;
 use tower_http::set_header::SetResponseHeaderLayer;
 
@@ -3363,10 +3363,9 @@ data: [DONE]\n\n";
     }
 
     /// P2 (#379): like the keyword guardrail above (which now holds back by
-    /// default, #466), `azure_content_safety_text_moderation` keeps offending
-    /// content off the wire — here via the configurable `Window` policy
-    /// rather than the default `BufferFull`. A blocked streaming response
-    /// NEVER puts the offending content on the wire.
+    /// default, #466), a remote screening guardrail keeps offending content
+    /// off the wire. A blocked streaming response NEVER puts the offending
+    /// content on the wire.
     #[tokio::test]
     async fn streaming_text_moderation_blocks_and_holds_content_back_no_leak() {
         let upstream = MockServer::builder().start().await;
@@ -3385,13 +3384,14 @@ data: [DONE]\n\n";
             .mount(&upstream)
             .await;
 
-        // Azure Content Safety mock returns high severity → block.
+        // Lakera Guard mock flags the response → block.
         let acs = MockServer::builder().start().await;
         Mock::given(method("POST"))
-            .and(path("/contentsafety/text:analyze"))
+            .and(path("/v2/guard"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "categoriesAnalysis": [{"category": "Hate", "severity": 6}],
-                "blocklistsMatch": []
+                "flagged": true,
+                "payload": [],
+                "breakdown": [{ "detector_type": "prompt_attack", "detected": true }]
             })))
             .mount(&acs)
             .await;
@@ -3404,7 +3404,7 @@ data: [DONE]\n\n";
             &state.snapshot,
             "g-textmod-output",
             &format!(
-                r#"{{"name":"textmod","kind":"azure_content_safety_text_moderation","hook_point":"output","endpoint":"{}","api_key":"k"}}"#,
+                r#"{{"name":"textmod","kind":"lakera","hook_point":"output","endpoint":"{}","api_key":"k"}}"#,
                 acs.uri()
             ),
         );
@@ -3470,10 +3470,11 @@ data: [DONE]\n\n";
             .await;
         let acs = MockServer::builder().start().await;
         Mock::given(method("POST"))
-            .and(path("/contentsafety/text:analyze"))
+            .and(path("/v2/guard"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "categoriesAnalysis": [{"category": "Hate", "severity": 0}],
-                "blocklistsMatch": []
+                "flagged": false,
+                "payload": [],
+                "breakdown": []
             })))
             .mount(&acs)
             .await;
@@ -3485,7 +3486,7 @@ data: [DONE]\n\n";
             &state.snapshot,
             "g-textmod-clean",
             &format!(
-                r#"{{"name":"textmod","kind":"azure_content_safety_text_moderation","hook_point":"output","endpoint":"{}","api_key":"k"}}"#,
+                r#"{{"name":"textmod","kind":"lakera","hook_point":"output","endpoint":"{}","api_key":"k"}}"#,
                 acs.uri()
             ),
         );
@@ -3558,13 +3559,22 @@ data: [DONE]\n\n";
         String::from_utf8(wire).expect("utf8")
     }
 
-    async fn acs_mock(severity: u8) -> MockServer {
+    async fn lakera_mock(flagged: bool) -> MockServer {
         let acs = MockServer::builder().start().await;
+        let (flagged, breakdown) = if flagged {
+            (
+                serde_json::json!(true),
+                serde_json::json!([{ "detector_type": "prompt_attack", "detected": true }]),
+            )
+        } else {
+            (serde_json::json!(false), serde_json::json!([]))
+        };
         Mock::given(method("POST"))
-            .and(path("/contentsafety/text:analyze"))
+            .and(path("/v2/guard"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "categoriesAnalysis": [{"category": "Hate", "severity": severity}],
-                "blocklistsMatch": []
+                "flagged": flagged,
+                "payload": [],
+                "breakdown": breakdown
             })))
             .mount(&acs)
             .await;
@@ -3584,11 +3594,16 @@ data: [DONE]\n\n"
     /// trips before end-of-stream) and leaks nothing.
     #[tokio::test]
     async fn streaming_text_moderation_window_blocks_mid_stream() {
-        let acs = acs_mock(6).await;
-        let cfg = format!(
-            r#"{{"name":"tm","kind":"azure_content_safety_text_moderation","hook_point":"output","endpoint":"{}","api_key":"k","stream_processing_mode":"window","window_size":5,"window_overlap_size":1}}"#,
-            acs.uri()
-        );
+        let cfg = serde_json::json!({
+            "name": "tm",
+            "kind": "custom",
+            "hook_point": "output",
+            "script": "export async function checkOutput() { return { action: \"block\", reason_code: \"policy\" }; }",
+            "stream_processing_mode": "window",
+            "window_size": 5,
+            "window_overlap_size": 1,
+        })
+        .to_string();
         let wire = run_textmod_stream(&cfg, &two_content_chunks("hello ", "world!")).await;
         assert!(
             !wire.contains("hello"),
@@ -3612,11 +3627,16 @@ data: [DONE]\n\n"
     /// mid-stream flush + overlap retention), ending with [DONE].
     #[tokio::test]
     async fn streaming_text_moderation_window_releases_clean_multiwindow() {
-        let acs = acs_mock(0).await;
-        let cfg = format!(
-            r#"{{"name":"tm","kind":"azure_content_safety_text_moderation","hook_point":"output","endpoint":"{}","api_key":"k","stream_processing_mode":"window","window_size":5,"window_overlap_size":2}}"#,
-            acs.uri()
-        );
+        let cfg = serde_json::json!({
+            "name": "tm",
+            "kind": "custom",
+            "hook_point": "output",
+            "script": "export async function checkOutput() { return { action: \"none\" }; }",
+            "stream_processing_mode": "window",
+            "window_size": 5,
+            "window_overlap_size": 2,
+        })
+        .to_string();
         let wire = run_textmod_stream(&cfg, &two_content_chunks("hello ", "world!")).await;
         assert!(
             wire.contains("hello"),
@@ -3639,9 +3659,9 @@ data: [DONE]\n\n"
     /// H1: BufferFull cap exceeded with fail_closed → block, no leak.
     #[tokio::test]
     async fn streaming_text_moderation_buffer_full_cap_fail_closed_blocks() {
-        let acs = acs_mock(0).await; // severity irrelevant — the cap trips first
+        let acs = lakera_mock(false).await; // verdict irrelevant — the cap trips first
         let cfg = format!(
-            r#"{{"name":"tm","kind":"azure_content_safety_text_moderation","hook_point":"output","endpoint":"{}","api_key":"k","stream_processing_mode":"buffer_full","max_buffer_bytes":4,"on_buffer_exceeded":"fail_closed"}}"#,
+            r#"{{"name":"tm","kind":"lakera","hook_point":"output","endpoint":"{}","api_key":"k","max_buffer_bytes":4,"on_buffer_exceeded":"fail_closed"}}"#,
             acs.uri()
         );
         let wire = run_textmod_stream(&cfg, &two_content_chunks("abcd", "efghij")).await;
@@ -3663,9 +3683,9 @@ data: [DONE]\n\n"
     /// the rest live, ending with [DONE].
     #[tokio::test]
     async fn streaming_text_moderation_buffer_full_cap_fail_open_releases() {
-        let acs = acs_mock(0).await;
+        let acs = lakera_mock(false).await;
         let cfg = format!(
-            r#"{{"name":"tm","kind":"azure_content_safety_text_moderation","hook_point":"output","endpoint":"{}","api_key":"k","stream_processing_mode":"buffer_full","max_buffer_bytes":4,"on_buffer_exceeded":"fail_open"}}"#,
+            r#"{{"name":"tm","kind":"lakera","hook_point":"output","endpoint":"{}","api_key":"k","max_buffer_bytes":4,"on_buffer_exceeded":"fail_open"}}"#,
             acs.uri()
         );
         let wire = run_textmod_stream(&cfg, &two_content_chunks("abcd", "efghij")).await;
@@ -3699,35 +3719,44 @@ data: [DONE]\n\n"
     /// code for a policy block.
     #[tokio::test]
     async fn streamed_guardrail_refusals_carry_the_buffered_error_code() {
-        let acs_down = MockServer::builder().start().await;
+        let guard_down = MockServer::builder().start().await;
         Mock::given(method("POST"))
-            .and(path("/contentsafety/text:analyze"))
+            .and(path("/v2/guard"))
             .respond_with(ResponseTemplate::new(500))
-            .mount(&acs_down)
+            .mount(&guard_down)
             .await;
-        let acs_hit = acs_mock(6).await;
-        let row = |endpoint: &str, mode: &str| {
+        let guard_hit = lakera_mock(true).await;
+        let custom_row = |script: &str| {
+            serde_json::json!({
+                "name": "tm",
+                "kind": "custom",
+                "hook_point": "output",
+                "script": script,
+                "stream_processing_mode": "window",
+                "window_size": 5,
+                "window_overlap_size": 1,
+            })
+            .to_string()
+        };
+        let blocking =
+            "export async function checkOutput() { return { action: \"block\", reason_code: \"policy\" }; }";
+        let faulting = "export async function checkOutput() { throw new Error(\"down\"); }";
+        let row = |endpoint: &str| {
             format!(
-                r#"{{"name":"tm","kind":"azure_content_safety_text_moderation","hook_point":"output","endpoint":"{endpoint}","api_key":"k","stream_processing_mode":"{mode}","window_size":5,"window_overlap_size":1}}"#
+                r#"{{"name":"tm","kind":"lakera","hook_point":"output","endpoint":"{endpoint}","api_key":"k"}}"#
             )
         };
         let cap = format!(
-            r#"{{"name":"tm","kind":"azure_content_safety_text_moderation","hook_point":"output","endpoint":"{}","api_key":"k","stream_processing_mode":"buffer_full","max_buffer_bytes":4,"on_buffer_exceeded":"fail_closed"}}"#,
-            acs_hit.uri()
+            r#"{{"name":"tm","kind":"lakera","hook_point":"output","endpoint":"{}","api_key":"k","max_buffer_bytes":4,"on_buffer_exceeded":"fail_closed"}}"#,
+            guard_hit.uri()
         );
         let chunks = two_content_chunks("hello ", "world!");
         for (cfg, code) in [
             (cap, Some("guardrail_unavailable")),
-            (
-                row(&acs_down.uri(), "window"),
-                Some("guardrail_unavailable"),
-            ),
-            (
-                row(&acs_down.uri(), "buffer_full"),
-                Some("guardrail_unavailable"),
-            ),
-            (row(&acs_hit.uri(), "window"), None),
-            (row(&acs_hit.uri(), "buffer_full"), None),
+            (custom_row(faulting), Some("guardrail_unavailable")),
+            (row(&guard_down.uri()), Some("guardrail_unavailable")),
+            (custom_row(blocking), None),
+            (row(&guard_hit.uri()), None),
         ] {
             let v = refusal_frame(&run_textmod_stream(&cfg, &chunks).await);
             assert_eq!(v["error"]["type"], "content_filter", "{cfg}: {v}");
@@ -4870,7 +4899,7 @@ data: [DONE]\n\n";
             &state.snapshot,
             "g-slow-output",
             &format!(
-                r#"{{"name":"slow-output","kind":"azure_content_safety_text_moderation","hook_point":"output","endpoint":"{}","api_key":"k"}}"#,
+                r#"{{"name":"slow-output","kind":"lakera","hook_point":"output","endpoint":"{}","api_key":"k"}}"#,
                 scanner.uri()
             ),
         );
@@ -5385,7 +5414,7 @@ data: [DONE]\n\n";
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
             })))
             // Two distinct payloads → expect exactly two upstream calls.
-            .expect(1)
+            .expect(2)
             .mount(&upstream)
             .await;
 
@@ -6795,7 +6824,7 @@ data: [DONE]\n\n";
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
             .respond_with(ResponseTemplate::new(502).set_body_string("upstream down"))
-            .expect(1)
+            .expect(2)
             .mount(&upstream)
             .await;
 
@@ -8134,7 +8163,7 @@ data: [DONE]\n\n";
             &state.snapshot,
             "g-slow-input",
             &format!(
-                r#"{{"name":"slow-input","kind":"azure_content_safety_text_moderation","hook_point":"input","endpoint":"{}","api_key":"k"}}"#,
+                r#"{{"name":"slow-input","kind":"lakera","hook_point":"input","endpoint":"{}","api_key":"k"}}"#,
                 scanner.uri()
             ),
         );
@@ -8379,7 +8408,7 @@ data: [DONE]\n\n";
             &state.snapshot,
             "g-slow-output",
             &format!(
-                r#"{{"name":"slow-output","kind":"azure_content_safety_text_moderation","hook_point":"output","endpoint":"{}","api_key":"k"}}"#,
+                r#"{{"name":"slow-output","kind":"lakera","hook_point":"output","endpoint":"{}","api_key":"k"}}"#,
                 scanner.uri()
             ),
         );
@@ -12160,420 +12189,6 @@ data: [DONE]\n\n";
         assert!(hit.error_type.is_empty());
     }
 
-    /// Cross-provider contract: Anthropic upstream 5xx → client sees an
-    /// OpenAI-shape envelope `{error:{type:"upstream_error",...}}` with
-    /// status 502 (collapsed per `BridgeError::http_status`, see
-    /// crates/aisix-gateway/src/bridge.rs).
-    #[tokio::test]
-    async fn upstream_anthropic_5xx_collapses_to_502_with_openai_envelope() {
-        use aisix_provider_anthropic::AnthropicBridge;
-
-        let upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .respond_with(ResponseTemplate::new(503).set_body_string(
-                r#"{"type":"error","error":{"type":"overloaded_error","message":"upstream busy"}}"#,
-            ))
-            .mount(&upstream)
-            .await;
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys
-            .insert(matrix_anthropic_pk(&upstream.uri()));
-        snap.models.insert(anthropic_model_entry("my-claude"));
-        snap.apikeys
-            .insert(apikey_entry("sk-caller", &["my-claude"]));
-        let hub = Arc::new(Hub::new());
-        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
-        let app = build_router(build_state(snap, hub));
-
-        let body = serde_json::json!({
-            "model": "my-claude",
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("authorization", "Bearer sk-caller")
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-        let v: serde_json::Value =
-            serde_json::from_slice(&to_bytes(resp.into_body(), 1024).await.unwrap()).unwrap();
-        // Anthropic-shape leaks must not bleed through to the client.
-        assert_eq!(v["error"]["type"], "upstream_error");
-        assert!(v["error"]["message"].is_string());
-    }
-
-    /// Cross-provider 4xx forwarding (issue #327): Anthropic upstream
-    /// 400 reaches the OpenAI-client side with `error.type` normalised
-    /// to the DP-stable `"upstream_error"` token — Anthropic's private
-    /// taxonomy (`invalid_request_error`, `authentication_error`, etc.)
-    /// must not bleed through.
-    #[tokio::test]
-    async fn upstream_anthropic_400_normalises_type_to_upstream_error() {
-        use aisix_provider_anthropic::AnthropicBridge;
-
-        let upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .respond_with(ResponseTemplate::new(400).set_body_raw(
-                br#"{"type":"error","error":{"type":"invalid_request_error","message":"bad input"}}"#.as_slice(),
-                "application/json",
-            ))
-            .mount(&upstream)
-            .await;
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys
-            .insert(matrix_anthropic_pk(&upstream.uri()));
-        snap.models.insert(anthropic_model_entry("my-claude"));
-        snap.apikeys
-            .insert(apikey_entry("sk-caller", &["my-claude"]));
-        let hub = Arc::new(Hub::new());
-        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
-        let app = build_router(build_state(snap, hub));
-
-        let body = serde_json::json!({
-            "model": "my-claude",
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("authorization", "Bearer sk-caller")
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let v: serde_json::Value =
-            serde_json::from_slice(&to_bytes(resp.into_body(), 1024).await.unwrap()).unwrap();
-        assert_eq!(v["error"]["type"], "upstream_error");
-        assert_eq!(v["error"]["message"], "bad input");
-        // Anthropic `invalid_request_error` doesn't derive an OpenAI
-        // string code — translation table emits `code: null`.
-        assert!(v["error"].get("code").is_none() || v["error"]["code"].is_null());
-    }
-
-    /// Issue #322 + #327 cross-wire contract: Anthropic upstream
-    /// `rate_limit_error` must derive OpenAI `error.code =
-    /// rate_limit_exceeded` (so SDK retry logic that switches on
-    /// `error.code` recognises the rate-limit failure regardless of
-    /// upstream), while `error.type` stays as the DP-stable
-    /// `"upstream_error"` (per #327, Anthropic's `rate_limit_error`
-    /// token must not bleed through).
-    #[tokio::test]
-    async fn upstream_anthropic_rate_limit_derives_openai_rate_limit_exceeded_code() {
-        use aisix_provider_anthropic::AnthropicBridge;
-
-        let upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .respond_with(ResponseTemplate::new(429).set_body_raw(
-                br#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#.as_slice(),
-                "application/json",
-            ))
-            .mount(&upstream)
-            .await;
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys
-            .insert(matrix_anthropic_pk(&upstream.uri()));
-        snap.models.insert(anthropic_model_entry("my-claude"));
-        snap.apikeys
-            .insert(apikey_entry("sk-caller", &["my-claude"]));
-        let hub = Arc::new(Hub::new());
-        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
-        let app = build_router(build_state(snap, hub));
-
-        let body = serde_json::json!({
-            "model": "my-claude",
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("authorization", "Bearer sk-caller")
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-        let v: serde_json::Value =
-            serde_json::from_slice(&to_bytes(resp.into_body(), 1024).await.unwrap()).unwrap();
-        // Per #327: `error.type` is the DP-stable token, never the
-        // upstream's. Per #322: `error.code` is the derived OpenAI
-        // string code so SDK retry logic fires correctly.
-        assert_eq!(v["error"]["type"], "upstream_error");
-        assert_eq!(v["error"]["code"], "rate_limit_exceeded");
-        assert_eq!(v["error"]["message"], "slow down");
-    }
-
-    fn matrix_anthropic_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
-        matrix_pk_entry(
-            MATRIX_ANTHROPIC_PK_ID,
-            "sk-ant-test",
-            api_base,
-            "anthropic",
-            "anthropic",
-        )
-    }
-
-    fn anthropic_model_entry(name: &str) -> ResourceEntry<Model> {
-        let cfg = format!(
-            r#"{{
-                "display_name": "{name}",
-                "provider": "anthropic",
-                "model_name": "claude-3-5-haiku-20241022",
-                "provider_key_id": "{MATRIX_ANTHROPIC_PK_ID}"
-            }}"#
-        );
-        ResourceEntry::new("model-anthropic-1", serde_json::from_str(&cfg).unwrap(), 1)
-    }
-
-    fn anthropic_snapshot(api_base: &str) -> (AisixSnapshot, Arc<Hub>) {
-        use aisix_provider_anthropic::AnthropicBridge;
-        let snap = AisixSnapshot::new();
-        snap.provider_keys.insert(matrix_anthropic_pk(api_base));
-        snap.models.insert(anthropic_model_entry("my-claude"));
-        let hub = Arc::new(Hub::new());
-        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
-        (snap, hub)
-    }
-
-    fn anthropic_message_body() -> serde_json::Value {
-        serde_json::json!({
-            "id": "msg_up",
-            "type": "message",
-            "role": "assistant",
-            "model": "claude-3-5-haiku-20241022",
-            "content": [{"type": "text", "text": "hello"}],
-            "stop_reason": "end_turn",
-            "usage": {"input_tokens": 10_000, "output_tokens": 10_000}
-        })
-    }
-
-    /// (OpenAI inbound) × (Anthropic upstream) × (non-streaming).
-    /// The most valuable cross-protocol cell — exercises real wire-shape
-    /// translation in both directions inside `AnthropicBridge::chat`.
-    #[tokio::test]
-    async fn matrix_openai_in_anthropic_upstream_non_streaming() {
-        use aisix_provider_anthropic::AnthropicBridge;
-
-        let upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .and(header("x-api-key", "sk-ant-test"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "msg_01",
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "text", "text": "Hello from Claude!"}],
-                "model": "claude-3-5-haiku-20241022",
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 5, "output_tokens": 4}
-            })))
-            .mount(&upstream)
-            .await;
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys
-            .insert(matrix_anthropic_pk(&upstream.uri()));
-        snap.models.insert(anthropic_model_entry("my-claude"));
-        snap.apikeys
-            .insert(apikey_entry("sk-caller", &["my-claude"]));
-        let hub = Arc::new(Hub::new());
-        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
-        let app = build_router(build_state(snap, hub));
-
-        let body = serde_json::json!({
-            "model": "my-claude",
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("authorization", "Bearer sk-caller")
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v: serde_json::Value =
-            serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap()).unwrap();
-        // OpenAI-shape wire on the way out.
-        assert_eq!(v["object"], "chat.completion");
-        assert_eq!(v["choices"][0]["message"]["role"], "assistant");
-        assert_eq!(v["choices"][0]["message"]["content"], "Hello from Claude!");
-        assert_eq!(v["choices"][0]["finish_reason"], "stop");
-        assert_eq!(v["usage"]["prompt_tokens"], 5);
-        assert_eq!(v["usage"]["completion_tokens"], 4);
-    }
-
-    /// (OpenAI inbound) × (Anthropic upstream) × (streaming).
-    /// Pin the SSE event-stream translation: AnthropicBridge ingests
-    /// typed Anthropic events (message_start / content_block_delta /
-    /// message_delta / message_stop) and emits flat OpenAI deltas.
-    #[tokio::test]
-    async fn matrix_openai_in_anthropic_upstream_streaming() {
-        use aisix_provider_anthropic::AnthropicBridge;
-
-        let upstream = MockServer::builder().start().await;
-        let sse = "\
-event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-haiku-20241022\",\"stop_reason\":null,\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n\
-event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
-event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hel\"}}\n\n\
-event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n\n\
-event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
-event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":2}}\n\n\
-event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_string(sse),
-            )
-            .mount(&upstream)
-            .await;
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys
-            .insert(matrix_anthropic_pk(&upstream.uri()));
-        snap.models.insert(anthropic_model_entry("my-claude"));
-        snap.apikeys
-            .insert(apikey_entry("sk-caller", &["my-claude"]));
-        let hub = Arc::new(Hub::new());
-        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
-        let app = build_router(build_state(snap, hub));
-
-        let body = serde_json::json!({
-            "model": "my-claude",
-            "messages": [{"role": "user", "content": "hi"}],
-            "stream": true,
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("authorization", "Bearer sk-caller")
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers()
-                .get(axum::http::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok()),
-            Some("text/event-stream"),
-        );
-        let body =
-            String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
-        // OpenAI-shape SSE deltas on the way out.
-        assert!(
-            body.contains("\"object\":\"chat.completion.chunk\""),
-            "missing OpenAI chunk envelope in:\n{body}"
-        );
-        assert!(body.contains("\"content\":\"hel\""));
-        assert!(body.contains("\"content\":\"lo\""));
-        assert!(body.contains("\"finish_reason\":\"stop\""));
-        assert!(body.contains("data: [DONE]"));
-    }
-
-    #[tokio::test]
-    async fn cache_hit_preserves_the_anthropic_cache_creation_split() {
-        use aisix_obs::UsageSink;
-        use aisix_provider_anthropic::AnthropicBridge;
-
-        let upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "msg_cached",
-                "type": "message",
-                "role": "assistant",
-                "model": "claude-sonnet-4-5",
-                "content": [{"type": "text", "text": "cached"}],
-                "stop_reason": "end_turn",
-                "usage": {
-                    "input_tokens": 7,
-                    "output_tokens": 11,
-                    "cache_creation_input_tokens": 300,
-                    "cache_creation": {
-                        "ephemeral_5m_input_tokens": 0,
-                        "ephemeral_1h_input_tokens": 300
-                    }
-                }
-            })))
-            .expect(1)
-            .mount(&upstream)
-            .await;
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let snap = AisixSnapshot::new();
-        snap.provider_keys
-            .insert(matrix_anthropic_pk(&upstream.uri()));
-        snap.models.insert(anthropic_model_entry("my-claude"));
-        snap.apikeys
-            .insert(apikey_entry("sk-caller", &["my-claude"]));
-        seed_cache_policy(&snap, "ttl-cache");
-        let hub = Arc::new(Hub::new());
-        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
-        let state = build_state_with_cache(snap, hub).with_usage_sink(UsageSink::new(tx));
-
-        let body = serde_json::json!({
-            "model": "my-claude",
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        let make_req = || {
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("authorization", "Bearer sk-caller")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap()
-        };
-        let _ = run(build_router(state.clone()), make_req()).await;
-        let miss = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
-            .await
-            .expect("event was never emitted")
-            .expect("sender dropped");
-        assert_eq!(miss.cache_status, "miss");
-        assert_eq!(miss.cache_creation_ttl.cache_creation_5m_tokens, Some(0));
-        assert_eq!(miss.cache_creation_ttl.cache_creation_1h_tokens, Some(300));
-
-        let _ = run(build_router(state), make_req()).await;
-        let hit = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
-            .await
-            .expect("event was never emitted")
-            .expect("sender dropped");
-        assert_eq!(hit.cache_status, "hit");
-        assert_eq!(hit.cache_creation_tokens, 300);
-        assert_eq!(hit.cache_creation_ttl, miss.cache_creation_ttl);
-    }
-
-    #[tokio::test]
-    async fn responses_bridged_hangup_during_output_check_counts_against_tpm() {
-        let upstream = MockServer::builder().start().await;
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_message_body()))
-            .mount(&upstream)
-            .await;
-        let (snap, hub) = anthropic_snapshot(&upstream.uri());
-        assert_hangup_during_output_check_counts_against_tpm(
-            snap,
-            hub,
-            "my-claude",
-            "/v1/responses",
-            serde_json::json!({"model": "my-claude", "input": "hi"}),
-        )
-        .await;
-    }
-
     /// AISIX-Cloud#790: a plain direct-model request (no routing group)
     /// records the client-sent name in `requested_model` and keeps the
     /// direct model's own id in `model_id`.
@@ -12630,21 +12245,16 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(event.requested_model_id, "model-id-1");
     }
 
-    const MATRIX_ANTHROPIC_PK_ID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-
     // ─── Usage accounting across the protocol-conversion matrix ────
     //
     // AISIX-Cloud#1447. `UsageStats` stores whichever accounting shape
     // the UPSTREAM used; the client must be answered in ITS OWN
-    // protocol's shape. The inbound `/v1/messages` surface was removed,
-    // so the matrix walked below covers the two OpenAI clients against
-    // both upstream shapes:
+    // protocol's shape. With the OpenAI adapter the only upstream, the
+    // matrix walked below covers:
     //
     //   client            upstream shape   conversion?
     //   /v1/chat/…        OpenAI           no  (identity)
-    //   /v1/chat/…        Anthropic        YES
     //   /v1/responses     OpenAI           no  (verbatim passthrough)
-    //   /v1/responses     Anthropic        YES
     //
     // …times streaming/non-streaming. Every cell is walked below, and
     // each is checked on BOTH exits: the bytes the client reads, and the
@@ -12654,7 +12264,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     // protocol addressed it, while the client sees its own protocol's
     // accounting.
     //
-    // One call, described by both upstreams: 40 uncached input tokens,
+    // One call, described by the upstream: 40 uncached input tokens,
     // a 30-token cache write, a 70-token cache read, 10 output. The
     // model read 140 input tokens and 150 in total, and no client may be
     // told otherwise.
@@ -12671,16 +12281,6 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         Responses,
     }
 
-    /// Which accounting shape the upstream reports in. Not "which
-    /// vendor" — bedrock reports in the Anthropic shape, and every
-    /// OpenAI-compatible provider (deepseek, gemini, azure, …) in the
-    /// OpenAI one, so these two exhaust the axis.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum UmUpstream {
-        OpenAiShape,
-        AnthropicShape,
-    }
-
     /// The OpenAI-shape upstream's account of the call: one `prompt_tokens`
     /// that already contains the cache read. OpenAI has no cache-WRITE
     /// bucket, so those 30 tokens are simply part of the prompt here.
@@ -12693,124 +12293,47 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         })
     }
 
-    /// The same call as the Anthropic-shape upstream reports it: cache
-    /// counters BESIDE a non-cached `input_tokens`.
-    fn um_anthropic_usage_json() -> serde_json::Value {
-        serde_json::json!({
-            "input_tokens": UM_UNCACHED_IN,
-            "output_tokens": UM_OUT,
-            "cache_creation_input_tokens": UM_CACHE_WRITE,
-            "cache_read_input_tokens": UM_CACHE_READ,
-        })
-    }
-
-    async fn um_mount_upstream(mock: &MockServer, upstream: UmUpstream, streaming: bool) {
-        match (upstream, streaming) {
-            (UmUpstream::OpenAiShape, false) => {
-                let body = serde_json::json!({
+    async fn um_mount_upstream(mock: &MockServer, streaming: bool) {
+        if !streaming {
+            let body = serde_json::json!({
+                "id": "chatcmpl-um",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": um_openai_usage_json(),
+            });
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(mock)
+                .await;
+        } else {
+            let sse = format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({
                     "id": "chatcmpl-um",
                     "model": "gpt-4o",
-                    "choices": [{
-                        "index": 0,
-                        "message": {"role": "assistant", "content": "ok"},
-                        "finish_reason": "stop"
-                    }],
+                    "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": "stop"}]
+                }),
+                serde_json::json!({
+                    "id": "chatcmpl-um",
+                    "model": "gpt-4o",
+                    "choices": [],
                     "usage": um_openai_usage_json(),
-                });
-                Mock::given(method("POST"))
-                    .and(path("/chat/completions"))
-                    .respond_with(ResponseTemplate::new(200).set_body_json(body))
-                    .mount(mock)
-                    .await;
-            }
-            (UmUpstream::OpenAiShape, true) => {
-                let sse = format!(
-                    "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
-                    serde_json::json!({
-                        "id": "chatcmpl-um",
-                        "model": "gpt-4o",
-                        "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": "stop"}]
-                    }),
-                    serde_json::json!({
-                        "id": "chatcmpl-um",
-                        "model": "gpt-4o",
-                        "choices": [],
-                        "usage": um_openai_usage_json(),
-                    }),
-                );
-                Mock::given(method("POST"))
-                    .and(path("/chat/completions"))
-                    .respond_with(
-                        ResponseTemplate::new(200)
-                            .insert_header("content-type", "text/event-stream")
-                            .set_body_raw(sse.into_bytes(), "text/event-stream"),
-                    )
-                    .mount(mock)
-                    .await;
-            }
-            (UmUpstream::AnthropicShape, false) => {
-                let body = serde_json::json!({
-                    "id": "msg_um",
-                    "type": "message",
-                    "role": "assistant",
-                    "model": "claude-3-5-haiku-20241022",
-                    "content": [{"type": "text", "text": "ok"}],
-                    "stop_reason": "end_turn",
-                    "usage": um_anthropic_usage_json(),
-                });
-                Mock::given(method("POST"))
-                    .and(path("/v1/messages"))
-                    .respond_with(ResponseTemplate::new(200).set_body_json(body))
-                    .mount(mock)
-                    .await;
-            }
-            (UmUpstream::AnthropicShape, true) => {
-                // `message_start` carries the input side (including both
-                // cache counters); `message_delta` closes with the output
-                // side. That split is Anthropic's, not ours.
-                let sse = format!(
-                    "event: message_start\ndata: {}\n\n\
-event: content_block_delta\ndata: {}\n\n\
-event: message_delta\ndata: {}\n\n\
-event: message_stop\ndata: {}\n\n",
-                    serde_json::json!({
-                        "type": "message_start",
-                        "message": {
-                            "id": "msg_um",
-                            "role": "assistant",
-                            "content": [],
-                            "model": "claude-3-5-haiku-20241022",
-                            "stop_reason": null,
-                            "usage": {
-                                "input_tokens": UM_UNCACHED_IN,
-                                "cache_creation_input_tokens": UM_CACHE_WRITE,
-                                "cache_read_input_tokens": UM_CACHE_READ,
-                                "output_tokens": 1
-                            }
-                        }
-                    }),
-                    serde_json::json!({
-                        "type": "content_block_delta",
-                        "index": 0,
-                        "delta": {"type": "text_delta", "text": "ok"}
-                    }),
-                    serde_json::json!({
-                        "type": "message_delta",
-                        "delta": {"stop_reason": "end_turn"},
-                        "usage": {"output_tokens": UM_OUT}
-                    }),
-                    serde_json::json!({"type": "message_stop"}),
-                );
-                Mock::given(method("POST"))
-                    .and(path("/v1/messages"))
-                    .respond_with(
-                        ResponseTemplate::new(200)
-                            .insert_header("content-type", "text/event-stream")
-                            .set_body_raw(sse.into_bytes(), "text/event-stream"),
-                    )
-                    .mount(mock)
-                    .await;
-            }
+                }),
+            );
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_raw(sse.into_bytes(), "text/event-stream"),
+                )
+                .mount(mock)
+                .await;
         }
     }
 
@@ -12865,44 +12388,27 @@ event: message_stop\ndata: {}\n\n",
     /// Drive one matrix cell and return `(client-facing usage, UsageEvent)`.
     async fn um_call(
         client: UmClient,
-        upstream: UmUpstream,
         streaming: bool,
     ) -> (serde_json::Value, aisix_obs::UsageEvent) {
         use aisix_obs::UsageSink;
-        use aisix_provider_anthropic::AnthropicBridge;
         use aisix_provider_openai::OpenAiBridge;
 
         let mock = MockServer::builder().start().await;
-        let responses_verbatim =
-            client == UmClient::Responses && upstream == UmUpstream::OpenAiShape;
+        let responses_verbatim = client == UmClient::Responses;
         if responses_verbatim {
             um_mount_responses_upstream(&mock, streaming).await;
         } else {
-            um_mount_upstream(&mock, upstream, streaming).await;
+            um_mount_upstream(&mock, streaming).await;
         }
 
         let snap = AisixSnapshot::new();
-        let model_name = match upstream {
-            UmUpstream::OpenAiShape => {
-                snap.provider_keys.insert(provider_key_entry(&mock.uri()));
-                snap.models.insert(model_entry("um-model"));
-                "um-model"
-            }
-            UmUpstream::AnthropicShape => {
-                snap.provider_keys.insert(matrix_anthropic_pk(&mock.uri()));
-                snap.models.insert(anthropic_model_entry("um-model"));
-                "um-model"
-            }
-        };
+        snap.provider_keys.insert(provider_key_entry(&mock.uri()));
+        snap.models.insert(model_entry("um-model"));
+        let model_name = "um-model";
         snap.apikeys
             .insert(apikey_entry("sk-caller", &[model_name]));
 
         let hub = Arc::new(Hub::new());
-        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
-        hub.register_family(
-            aisix_core::Adapter::Anthropic,
-            Arc::new(AnthropicBridge::new()),
-        );
         hub.register_family(aisix_core::Adapter::Openai, Arc::new(OpenAiBridge::new()));
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let app = build_router(build_state(snap, hub).with_usage_sink(UsageSink::new(tx)));
@@ -12936,7 +12442,7 @@ event: message_stop\ndata: {}\n\n",
         assert_eq!(
             resp.status(),
             StatusCode::OK,
-            "{client:?}/{upstream:?}/stream={streaming}"
+            "{client:?}/stream={streaming}"
         );
         let raw = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         let text = String::from_utf8(raw.to_vec()).unwrap();
@@ -12948,7 +12454,7 @@ event: message_stop\ndata: {}\n\n",
         };
         assert!(
             usage.is_object(),
-            "{client:?}/{upstream:?}/stream={streaming} produced no client usage; body: {text}"
+            "{client:?}/stream={streaming} produced no client usage; body: {text}"
         );
         // Take the SERVED attempt's event, not simply the first one.
         // Every attempt emits its own (#655), so a connection hiccup
@@ -12965,12 +12471,8 @@ event: message_stop\ndata: {}\n\n",
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let next = tokio::time::timeout(remaining, rx.recv())
                 .await
-                .unwrap_or_else(|_| {
-                    panic!("{client:?}/{upstream:?}/stream={streaming}: no served UsageEvent")
-                })
-                .unwrap_or_else(|| {
-                    panic!("{client:?}/{upstream:?}/stream={streaming}: usage sink closed")
-                });
+                .unwrap_or_else(|_| panic!("{client:?}/stream={streaming}: no served UsageEvent"))
+                .unwrap_or_else(|| panic!("{client:?}/stream={streaming}: usage sink closed"));
             if next.status_code == 200 {
                 break next;
             }
@@ -13008,63 +12510,39 @@ event: message_stop\ndata: {}\n\n",
     /// Every cell, regardless of conversion: the event carries the
     /// UPSTREAM's own counters, so the same call bills identically no
     /// matter which client protocol addressed it.
-    fn um_assert_event_keeps_upstream_shape(
-        event: &aisix_obs::UsageEvent,
-        upstream: UmUpstream,
-        label: &str,
-    ) {
+    fn um_assert_event_keeps_upstream_shape(event: &aisix_obs::UsageEvent, label: &str) {
         assert_eq!(event.completion_tokens, UM_OUT, "{label}: completion");
-        match upstream {
-            UmUpstream::AnthropicShape => {
-                assert_eq!(event.prompt_tokens, UM_UNCACHED_IN, "{label}: prompt");
-                assert_eq!(event.cached_prompt_tokens, 0, "{label}: cached_prompt");
-                assert_eq!(
-                    event.cache_creation_tokens, UM_CACHE_WRITE,
-                    "{label}: cache_creation"
-                );
-                assert_eq!(
-                    event.cache_read_tokens, UM_CACHE_READ,
-                    "{label}: cache_read"
-                );
-            }
-            UmUpstream::OpenAiShape => {
-                assert_eq!(event.prompt_tokens, UM_TOTAL_IN, "{label}: prompt");
-                assert_eq!(
-                    event.cached_prompt_tokens, UM_CACHE_READ,
-                    "{label}: cached_prompt"
-                );
-                assert_eq!(event.cache_creation_tokens, 0, "{label}: cache_creation");
-                assert_eq!(event.cache_read_tokens, 0, "{label}: cache_read");
-            }
-        }
+        assert_eq!(event.prompt_tokens, UM_TOTAL_IN, "{label}: prompt");
+        assert_eq!(
+            event.cached_prompt_tokens, UM_CACHE_READ,
+            "{label}: cached_prompt"
+        );
+        assert_eq!(event.cache_creation_tokens, 0, "{label}: cache_creation");
+        assert_eq!(event.cache_read_tokens, 0, "{label}: cache_read");
     }
 
     /// A semantic-cache hit replays the stored `UsageStats`, so it must
     /// travel the same projection as the original call. Serving the hit
     /// from a path that copies the stored fields would report a
     /// different `prompt_tokens` for the same answer depending on
-    /// whether it came from cache — with only the Anthropic-upstream
-    /// numbers ever wrong, which is the hardest kind of drift to notice.
+    /// whether it came from cache — which is the hardest kind of drift
+    /// to notice.
     #[tokio::test]
     async fn usage_matrix_cache_hit_replays_the_same_client_facing_usage() {
-        use aisix_provider_anthropic::AnthropicBridge;
+        use aisix_provider_openai::OpenAiBridge;
 
         let mock = MockServer::builder().start().await;
-        um_mount_upstream(&mock, UmUpstream::AnthropicShape, false).await;
+        um_mount_upstream(&mock, false).await;
 
         let snap = AisixSnapshot::new();
-        snap.provider_keys.insert(matrix_anthropic_pk(&mock.uri()));
-        snap.models.insert(anthropic_model_entry("um-model"));
+        snap.provider_keys.insert(provider_key_entry(&mock.uri()));
+        snap.models.insert(model_entry("um-model"));
         snap.apikeys
             .insert(apikey_entry("sk-caller", &["um-model"]));
         seed_cache_policy(&snap, "usage-matrix-cache");
 
         let hub = Arc::new(Hub::new());
-        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
-        hub.register_family(
-            aisix_core::Adapter::Anthropic,
-            Arc::new(AnthropicBridge::new()),
-        );
+        hub.register_family(aisix_core::Adapter::Openai, Arc::new(OpenAiBridge::new()));
         let state = build_state_with_cache(snap, hub);
 
         let mut seen = Vec::new();
@@ -13107,15 +12585,14 @@ event: message_stop\ndata: {}\n\n",
             .unwrap()
     }
 
-    /// An OpenAI client reads the SAME numbers whichever upstream served
-    /// it — that equality is the whole contract, and pre-fix an Anthropic
-    /// upstream broke every field of it.
+    /// An OpenAI client reads the SAME numbers the upstream stated —
+    /// that equality is the whole contract.
     #[tokio::test]
     async fn usage_matrix_openai_client_is_upstream_agnostic() {
         for streaming in [false, true] {
-            for upstream in [UmUpstream::OpenAiShape, UmUpstream::AnthropicShape] {
-                let label = format!("chat/{upstream:?}/stream={streaming}");
-                let (usage, event) = um_call(UmClient::Chat, upstream, streaming).await;
+            {
+                let label = format!("chat/stream={streaming}");
+                let (usage, event) = um_call(UmClient::Chat, streaming).await;
                 assert_eq!(
                     usage["prompt_tokens"], UM_TOTAL_IN,
                     "{label}: prompt_tokens"
@@ -13132,19 +12609,19 @@ event: message_stop\ndata: {}\n\n",
                     usage["total_tokens"].as_u64().unwrap(),
                     "{label}: total must decompose"
                 );
-                um_assert_event_keeps_upstream_shape(&event, upstream, &label);
+                um_assert_event_keeps_upstream_shape(&event, &label);
             }
         }
     }
 
-    /// Same contract on the Responses surface, where the pre-fix bug was
+    /// Same contract on the Responses surface, where a pre-fix bug was
     /// louder still: `cached_tokens` could exceed `input_tokens`.
     #[tokio::test]
     async fn usage_matrix_responses_client_is_upstream_agnostic() {
         for streaming in [false, true] {
-            for upstream in [UmUpstream::OpenAiShape, UmUpstream::AnthropicShape] {
-                let label = format!("responses/{upstream:?}/stream={streaming}");
-                let (usage, event) = um_call(UmClient::Responses, upstream, streaming).await;
+            {
+                let label = format!("responses/stream={streaming}");
+                let (usage, event) = um_call(UmClient::Responses, streaming).await;
                 assert_eq!(usage["input_tokens"], UM_TOTAL_IN, "{label}: input_tokens");
                 assert_eq!(usage["output_tokens"], UM_OUT, "{label}: output_tokens");
                 assert_eq!(usage["total_tokens"], UM_TOTAL, "{label}: total");
@@ -13159,7 +12636,7 @@ event: message_stop\ndata: {}\n\n",
                         <= usage["input_tokens"].as_u64().unwrap(),
                     "{label}: cached_tokens must stay a subset of input_tokens"
                 );
-                um_assert_event_keeps_upstream_shape(&event, upstream, &label);
+                um_assert_event_keeps_upstream_shape(&event, &label);
             }
         }
     }

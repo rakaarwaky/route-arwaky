@@ -805,7 +805,7 @@ mod tests {
     fn gateway_error_message_carries_every_failures_text() {
         let semantic = ProxyError::SemanticDecisionFailed {
             router: "router-a".into(),
-            reason: crate::semantic::DecisionFailure::EmbeddingTimeout,
+            reason: crate::semantic::DecisionFailure::Timeout,
         };
         assert_eq!(
             gateway_error_message(&semantic),

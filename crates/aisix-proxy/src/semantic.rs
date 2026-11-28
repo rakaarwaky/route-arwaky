@@ -82,21 +82,21 @@ pub(crate) fn decide(
 /// access log. Free text about the failure goes only to the warn line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecisionFailure {
-    EmbeddingTimeout,
+    Timeout,
     /// The embedding upstream answered an error, or the call failed in
     /// transport or decoding.
-    EmbeddingUpstream,
+    Upstream,
     /// The embedding model is missing, misconfigured, or returned vectors
     /// that do not fit it.
-    EmbeddingUnavailable,
+    Unavailable,
 }
 
 impl DecisionFailure {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::EmbeddingTimeout => "embedding_timeout",
-            Self::EmbeddingUpstream => "embedding_upstream",
-            Self::EmbeddingUnavailable => "embedding_unavailable",
+            Self::Timeout => "embedding_timeout",
+            Self::Upstream => "embedding_upstream",
+            Self::Unavailable => "embedding_unavailable",
         }
     }
 
@@ -104,7 +104,7 @@ impl DecisionFailure {
         use aisix_gateway::BridgeError;
         match err {
             EmbedTextsError::Dispatch(ProxyError::Bridge(BridgeError::Timeout { .. })) => {
-                Self::EmbeddingTimeout
+                Self::Timeout
             }
             EmbedTextsError::Dispatch(ProxyError::Bridge(
                 BridgeError::UpstreamStatus { .. }
@@ -114,9 +114,9 @@ impl DecisionFailure {
                 | BridgeError::TokenExchangeDecode(_)
                 | BridgeError::Transport(_)
                 | BridgeError::StreamAborted,
-            )) => Self::EmbeddingUpstream,
+            )) => Self::Upstream,
             EmbedTextsError::Dispatch(_) | EmbedTextsError::UnusableResponse(_) => {
-                Self::EmbeddingUnavailable
+                Self::Unavailable
             }
         }
     }
@@ -505,8 +505,8 @@ impl InjectedBlocks {
 /// Empty when no turn has any.
 ///
 /// `user_turns` yields each user turn's text parts, newest turn first. The
-/// per-protocol readers ([`chat_prompt`], [`anthropic_prompt`],
-/// [`responses_prompt`]) decide what a user turn and a text part are.
+/// per-protocol readers ([`chat_prompt`], [`responses_prompt`]) decide
+/// what a user turn and a text part are.
 pub(crate) fn classification_text<'a, T, P>(user_turns: T, blocks: InjectedBlocks) -> String
 where
     T: IntoIterator<Item = P>,
@@ -585,25 +585,6 @@ pub(crate) fn chat_prompt(req: &aisix_gateway::ChatFormat, blocks: InjectedBlock
                     (None, None) => Vec::new(),
                 }
             }),
-        blocks,
-    )
-}
-
-/// [`classification_text`] of an Anthropic Messages body: its `user`
-/// messages, their string content or their `text` blocks (a `tool_result`
-/// block is not text). The top-level `system` is never classified.
-pub(crate) fn anthropic_prompt(body: &serde_json::Value, blocks: InjectedBlocks) -> String {
-    let messages = body
-        .get("messages")
-        .and_then(serde_json::Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    classification_text(
-        messages
-            .iter()
-            .rev()
-            .filter(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("user"))
-            .map(|m| content_text_parts(m.get("content"), "text")),
         blocks,
     )
 }
@@ -688,7 +669,7 @@ async fn decide_by_embedding(
                 "semantic router references a missing or non-embedding embedding_model; \
                  applying on_embedding_failure",
             );
-            return Err(DecisionFailure::EmbeddingUnavailable);
+            return Err(DecisionFailure::Unavailable);
         }
     };
     let dims = embed_entry
@@ -816,6 +797,34 @@ fn fallback(
             reason: failure,
         }),
     }
+}
+
+/// A route, default or failure target, resolved: a model group is
+/// dispatched through its own members, anything else as the one attempt.
+enum Candidate {
+    Direct(Arc<ResourceEntry<Model>>),
+    Group(Arc<ResourceEntry<Model>>),
+}
+
+impl Candidate {
+    fn model(&self) -> &Model {
+        match self {
+            Self::Direct(entry) | Self::Group(entry) => &entry.value,
+        }
+    }
+}
+
+fn candidate_for_target(snapshot: &AisixSnapshot, alias: &str) -> Result<Candidate, ProxyError> {
+    let entry = snapshot.models.get_by_name(alias).ok_or_else(|| {
+        ProxyError::InvalidRequest(format!(
+            "semantic router target {alias:?} does not resolve to a known model",
+        ))
+    })?;
+    Ok(if entry.value.is_routing() {
+        Candidate::Group(entry)
+    } else {
+        Candidate::Direct(entry)
+    })
 }
 
 /// The target [`select_eligible`] picked.
@@ -1693,18 +1702,14 @@ mod tests {
 
     #[test]
     fn each_protocol_reads_its_user_turns() {
-        let messages = serde_json::json!({
-            "system": "system text is never classified",
-            "messages": [
-                {"role": "user", "content": "the real ask"},
-                {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "x", "input": {}}]},
-                {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "t", "content": "tool output"},
-                    {"type": "text", "text": "<system-reminder>r</system-reminder>"}
-                ]}
-            ]
-        });
-        assert_eq!(anthropic_prompt(&messages, GENERIC), "the real ask");
+        let chat = aisix_gateway::ChatFormat::new(
+            "m",
+            vec![
+                aisix_gateway::ChatMessage::system("system text is never classified"),
+                aisix_gateway::ChatMessage::user("the real ask"),
+            ],
+        );
+        assert_eq!(chat_prompt(&chat, GENERIC), "the real ask");
 
         let responses = serde_json::json!({
             "instructions": "never classified",

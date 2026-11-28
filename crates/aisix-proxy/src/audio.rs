@@ -1421,24 +1421,7 @@ async fn multipart_dispatch(
                 let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
                 let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
 
-                let azure = crate::dispatch::is_azure_key(&pk_entry.value);
-                let (url, auth) = if azure {
-                    let operation = if upstream_path == "/audio/translations" {
-                        aisix_provider_azure_openai::AzureOperation::AudioTranslations
-                    } else {
-                        aisix_provider_azure_openai::AzureOperation::AudioTranscriptions
-                    };
-                    crate::dispatch::azure_upstream(&pk_entry, &upstream_model, operation)
-                        .await
-                        .map_err(|e| {
-                            ProxyError::Bridge(crate::cooldown::note_failure(
-                                &state.runtime_status,
-                                &target.id,
-                                model.cooldown.as_ref(),
-                                e,
-                            ))
-                        })?
-                } else {
+                let (url, auth) = {
                     // Cache key must be `'static`; both callers pass fixed literals.
                     let url_cache_key: &'static str = if upstream_path == "/audio/translations" {
                         "proxy/audio/translations"
@@ -1596,7 +1579,7 @@ async fn multipart_dispatch(
                                 aisix_gateway::upstream_error_within(
                                     connect_deadline,
                                     resp,
-                                    |resp| crate::dispatch::held_route_http_error(azure, resp),
+                                    crate::dispatch::held_route_http_error,
                                 )
                                 .await,
                             ));
@@ -2313,23 +2296,7 @@ async fn speech_dispatch(
                 crate::util::outbound_json(body)?
             };
 
-            let azure = crate::dispatch::is_azure_key(&pk_entry.value);
-            let (speech_url, auth) = if azure {
-                crate::dispatch::azure_upstream(
-                    &pk_entry,
-                    &upstream_model,
-                    aisix_provider_azure_openai::AzureOperation::AudioSpeech,
-                )
-                .await
-                .map_err(|e| {
-                    ProxyError::Bridge(crate::cooldown::note_failure(
-                        &state.runtime_status,
-                        &target.id,
-                        model.cooldown.as_ref(),
-                        e,
-                    ))
-                })?
-            } else {
+            let (speech_url, auth) = {
                 let speech_url = aisix_gateway::url_cache::cached_endpoint_url(
                     &pk_entry.id,
                     "proxy/audio/speech",
@@ -2426,7 +2393,7 @@ async fn speech_dispatch(
                             model_id,
                             cooldown_cfg,
                             aisix_gateway::upstream_error_within(stream_budget, resp, |resp| {
-                                crate::dispatch::held_route_http_error(azure, resp)
+                                crate::dispatch::held_route_http_error(resp)
                             })
                             .await,
                         ));

@@ -1105,19 +1105,19 @@ mod tests {
 
     #[test]
     fn provider_key_azure_resource_payload_loads_partially_compatible() {
-        // Same decision as aws_region: the Azure bridge derives the
-        // resource name from `api_base`, so `azure_resource_name` is not
-        // consumed — YELLOW load, field reported. `api_version` is a
-        // Provider Key field and is not reported.
+        // Same decision as aws_region: no bridge is registered for the
+        // `azure` provider string any more, so `azure_resource_name` is
+        // not consumed — YELLOW load, field reported. A field the struct
+        // still declares (`api_base`) is not reported.
         let entries = vec![raw(
             "/aisix/provider_keys/pk-azure",
-            br#"{"display_name":"azure-pk","api_key":"x","provider":"azure","azure_resource_name":"my-azure","api_version":"2024-02-01"}"#,
+            br#"{"display_name":"azure-pk","api_key":"x","api_base":"https://azure.example","provider":"azure","azure_resource_name":"my-azure"}"#,
             1,
         )];
         let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
         let pk = snap.provider_keys.get_by_id("pk-azure").unwrap();
-        assert_eq!(pk.value.api_version.as_deref(), Some("2024-02-01"));
+        assert_eq!(pk.value.api_base.as_deref(), Some("https://azure.example"));
         assert_eq!(
             stats.partially_compatible,
             vec![PartialCompatEntry {

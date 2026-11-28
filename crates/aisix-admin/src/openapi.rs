@@ -26,7 +26,7 @@ use std::sync::OnceLock;
 
 use axum::http::header;
 use axum::response::{Html, IntoResponse, Response};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 
 /// Paths + OpenAPI-specific wrapper schemas (`ModelEntry`,
 /// `PublicApiKeyEntry`, `ModelStatusView`, `AdminError`, etc.).

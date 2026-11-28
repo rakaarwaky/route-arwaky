@@ -25,8 +25,7 @@ use aisix_core::{AisixSnapshot, ApiSurface, Model, ProviderKey};
 use aisix_gateway::{Bridge, BridgeError, Hub};
 
 /// Map a `reqwest` transport error from a raw-passthrough dispatch
-/// (`/v1/responses`, `/v1/messages` Anthropic, `/v1/messages/count_tokens`)
-/// into the gateway's [`BridgeError`]. A timed-out request becomes
+/// (`/v1/responses`) into the gateway's [`BridgeError`]. A timed-out request becomes
 /// [`BridgeError::Timeout`] so it surfaces as 504, classifies as `"timeout"`
 /// in telemetry, and participates in routing failover exactly like the
 /// Bridge-trait path (#554). Everything else stays a transport error.
@@ -146,104 +145,6 @@ pub(crate) fn check_ip_access(model: &Model, source_ip: &str) -> Result<(), Prox
     Err(ProxyError::ModelIpRestricted(model.display_name.clone()))
 }
 
-/// Whether this Model's upstream speaks the Anthropic wire protocol, i.e.
-/// whether `/v1/messages` and `/v1/messages/count_tokens` may forward the
-/// caller's Anthropic-native body verbatim instead of round-tripping it
-/// through the cross-provider bridge.
-///
-/// Keyed on the ProviderKey's `adapter`, not on the vendor id:
-/// `provider: "byo"` + `adapter: anthropic` is the documented way to front a
-/// self-hosted or proxied Anthropic endpoint, and such an upstream serves
-/// both routes exactly like the catalog vendor does. Gating on the vendor id
-/// alone made `/v1/messages` bridge a body that needed no translation (which
-/// drops caller-owned fields such as `cache_control`) and made
-/// `/v1/messages/count_tokens` reject the model outright.
-///
-/// `model.provider` is still honoured so a ProviderKey written without an
-/// adapter — cp-api's AdapterMap-absent degenerate boot — keeps dispatching
-/// as before. A dangling `provider_key_id` likewise falls back to the vendor
-/// id, leaving the dispatch path (not this gate) to report it.
-pub(crate) fn speaks_anthropic(snapshot: &AisixSnapshot, model: &Model) -> bool {
-    serves_natively(snapshot, model, ApiSurface::Messages)
-}
-
-/// The platform bridge that serves `/v1/messages` (and its
-/// `count_tokens` sub-route) for this target on the platform's own Claude
-/// Messages routes — Claude on Amazon Bedrock or on Vertex AI. The caller's
-/// Anthropic body is then forwarded nearly as it is and answered in the
-/// same wire, rather than translated through the chat form; the other
-/// endpoints keep translating, since the platform routes speak only the
-/// Anthropic Messages wire. `None` for every other target.
-pub(crate) fn anthropic_platform_bridge(
-    hub: &Hub,
-    snapshot: &AisixSnapshot,
-    model: &Model,
-) -> Option<Arc<dyn Bridge>> {
-    let pk = snapshot
-        .provider_keys
-        .get_by_id(model.provider_key_id.as_deref()?)?;
-    if !matches!(
-        pk.value.adapter,
-        Some(aisix_core::Adapter::Bedrock) | Some(aisix_core::Adapter::Vertex)
-    ) {
-        return None;
-    }
-    let bridge = resolve_bridge(hub, &pk.value)?;
-    bridge
-        .serves_anthropic_messages(model.model_name.as_deref()?)
-        .then_some(bridge)
-}
-
-/// Whether this Model's upstream is Anthropic's **own** API, as opposed
-/// to any of the other upstreams that merely speak the same wire
-/// protocol.
-///
-/// [`speaks_anthropic`] answers "may this body be forwarded verbatim",
-/// which is true for `provider: "byo"` + `adapter: anthropic` and for any
-/// vendor declaring [`ProviderKey::apis`]`.messages` as well. This answers
-/// the narrower question "is the request being billed and served by
-/// Anthropic", which is what decides whether Anthropic-only request
-/// metadata is meaningful at the other end. It is deliberately keyed on
-/// the catalog vendor id rather than on `api_base`, so a first-party key
-/// pointed at a regional or proxied Anthropic endpoint still counts.
-///
-/// `serves_natively` is the second half rather than a redundant one: a
-/// hand-written resources file can put `provider: "anthropic"` in front of
-/// a platform-adapter key, and such a request is translated onto Bedrock's
-/// or Vertex's own route, where Anthropic's metadata means no more than it
-/// does to any other foreign upstream.
-pub(crate) fn is_first_party_anthropic(snapshot: &AisixSnapshot, model: &Model) -> bool {
-    model.provider.as_deref() == Some("anthropic") && speaks_anthropic(snapshot, model)
-}
-
-/// Whether this Model's upstream serves `surface` natively — i.e. whether
-/// the caller's body may be forwarded verbatim instead of being translated
-/// through a provider bridge.
-///
-/// The two surfaces answer differently, because the evidence for them
-/// differs. `/v1/messages` is served by any key that speaks the Anthropic
-/// wire by declaration — the `anthropic` vendor id, or `provider: "byo"` +
-/// `adapter: anthropic`, which is the documented way to front a
-/// self-hosted or proxied Anthropic endpoint — and additionally by any key
-/// that names the route in [`ProviderKey::apis`], which is how one
-/// credential reaches a vendor's OpenAI path and its Anthropic path both.
-///
-/// `/v1/responses` has no such declaration to lean on: the Responses API
-/// is a strict superset of chat completions rather than a rename, so
-/// `adapter: openai` says nothing about whether the route exists. Absent
-/// an `apis` map the gateway falls back to the vendor id — only OpenAI
-/// itself is assumed to serve it — and once the map exists it is the
-/// answer, so an operator whose OpenAI-compatible endpoint has no
-/// `/v1/responses` gets the request translated rather than 404'd upstream.
-pub(crate) fn serves_natively(
-    snapshot: &AisixSnapshot,
-    model: &Model,
-    surface: ApiSurface,
-) -> bool {
-    let pk = resolve_provider_key(snapshot, model).ok();
-    serves_natively_with(model, pk.as_ref().map(|e| &e.value), surface)
-}
-
 /// [`serves_natively`] over an already-resolved key, with no attribution
 /// side effect — for readers that run after dispatch, such as the span
 /// encoder's upstream lookup.
@@ -269,22 +170,8 @@ pub(crate) fn serves_natively_with(
     // error here rather than silently inheriting the verbatim path,
     // which is how a platform credential would end up on a route that
     // does not exist.
-    let platform = pk.is_some_and(|p| match p.adapter {
-        Some(aisix_core::Adapter::Bedrock)
-        | Some(aisix_core::Adapter::Vertex)
-        | Some(aisix_core::Adapter::AzureOpenai) => true,
-        Some(aisix_core::Adapter::Openai) | Some(aisix_core::Adapter::Anthropic) | None => false,
-    });
-    if platform {
-        return false;
-    }
     let declared = pk.and_then(|p| p.apis.as_ref());
     match surface {
-        ApiSurface::Messages => {
-            model.provider.as_deref() == Some("anthropic")
-                || pk.is_some_and(|p| p.adapter == Some(aisix_core::Adapter::Anthropic))
-                || declared.is_some_and(|apis| apis.messages.is_some())
-        }
         ApiSurface::Responses => match declared {
             Some(apis) => apis.responses.is_some(),
             None => model.provider.as_deref() == Some("openai"),
@@ -330,59 +217,10 @@ pub(crate) fn responses_served_natively_with(
         && (reads_additional_tools || !declares_additional_tools)
 }
 
-/// Whether a direct-upstream route (audio, image edits) dispatches this key
-/// on the Azure OpenAI routes rather than the OpenAI ones.
-pub(crate) fn is_azure_key(provider_key: &ProviderKey) -> bool {
-    provider_key.adapter == Some(aisix_core::Adapter::AzureOpenai)
-}
-
-/// [`is_azure_key`] for the key `model` references, read without
-/// [`resolve_provider_key`]'s target attribution — for a gate that may
-/// still refuse the target.
-pub(crate) fn references_azure_key(snapshot: &AisixSnapshot, model: &Model) -> bool {
-    model
-        .provider_key_id
-        .as_deref()
-        .and_then(|id| snapshot.provider_keys.get_by_id(id))
-        .is_some_and(|entry| is_azure_key(&entry.value))
-}
-
-/// The URL and auth header a direct-upstream route sends `operation` to on
-/// an Azure key: the shared Azure builder's URL, and the key's secret as
-/// `api-key` (or a minted Entra ID token as a bearer), never as a bearer
-/// API key. The error is the bridge's, for the caller to count against the
-/// target's cooldown as the bridge paths do.
-pub(crate) async fn azure_upstream(
-    pk_entry: &ResourceEntry<ProviderKey>,
-    deployment: &str,
-    operation: aisix_provider_azure_openai::AzureOperation,
-) -> Result<
-    (
-        aisix_gateway::url_cache::EndpointUrl,
-        (axum::http::HeaderName, axum::http::HeaderValue),
-    ),
-    BridgeError,
-> {
-    let url = aisix_provider_azure_openai::endpoint_url(
-        &pk_entry.id,
-        &pk_entry.value,
-        deployment,
-        operation,
-    )?;
-    let credential =
-        aisix_provider_azure_openai::resolve_credential(&pk_entry.value.api_key).await?;
-    let auth = aisix_provider_azure_openai::auth_header(&credential)?;
-    Ok((url, auth))
-}
-
 /// The error of a non-2xx answer on a direct-upstream route, parsed by the
 /// wire the key speaks.
-pub(crate) async fn held_route_http_error(azure: bool, resp: reqwest::Response) -> BridgeError {
-    if azure {
-        aisix_provider_azure_openai::held_route_http_error(resp).await
-    } else {
-        aisix_provider_openai::held_route_http_error(resp).await
-    }
+pub(crate) async fn held_route_http_error(resp: reqwest::Response) -> BridgeError {
+    aisix_provider_openai::held_route_http_error(resp).await
 }
 
 /// Required upstream model id (`model_name`) for a non-routing Model.
@@ -414,11 +252,6 @@ const API_BASE_ENDPOINT_SUFFIXES: &[&str] = &[
     "/completions",
     "/embeddings",
     "/responses",
-    // Longest first: `/messages` would otherwise never match a pasted
-    // count_tokens URL, and stripping it from the middle is not what a
-    // suffix scan does.
-    "/messages/count_tokens",
-    "/messages",
     "/rerank",
 ];
 
@@ -456,16 +289,9 @@ pub(crate) fn dashscope_native_root(base: &str) -> &str {
 /// [`aisix_provider_openai::OPENAI_DEFAULT_BASE`] exactly when
 /// [`falls_back_to_openai_default`] says so, which is the same set of
 /// keys the OpenAI bridge sends there on chat — so every route treats a
-/// key the way chat does. Every other key keeps requiring `api_base`:
-/// this resolver also serves the Anthropic-wire routes (messages /
-/// count_tokens) and must never send another vendor's credential to
-/// api.openai.com, and the DP does not enumerate per-vendor default
-/// URLs; the Anthropic default for the Anthropic-wire routes is applied
-/// one level up, in [`resolve_base_url_for`]. A key misdeclared as
-/// `provider: "openai"` on an
-/// anthropic-adapter path dispatches to api.openai.com and gets the
-/// upstream's 401 instead of a gateway 400 — by declaration that secret
-/// is an OpenAI credential, so nothing crosses vendors.
+/// key the way chat does. Every other key keeps requiring `api_base`,
+/// so no other vendor's credential ever reaches api.openai.com: the DP
+/// does not enumerate per-vendor default URLs.
 ///
 /// Callers that cache the built URL take their fingerprint from
 /// [`pk_url_fingerprint`], which carries every input this resolver
@@ -500,9 +326,9 @@ pub(crate) fn resolve_base_url(provider_key: &ProviderKey) -> Result<String, Pro
 
 /// The base URL a request on `surface` (or on the key's default route, for
 /// `None`) is sent to, resolved like [`resolve_base_url_for`] /
-/// [`resolve_base_url`] — including the built-in OpenAI and Anthropic
-/// defaults — but without logging: a key that has no base is a
-/// configuration error the dispatch path already reported. `None` there.
+/// [`resolve_base_url`] — including the built-in OpenAI default — but
+/// without logging: a key that has no base is a configuration error the
+/// dispatch path already reported. `None` there.
 pub(crate) fn configured_base_url(
     provider_key: &ProviderKey,
     surface: Option<ApiSurface>,
@@ -512,13 +338,8 @@ pub(crate) fn configured_base_url(
     }
     match provider_key.api_base.as_deref() {
         Some(b) if !b.trim().is_empty() => Some(strip_endpoint_suffix(b.trim()).to_string()),
-        _ if surface != Some(ApiSurface::Messages)
-            && falls_back_to_openai_default(provider_key) =>
-        {
+        _ if falls_back_to_openai_default(provider_key) => {
             Some(aisix_provider_openai::OPENAI_DEFAULT_BASE.to_string())
-        }
-        _ if falls_back_to_anthropic_default(provider_key) => {
-            Some(aisix_provider_anthropic::ANTHROPIC_DEFAULT_BASE.to_string())
         }
         _ => None,
     }
@@ -533,11 +354,7 @@ pub(crate) fn configured_base_url(
 /// actually hands that bridge. The bridge falls back for an empty or
 /// `openai` vendor; a `provider: "openai"` key reaches it as the
 /// specialized bridge, and an empty-vendor key only through its
-/// `adapter: openai` family registration. The adapter check is what the
-/// bridge gets for free from dispatch and this resolver has to state:
-/// without it, an empty-vendor `adapter: anthropic` row reaching the
-/// messages passthrough would send its credential to api.openai.com.
-/// Change the two together.
+/// `adapter: openai` family registration. Change the two together.
 fn falls_back_to_openai_default(provider_key: &ProviderKey) -> bool {
     let vendor = provider_key.provider.trim();
     vendor.eq_ignore_ascii_case("openai")
@@ -662,50 +479,16 @@ pub(crate) fn pk_url_fingerprint(provider_key: &ProviderKey) -> [&str; 3] {
 }
 
 /// The base URL for one API surface: the `apis` entry's own `base` when
-/// the Provider Key declares one, else [`resolve_base_url`] — except
-/// that on `Messages` a key [`falls_back_to_anthropic_default`] names,
-/// with no `api_base`, gets the Anthropic default base: this is the
-/// Anthropic wire, so the wire-agnostic resolver's OpenAI default does
-/// not apply to it.
-///
-/// This is what lets a single upstream account serve two protocols from
-/// two paths — `…/v1` for the OpenAI wire and `…/anthropic` for the
-/// Anthropic one — under one credential. Surfaces the `apis` map does not
-/// cover keep resolving through `api_base` alone.
+/// the Provider Key declares one, else [`resolve_base_url`]. Surfaces the
+/// `apis` map does not cover keep resolving through `api_base` alone.
 pub(crate) fn resolve_base_url_for(
     provider_key: &ProviderKey,
     surface: ApiSurface,
 ) -> Result<String, ProxyError> {
     match surface_base(provider_key, surface) {
         Some(base) => Ok(strip_endpoint_suffix(base.trim()).to_string()),
-        None if surface == ApiSurface::Messages
-            && provider_key
-                .api_base
-                .as_deref()
-                .is_none_or(|b| b.trim().is_empty())
-            && falls_back_to_anthropic_default(provider_key) =>
-        {
-            Ok(aisix_provider_anthropic::ANTHROPIC_DEFAULT_BASE.to_string())
-        }
         None => resolve_base_url(provider_key),
     }
-}
-
-/// Whether a key with no `api_base` reaches the built-in Anthropic base
-/// on the Anthropic-wire routes: the `anthropic` vendor, or the legacy
-/// empty-vendor row on the `anthropic` adapter.
-///
-/// The Anthropic counterpart of [`falls_back_to_openai_default`], and
-/// for the same reason: it is `AnthropicBridge`'s own fallback
-/// (`resolve_base` in `aisix-provider-anthropic`, which falls back for
-/// an empty or `anthropic` vendor) restricted to the keys two-tier
-/// dispatch hands that bridge — the `anthropic` vendor through its
-/// specialized registration, an empty vendor only through the
-/// `adapter: anthropic` family one. Change the two together.
-fn falls_back_to_anthropic_default(provider_key: &ProviderKey) -> bool {
-    let vendor = provider_key.provider.trim();
-    vendor.eq_ignore_ascii_case("anthropic")
-        || (vendor.is_empty() && provider_key.adapter == Some(aisix_core::Adapter::Anthropic))
 }
 
 /// The raw per-surface `base` override, if this key declares a non-empty
@@ -736,27 +519,6 @@ pub(crate) fn pk_surface_url_fingerprint(
         vendor,
         adapter,
     ]
-}
-
-/// Join an Anthropic upstream base with a version-independent endpoint
-/// path (`/messages`, `/messages/count_tokens`).
-///
-/// Anthropic's convention is the mirror image of the OpenAI family's:
-/// the documented `api_base` is the bare host and the `/v1` belongs to
-/// the endpoint (`POST {base}/v1/messages`). So `/v1` is synthesized for
-/// every base, including one that carries a path — a self-hosted
-/// Anthropic-compatible gateway mounted at `…/anthropic` serves
-/// `…/anthropic/v1/messages`. A base that already ends in `/v1` is an
-/// operator importing the OpenAI habit; collapse it so it can't double.
-/// Mirrors `AnthropicBridge::normalize_api_base`.
-pub(crate) fn build_anthropic_url(base: &str, path: &str) -> String {
-    assert!(
-        path.starts_with('/'),
-        "build_anthropic_url path must start with /, got {path:?}",
-    );
-    let trimmed = base.trim_end_matches('/');
-    let root = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
-    format!("{root}/v1{path}")
 }
 
 /// The upstream API key — `provider_key.api_key`. Empty string is
@@ -1040,33 +802,6 @@ mod tests {
         .unwrap()
     }
 
-    /// No `apis` map — every surface resolves exactly as it did before the
-    /// field existed. This is the guard that stored configuration keeps its
-    /// behavior: the vendor id decides `/v1/responses`, the vendor id or
-    /// the anthropic adapter decides `/v1/messages`.
-    #[test]
-    fn without_apis_the_vendor_inference_is_unchanged() {
-        let snap = snapshot_with_pk_json(
-            "pk-1",
-            r#"{"display_name":"o","api_key":"k","api_base":"https://up/v1","provider":"openai","adapter":"openai"}"#,
-        );
-        let m = model_on("openai", "pk-1");
-        assert!(serves_natively(&snap, &m, ApiSurface::Responses));
-        assert!(!serves_natively(&snap, &m, ApiSurface::Messages));
-
-        let snap = snapshot_with_pk_json(
-            "pk-2",
-            r#"{"display_name":"a","api_key":"k","api_base":"https://up","provider":"byo","adapter":"anthropic"}"#,
-        );
-        let m = model_on("byo", "pk-2");
-        assert!(serves_natively(&snap, &m, ApiSurface::Messages));
-        assert!(!serves_natively(&snap, &m, ApiSurface::Responses));
-    }
-
-    /// A request declaring tools in `additional_tools` input items keeps a
-    /// declared native Responses surface only on `openai`, `azure`, `byo`
-    /// and unset providers; every other vendor is bridged. Without such
-    /// items every key keeps its native surface.
     #[test]
     fn additional_tools_bridge_every_provider_but_openai_azure_and_byo() {
         for (provider, native_with_tools) in [
@@ -1105,8 +840,9 @@ mod tests {
             r#"{"display_name":"o","api_key":"k","api_base":"https://vllm.internal/v1","provider":"openai","adapter":"openai","apis":{}}"#,
         );
         let m = model_on("openai", "pk-1");
+        let pk = resolve_provider_key(&snap, &m).ok();
         assert!(
-            !serves_natively(&snap, &m, ApiSurface::Responses),
+            !serves_natively_with(&m, pk.as_ref().map(|e| &e.value), ApiSurface::Responses),
             "an apis map that omits responses is the operator saying the route is absent",
         );
     }
@@ -1121,137 +857,12 @@ mod tests {
             r#"{"display_name":"o","api_key":"k","api_base":"https://vllm.internal/v1","provider":"byo","adapter":"openai","apis":{"responses":{}}}"#,
         );
         let m = model_on("byo", "pk-1");
-        assert!(serves_natively(&snap, &m, ApiSurface::Responses));
-    }
-
-    /// The DeepSeek/Zhipu shape: one credential, an OpenAI-compatible path
-    /// and an Anthropic-compatible one. Declaring `messages` adds the
-    /// native Anthropic route to a key whose adapter is `openai`, so
-    /// `/v1/messages` stops being translated (which is what drops
-    /// `cache_control` and thinking blocks).
-    #[test]
-    fn apis_adds_a_native_anthropic_route_to_an_openai_key() {
-        let snap = snapshot_with_pk_json(
-            "pk-1",
-            r#"{"display_name":"ds","api_key":"k","api_base":"https://api.deepseek.com/v1","provider":"deepseek","adapter":"openai",
-                "apis":{"messages":{"base":"https://api.deepseek.com/anthropic"}}}"#,
-        );
-        let m = model_on("deepseek", "pk-1");
-        assert!(serves_natively(&snap, &m, ApiSurface::Messages));
-        // …and it does not accidentally imply the Responses route.
-        assert!(!serves_natively(&snap, &m, ApiSurface::Responses));
-    }
-
-    /// An anthropic-adapter key keeps serving `/v1/messages` at `api_base`
-    /// whatever else `apis` lists — that is what the adapter declares, and
-    /// an unrelated entry must not turn it off.
-    #[test]
-    fn an_anthropic_adapter_keeps_its_own_surface_when_apis_lists_others() {
-        let snap = snapshot_with_pk_json(
-            "pk-1",
-            r#"{"display_name":"a","api_key":"k","api_base":"https://up","provider":"byo","adapter":"anthropic","apis":{"responses":{}}}"#,
-        );
-        let m = model_on("byo", "pk-1");
-        assert!(serves_natively(&snap, &m, ApiSurface::Messages));
-    }
-
-    /// The first-party gate is narrower than the protocol gate, and every
-    /// upstream that only *speaks* Anthropic falls on the other side of it.
-    #[test]
-    fn only_the_catalog_anthropic_vendor_is_first_party() {
-        // The catalog vendor, even pointed at a proxied endpoint.
-        let snap = snapshot_with_pk_json(
-            "pk-1",
-            r#"{"display_name":"a","api_key":"k","api_base":"https://anthropic.corp-proxy/","provider":"anthropic","adapter":"anthropic"}"#,
-        );
-        let m = model_on("anthropic", "pk-1");
-        assert!(is_first_party_anthropic(&snap, &m));
-
-        // byo + anthropic adapter: speaks the protocol, is not Anthropic.
-        let snap = snapshot_with_pk_json(
-            "pk-1",
-            r#"{"display_name":"a","api_key":"k","api_base":"https://up","provider":"byo","adapter":"anthropic"}"#,
-        );
-        let m = model_on("byo", "pk-1");
-        assert!(speaks_anthropic(&snap, &m));
-        assert!(!is_first_party_anthropic(&snap, &m));
-
-        // A vendor declaring `apis.messages`: same answer.
-        let snap = snapshot_with_pk_json(
-            "pk-1",
-            r#"{"display_name":"ds","api_key":"k","api_base":"https://api.deepseek.com/v1","provider":"deepseek","adapter":"openai",
-                "apis":{"messages":{"base":"https://api.deepseek.com/anthropic"}}}"#,
-        );
-        let m = model_on("deepseek", "pk-1");
-        assert!(speaks_anthropic(&snap, &m));
-        assert!(!is_first_party_anthropic(&snap, &m));
-
-        // An OpenAI-compatible upstream reached through the bridge.
-        let snap = snapshot_with_pk_json(
-            "pk-1",
-            r#"{"display_name":"o","api_key":"k","api_base":"https://up/v1","provider":"openai","adapter":"openai"}"#,
-        );
-        let m = model_on("openai", "pk-1");
-        assert!(!is_first_party_anthropic(&snap, &m));
-
-        // A hand-written file can name the anthropic vendor in front of a
-        // platform key. That request is translated onto Bedrock's own
-        // route, so it is not first-party either.
-        let snap = snapshot_with_pk_json(
-            "pk-1",
-            r#"{"display_name":"b","api_key":"{}","api_base":"https://up","provider":"anthropic","adapter":"bedrock"}"#,
-        );
-        let m = model_on("anthropic", "pk-1");
-        assert!(!is_first_party_anthropic(&snap, &m));
-    }
-
-    /// A platform adapter never takes a native path, declaration or not:
-    /// its own routes are not these paths, and its credential is a JSON
-    /// tuple the verbatim dispatch would send as a bearer token.
-    #[test]
-    fn a_platform_adapter_never_serves_a_declared_surface() {
-        for adapter in ["bedrock", "vertex", "azure-openai"] {
-            let snap = snapshot_with_pk_json(
-                "pk-1",
-                &format!(
-                    r#"{{"display_name":"p","api_key":"{{}}","api_base":"https://up","provider":"byo","adapter":"{adapter}","apis":{{"responses":{{}},"messages":{{}}}}}}"#
-                ),
-            );
-            let m = model_on("byo", "pk-1");
-            for surface in [ApiSurface::Responses, ApiSurface::Messages] {
-                assert!(
-                    !serves_natively(&snap, &m, surface),
-                    "{adapter} must not dispatch {surface:?} natively"
-                );
-            }
-        }
-    }
-
-    /// The platform guard has to cover the fallback too. cp-api pairs an
-    /// adapter with a vendor id from its own catalog, but a hand-written
-    /// resources file can name a vendor the vendor-id inference treats as
-    /// native in front of a platform key — and that path would send a
-    /// JSON credential tuple as a bearer token to a route that does not
-    /// exist.
-    #[test]
-    fn a_platform_adapter_is_not_rescued_by_the_vendor_fallback() {
-        for (adapter, vendor, surface) in [
-            ("azure-openai", "openai", ApiSurface::Responses),
-            ("bedrock", "openai", ApiSurface::Responses),
-            ("vertex", "anthropic", ApiSurface::Messages),
-        ] {
-            let snap = snapshot_with_pk_json(
-                "pk-1",
-                &format!(
-                    r#"{{"display_name":"p","api_key":"{{}}","api_base":"https://up","provider":"{vendor}","adapter":"{adapter}"}}"#
-                ),
-            );
-            let m = model_on(vendor, "pk-1");
-            assert!(
-                !serves_natively(&snap, &m, surface),
-                "{adapter} + vendor {vendor} must not reach a verbatim path",
-            );
-        }
+        let pk = resolve_provider_key(&snap, &m).ok();
+        assert!(serves_natively_with(
+            &m,
+            pk.as_ref().map(|e| &e.value),
+            ApiSurface::Responses
+        ));
     }
 
     /// An empty `base` resolves as "no override" rather than building a
@@ -1261,11 +872,11 @@ mod tests {
     #[test]
     fn an_empty_surface_base_falls_back_to_api_base() {
         let pk: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"ds","api_key":"k","api_base":"https://api.deepseek.com/v1","provider":"deepseek","apis":{"messages":{"base":"   "}}}"#,
+            r#"{"display_name":"ds","api_key":"k","api_base":"https://api.deepseek.com/v1","provider":"deepseek","apis":{"responses":{"base":"   "}}}"#,
         )
         .unwrap();
         assert_eq!(
-            resolve_base_url_for(&pk, ApiSurface::Messages).unwrap(),
+            resolve_base_url_for(&pk, ApiSurface::Responses).unwrap(),
             "https://api.deepseek.com/v1",
         );
     }
@@ -1276,45 +887,37 @@ mod tests {
     #[test]
     fn surface_base_overrides_api_base_only_for_the_declared_surface() {
         let pk: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"ds","api_key":"k","api_base":"https://api.deepseek.com/v1","provider":"deepseek","adapter":"openai",
-                "apis":{"messages":{"base":"https://api.deepseek.com/anthropic/v1/messages"}}}"#,
+            r#"{"display_name":"o","api_key":"k","api_base":"https://api.openai.com/v1","provider":"openai","adapter":"openai",
+                "apis":{"responses":{"base":"https://responses.example.com/v1/responses"}}}"#,
         )
         .unwrap();
         assert_eq!(
-            resolve_base_url_for(&pk, ApiSurface::Messages).unwrap(),
-            "https://api.deepseek.com/anthropic/v1",
-            "a pasted full endpoint URL loses the endpoint, keeping the version segment \
+            resolve_base_url_for(&pk, ApiSurface::Responses).unwrap(),
+            "https://responses.example.com/v1",
+            "a pasted full endpoint URL loses the endpoint, keeping the version segment \\
              exactly as api_base does",
         );
         assert_eq!(
-            build_anthropic_url(
-                &resolve_base_url_for(&pk, ApiSurface::Messages).unwrap(),
-                "/messages"
+            build_openai_url(
+                &resolve_base_url_for(&pk, ApiSurface::Responses).unwrap(),
+                "/responses"
             ),
-            "https://api.deepseek.com/anthropic/v1/messages",
-        );
-        assert_eq!(
-            resolve_base_url_for(&pk, ApiSurface::Responses).unwrap(),
-            "https://api.deepseek.com/v1",
+            "https://responses.example.com/v1/responses",
         );
     }
-
-    /// The cached-URL fingerprint has to carry the per-surface override, or
-    /// editing an `apis` entry would keep serving the URL built from the
-    /// previous one.
     #[test]
     fn surface_fingerprint_changes_when_the_entry_changes() {
         let base: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"ds","api_key":"k","api_base":"https://api.deepseek.com/v1","provider":"deepseek","apis":{"messages":{"base":"https://a.example/anthropic"}}}"#,
+            r#"{"display_name":"o","api_key":"k","api_base":"https://api.openai.com/v1","provider":"openai","apis":{"responses":{"base":"https://a.example/v1"}}}"#,
         )
         .unwrap();
         let edited: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"ds","api_key":"k","api_base":"https://api.deepseek.com/v1","provider":"deepseek","apis":{"messages":{"base":"https://b.example/anthropic"}}}"#,
+            r#"{"display_name":"o","api_key":"k","api_base":"https://api.openai.com/v1","provider":"openai","apis":{"responses":{"base":"https://b.example/v1"}}}"#,
         )
         .unwrap();
         assert_ne!(
-            pk_surface_url_fingerprint(&base, ApiSurface::Messages),
-            pk_surface_url_fingerprint(&edited, ApiSurface::Messages),
+            pk_surface_url_fingerprint(&base, ApiSurface::Responses),
+            pk_surface_url_fingerprint(&edited, ApiSurface::Responses),
         );
         // A surface the map does not cover still fingerprints on api_base.
         assert_eq!(
@@ -1322,7 +925,6 @@ mod tests {
             pk_url_fingerprint(&base)[..],
         );
     }
-
     fn routing_model() -> Model {
         serde_json::from_str(
             r#"{
@@ -1446,105 +1048,6 @@ mod tests {
     /// shape on any other adapter keeps requiring `api_base`, so its
     /// credential never reaches api.openai.com through the messages
     /// passthrough or any other resolver-fed route.
-    #[test]
-    fn resolve_base_url_legacy_empty_vendor_other_adapter_still_errors() {
-        for adapter in aisix_core::Adapter::ALL
-            .into_iter()
-            .filter(|a| *a != aisix_core::Adapter::Openai)
-        {
-            let pk: ProviderKey = serde_json::from_str(&format!(
-                r#"{{"display_name":"x","api_key":"k","provider":"","adapter":"{}"}}"#,
-                adapter.wire_protocol()
-            ))
-            .unwrap();
-            assert!(
-                matches!(resolve_base_url(&pk), Err(ProxyError::InvalidRequest(_))),
-                "adapter {adapter:?} must not fall back to the OpenAI default base"
-            );
-        }
-    }
-
-    /// The adapter is a resolver input, so it is a fingerprint input: a
-    /// legacy row cached on the `openai` adapter (default base) must not
-    /// keep serving api.openai.com once it is edited to another adapter.
-    #[test]
-    fn cached_url_rebuilds_when_adapter_changes_without_api_base() {
-        let openai_pk: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"legacy","api_key":"k","provider":"","adapter":"openai"}"#,
-        )
-        .unwrap();
-        let anthropic_pk: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"legacy","api_key":"k2","provider":"","adapter":"anthropic"}"#,
-        )
-        .unwrap();
-        let resource_id = "test-1019-fingerprint-adapter";
-        for (surface_pk, expect_ok) in [(&openai_pk, true), (&anthropic_pk, false)] {
-            let url = aisix_gateway::url_cache::cached_endpoint_url(
-                resource_id,
-                "test/1019-fingerprint",
-                &pk_url_fingerprint(surface_pk),
-                || {
-                    let base = resolve_base_url(surface_pk)?;
-                    Ok::<_, ProxyError>(build_openai_url(&base, "/responses"))
-                },
-            );
-            assert_eq!(url.is_ok(), expect_ok, "adapter edit must rebuild the URL");
-        }
-    }
-
-    /// The Anthropic counterpart of #1019: a key the Anthropic bridge
-    /// sends to its default base on chat resolves to the same base on the
-    /// verbatim Anthropic-wire routes, and only on those.
-    #[test]
-    fn resolve_base_url_for_messages_falls_back_to_anthropic_default() {
-        for doc in [
-            r#"{"display_name":"x","api_key":"k","provider":"anthropic","adapter":"anthropic"}"#,
-            r#"{"display_name":"x","api_key":"k","provider":" Anthropic "}"#,
-            r#"{"display_name":"x","api_key":"k","provider":"","adapter":"anthropic","api_base":" "}"#,
-            r#"{"display_name":"x","api_key":"k","provider":"anthropic","apis":{"messages":{}}}"#,
-        ] {
-            let pk: ProviderKey = serde_json::from_str(doc).unwrap();
-            assert_eq!(
-                resolve_base_url_for(&pk, ApiSurface::Messages).unwrap(),
-                aisix_provider_anthropic::ANTHROPIC_DEFAULT_BASE,
-                "{doc}"
-            );
-            assert!(
-                resolve_base_url_for(&pk, ApiSurface::Responses).is_err(),
-                "the Anthropic default is not an OpenAI-wire base: {doc}"
-            );
-        }
-    }
-
-    /// Everything else keeps its existing answer on the Anthropic wire:
-    /// an OpenAI-compatible or unknown vendor still requires `api_base`,
-    /// an empty vendor on another adapter too, and a configured base wins.
-    #[test]
-    fn resolve_base_url_for_messages_keeps_non_anthropic_keys() {
-        for doc in [
-            r#"{"display_name":"x","api_key":"k","provider":"deepseek","adapter":"anthropic"}"#,
-            r#"{"display_name":"x","api_key":"k","provider":"","adapter":"bedrock"}"#,
-            r#"{"display_name":"x","api_key":"k","provider":""}"#,
-        ] {
-            let pk: ProviderKey = serde_json::from_str(doc).unwrap();
-            assert!(
-                resolve_base_url_for(&pk, ApiSurface::Messages).is_err(),
-                "{doc}"
-            );
-        }
-        let pk: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"x","api_key":"k","provider":"anthropic","api_base":"https://proxy.example.com/"}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            resolve_base_url_for(&pk, ApiSurface::Messages).unwrap(),
-            "https://proxy.example.com"
-        );
-    }
-
-    /// The vendor match is trim + case-insensitive (operator-typed
-    /// declarative rows), and a whitespace-only `api_base` counts as
-    /// unset — same emptiness rule as the error arm.
     #[test]
     fn resolve_base_url_openai_fallback_tolerates_case_and_blank_base() {
         let pk: ProviderKey = serde_json::from_str(
@@ -1725,32 +1228,6 @@ mod tests {
         }
     }
 
-    /// Anthropic: the messages handler builds `…/v1/messages`. A paste
-    /// of the full upstream URL must strip so
-    /// `build_anthropic_url("/messages")` does not produce
-    /// `…/v1/messages/v1/messages`.
-    #[test]
-    fn resolve_base_url_strips_anthropic_messages_suffix() {
-        for paste in [
-            "https://api.anthropic.com",
-            "https://api.anthropic.com/",
-            "https://api.anthropic.com/v1",
-            "https://api.anthropic.com/v1/messages",
-            "https://api.anthropic.com/v1/messages/",
-        ] {
-            let pk = pk_with_base(paste);
-            let base = resolve_base_url(&pk).unwrap();
-            assert_eq!(
-                build_anthropic_url(&base, "/messages"),
-                "https://api.anthropic.com/v1/messages",
-                "paste {paste:?} must build to the canonical messages URL",
-            );
-        }
-    }
-
-    /// Non-canonical hosts (corporate proxies, test mocks) pass through
-    /// after suffix-stripping. The operator's path on a non-default
-    /// host is trusted as-is.
     #[test]
     fn resolve_base_url_passes_non_canonical_hosts_through() {
         let pk = pk_with_base("https://proxy.example.com/openai-shim");
@@ -1907,216 +1384,6 @@ mod tests {
         let _ = build_openai_url("https://api.openai.com", "responses");
     }
 
-    // ---------------------------------------------------------------
-    // build_anthropic_url — the mirror-image convention: `/v1` belongs
-    // to the endpoint, so it is synthesized for a path-bearing base too.
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn build_anthropic_url_synthesizes_v1_for_every_base_shape() {
-        assert_eq!(
-            build_anthropic_url("https://api.anthropic.com", "/messages"),
-            "https://api.anthropic.com/v1/messages",
-        );
-        assert_eq!(
-            build_anthropic_url("https://api.anthropic.com/", "/messages"),
-            "https://api.anthropic.com/v1/messages",
-        );
-        // Operator importing the OpenAI habit — must not double.
-        assert_eq!(
-            build_anthropic_url("https://api.anthropic.com/v1", "/messages"),
-            "https://api.anthropic.com/v1/messages",
-        );
-        // A self-hosted Anthropic-compatible gateway mounted under a
-        // path still serves `<mount>/v1/messages` — unlike the OpenAI
-        // family, the path here does NOT suppress the `/v1`.
-        assert_eq!(
-            build_anthropic_url("https://gw.corp.example/anthropic", "/messages"),
-            "https://gw.corp.example/anthropic/v1/messages",
-        );
-        assert_eq!(
-            build_anthropic_url(
-                "https://gw.corp.example/anthropic",
-                "/messages/count_tokens"
-            ),
-            "https://gw.corp.example/anthropic/v1/messages/count_tokens",
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "build_anthropic_url path must start with /")]
-    fn build_anthropic_url_rejects_path_without_leading_slash() {
-        let _ = build_anthropic_url("https://api.anthropic.com", "messages");
-    }
-
-    // --- resolve_bridge tests -------------------------------------
-    //
-    // Cover the reachable outcomes of resolve_bridge:
-    //   1. specialized hit — pk.provider matches a specialized entry
-    //   2. family hit       — pk.adapter matches a family entry,
-    //                          specialized misses
-    //   3. none miss        — neither tier matches (misconfigured PK)
-    //
-    // A minimal Bridge stub is used so the test doesn't need reqwest
-    // or a real upstream.
-
-    mod resolve_bridge_tests {
-        use super::*;
-        use aisix_core::models::Adapter;
-        use aisix_gateway::{
-            Bridge, BridgeContext, BridgeError, ChatChunkStream, ChatFormat, ChatMessage,
-            ChatResponse, EmbeddingRequest, EmbeddingResponse, FinishReason, Hub, UsageStats,
-        };
-        use async_trait::async_trait;
-        use futures::stream;
-
-        /// Minimal Bridge that records its identity via `name()`. Lets
-        /// resolve_bridge tests verify which Bridge was returned without
-        /// dragging in reqwest.
-        struct StubBridge {
-            name: &'static str,
-        }
-
-        #[async_trait]
-        impl Bridge for StubBridge {
-            fn name(&self) -> &'static str {
-                self.name
-            }
-
-            async fn chat(
-                &self,
-                req: &ChatFormat,
-                _ctx: &BridgeContext,
-            ) -> Result<ChatResponse, BridgeError> {
-                Ok(ChatResponse {
-                    logprobs: None,
-                    more_choices: Vec::new(),
-                    id: "stub".into(),
-                    model: req.model.clone(),
-                    message: ChatMessage::assistant("stub"),
-                    finish_reason: FinishReason::Stop,
-                    usage: UsageStats::new(0, 0),
-                    service_tier: None,
-                })
-            }
-
-            async fn chat_stream(
-                &self,
-                _req: &ChatFormat,
-                _ctx: &BridgeContext,
-            ) -> Result<ChatChunkStream, BridgeError> {
-                Ok(Box::pin(stream::iter(Vec::new())))
-            }
-
-            async fn embed(
-                &self,
-                _req: &EmbeddingRequest,
-                _ctx: &BridgeContext,
-            ) -> Result<EmbeddingResponse, BridgeError> {
-                Err(BridgeError::Config("stub".into()))
-            }
-        }
-
-        /// Build a ProviderKey JSON with the new-shape fields. `adapter`
-        /// is passed as the kebab-case wire string (`"openai"` /
-        /// `"azure-openai"` etc.) rather than the enum, to keep the
-        /// helper independent of any `as_str()` method on `Adapter`.
-        fn pk_with_provider_and_adapter(provider: &str, adapter: Option<&str>) -> ProviderKey {
-            let adapter_json = match adapter {
-                Some(a) => format!(", \"adapter\":\"{a}\""),
-                None => String::new(),
-            };
-            let cfg = format!(
-                r#"{{"display_name":"x","api_key":"k","provider":"{provider}"{adapter_json}}}"#
-            );
-            serde_json::from_str(&cfg).unwrap()
-        }
-
-        #[test]
-        fn specialized_hit_wins_over_family() {
-            let hub = Hub::new();
-            hub.register_specialized(
-                "deepseek",
-                Arc::new(StubBridge {
-                    name: "specialized",
-                }),
-            );
-            hub.register_family(Adapter::Openai, Arc::new(StubBridge { name: "family" }));
-
-            let pk = pk_with_provider_and_adapter("deepseek", Some("openai"));
-            let bridge = resolve_bridge(&hub, &pk).unwrap();
-            assert_eq!(bridge.name(), "specialized");
-        }
-
-        #[test]
-        fn family_hit_when_specialized_misses() {
-            let hub = Hub::new();
-            hub.register_family(Adapter::Openai, Arc::new(StubBridge { name: "family" }));
-
-            // pk.provider = "unknown-vendor" → no specialized; pk.adapter
-            // = Openai → family hit.
-            let pk = pk_with_provider_and_adapter("unknown-vendor", Some("openai"));
-            let bridge = resolve_bridge(&hub, &pk).unwrap();
-            assert_eq!(bridge.name(), "family");
-        }
-
-        /// A PK whose `provider` matches no specialized entry and whose
-        /// `adapter` matches no family entry has nothing to dispatch on
-        /// — caller surfaces 503. cp-api always writes both fields, so
-        /// this is a genuine misconfiguration, not a migration gap.
-        #[test]
-        fn none_when_neither_tier_matches() {
-            let hub = Hub::new();
-            hub.register_specialized("openai", Arc::new(StubBridge { name: "vendor" }));
-            let pk = pk_with_provider_and_adapter("unknown-vendor", Some("anthropic"));
-            assert!(resolve_bridge(&hub, &pk).is_none());
-        }
-
-        /// A PK with empty `provider` AND no `adapter` (the malformed
-        /// shape the removed compat shim used to rescue) now resolves to
-        /// nothing — 503.
-        #[test]
-        fn none_when_provider_and_adapter_both_empty() {
-            let hub = Hub::new();
-            hub.register_specialized("openai", Arc::new(StubBridge { name: "vendor" }));
-            let pk = pk_with_provider_and_adapter("", None);
-            assert!(resolve_bridge(&hub, &pk).is_none());
-        }
-
-        #[test]
-        fn none_when_nothing_registered() {
-            let hub = Hub::new();
-            let pk = pk_with_provider_and_adapter("openai", Some("openai"));
-            assert!(resolve_bridge(&hub, &pk).is_none());
-        }
-
-        /// A PK with a non-empty `provider` and an `adapter` whose
-        /// family isn't registered misses both tiers authoritatively —
-        /// it is NOT rescued by any fallback. If a future PR drops the
-        /// `Adapter::Openai` family registration in `build_hub()`, this
-        /// fires instead of silently routing elsewhere.
-        #[test]
-        fn none_when_adapter_family_not_registered() {
-            let hub = Hub::new();
-            hub.register_specialized(
-                "openai",
-                Arc::new(StubBridge {
-                    name: "specialized-openai",
-                }),
-            );
-            // `vendor-without-specialized` has no specialized entry;
-            // `Adapter::Openai` has no family entry → None.
-            let pk = pk_with_provider_and_adapter("vendor-without-specialized", Some("openai"));
-            assert!(resolve_bridge(&hub, &pk).is_none());
-        }
-    }
-
-    /// The relays used to pick their streaming branch from the REQUEST's
-    /// `stream` flag alone, so a JSON body answering `stream: true` entered
-    /// the SSE hold-back — unscanned, and released with a `\n\n` appended.
-    /// Only an explicitly-JSON content type routes such a body away from
-    /// the SSE path; everything else stays on it, so an SSE upstream with
-    /// an unfamiliar label is never buffered into a `.json()` decode error.
     #[test]
     fn only_a_json_content_type_says_the_upstream_did_not_stream() {
         let ct = |v: &str| {

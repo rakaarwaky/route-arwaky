@@ -102,16 +102,12 @@ const IMAGE_HEADER_DECODE_BOUND: usize = 256 * 1024;
 pub enum PromptInput {
     /// OpenAI-shaped chat request (`/v1/chat/completions`).
     Chat(Box<aisix_gateway::chat::ChatFormat>),
-    /// Raw Anthropic `/v1/messages` request body.
-    Anthropic(Value),
     /// Raw `/v1/responses` request body.
     Responses(Value),
     /// Outbound `/v1/responses` wire bytes, parsed only if estimation
     /// runs: a stream that keeps its estimator to the end would otherwise
     /// hold a second parsed copy of the request for its whole lifetime.
     ResponsesWire(bytes::Bytes),
-    /// Outbound `/v1/messages` bytes with the same deferred parsing.
-    AnthropicWire(bytes::Bytes),
 }
 
 /// Prompt shape + the model name that selects the tokenizer encoding.
@@ -148,13 +144,9 @@ impl Estimator {
         let bpe = bpe_for(&self.model);
         match &*self.input {
             PromptInput::Chat(req) => count_chat_prompt(bpe, req),
-            PromptInput::Anthropic(body) => count_anthropic_prompt(bpe, body),
             PromptInput::Responses(body) => count_responses_prompt(bpe, body),
             PromptInput::ResponsesWire(wire) => {
                 count_responses_prompt(bpe, &crate::util::outbound_value(wire))
-            }
-            PromptInput::AnthropicWire(wire) => {
-                count_anthropic_prompt(bpe, &crate::util::outbound_value(wire))
             }
         }
     }
@@ -172,10 +164,8 @@ impl Estimator {
         use crate::estimate_pool::serialized_bytes_bound;
         match &*self.input {
             PromptInput::Chat(req) => serialized_bytes_bound(&ChatPromptProbe(req)),
-            PromptInput::Anthropic(body) | PromptInput::Responses(body) => {
-                serialized_bytes_bound(body)
-            }
-            PromptInput::ResponsesWire(wire) | PromptInput::AnthropicWire(wire) => wire.len(),
+            PromptInput::Responses(body) => serialized_bytes_bound(body),
+            PromptInput::ResponsesWire(wire) => wire.len(),
         }
     }
 }
@@ -847,40 +837,6 @@ fn count_tool_call_arguments(bpe: &CoreBPE, value: &Value) -> u32 {
         }
     }
     n
-}
-
-// ---------------------------------------------------------------------
-// Anthropic (`/v1/messages`)
-// ---------------------------------------------------------------------
-
-fn count_anthropic_prompt(bpe: &CoreBPE, body: &Value) -> u32 {
-    let mut n: u32 = 0;
-    let mut has_system = false;
-    if let Some(system) = body.get("system") {
-        if !system.is_null() {
-            has_system = true;
-            n = n.saturating_add(TOKENS_PER_MESSAGE);
-            n = n.saturating_add(enc(bpe, "system"));
-            n = n.saturating_add(count_content_value(bpe, system));
-        }
-    }
-    if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
-        for m in messages {
-            n = n.saturating_add(TOKENS_PER_MESSAGE);
-            if let Some(role) = m.get("role").and_then(|r| r.as_str()) {
-                n = n.saturating_add(enc(bpe, role));
-            }
-            if let Some(content) = m.get("content") {
-                n = n.saturating_add(count_content_value(bpe, content));
-            }
-        }
-    }
-    n.saturating_add(count_request_extra(
-        bpe,
-        body.get("tools"),
-        body.get("tool_choice"),
-        has_system,
-    ))
 }
 
 // ---------------------------------------------------------------------
@@ -1857,8 +1813,8 @@ mod tests {
             plain + count_text("gpt-4", &rendered) + TOOLS_OVERHEAD
         );
 
-        // Anthropic flat tool shape renders identically.
-        let anthropic_tools = json!([{
+        // A flat tool shape (no `function` nesting) renders identically.
+        let flat_tools = json!([{
             "name": "get_weather",
             "description": "Get the weather",
             "input_schema": {
@@ -1871,7 +1827,7 @@ mod tests {
             }
         }]);
         assert_eq!(
-            format_tool_definitions(anthropic_tools.as_array().unwrap()),
+            format_tool_definitions(flat_tools.as_array().unwrap()),
             rendered
         );
     }
@@ -1912,43 +1868,6 @@ mod tests {
             chat_est("gpt-4", without_developer).count_prompt() + developer_msg_cost
                 - TOOLS_WITH_SYSTEM_DISCOUNT
         );
-    }
-
-    #[test]
-    fn anthropic_prompt_counts_system_blocks_and_tools() {
-        let body = json!({
-            "model": "claude-sonnet-4-5",
-            "system": "Be helpful",
-            "messages": [
-                {"role": "user", "content": "Hello"},
-                {"role": "assistant", "content": [
-                    {"type": "text", "text": "Hi"},
-                    {"type": "tool_use", "id": "tu_1", "name": "get_weather",
-                     "input": {"city": "Paris"}}
-                ]},
-                {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "tu_1", "content": "sunny"}
-                ]}
-            ]
-        });
-        let wire_bytes = serde_json::to_vec(&body).unwrap();
-        let est = Estimator::new("claude-sonnet-4-5", PromptInput::Anthropic(body));
-        let wire = Estimator::new(
-            "claude-sonnet-4-5",
-            PromptInput::AnthropicWire(wire_bytes.into()),
-        );
-        assert_eq!(wire.count_prompt(), est.count_prompt());
-        let m = |s: &str| count_text("claude-sonnet-4-5", s);
-        let expected = (TOKENS_PER_MESSAGE + m("system") + m("Be helpful"))
-            + (TOKENS_PER_MESSAGE + m("user") + m("Hello"))
-            + (TOKENS_PER_MESSAGE
-                + m("assistant")
-                + m("Hi")
-                + m("get_weather")
-                + m("{\"city\":\"Paris\"}"))
-            + (TOKENS_PER_MESSAGE + m("user") + m("sunny"))
-            + REPLY_PRIMING;
-        assert_eq!(est.count_prompt(), expected);
     }
 
     #[test]
@@ -2376,28 +2295,6 @@ mod tests {
         assert_eq!(est.count_prompt(), expected);
     }
 
-    #[test]
-    fn anthropic_tool_result_image_is_not_text() {
-        let mut big = png(800, 600);
-        big.extend(std::iter::repeat_n(0x5A, 3 << 20));
-        let body = json!({
-            "model": "claude-sonnet-4-5",
-            "messages": [{"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "tu_1", "content": [
-                    {"type": "text", "text": "done"},
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png",
-                     "data": b64(&big)}}
-                ]}
-            ]}]
-        });
-        let m = |s: &str| count_text("claude-sonnet-4-5", s);
-        let est = Estimator::new("claude-sonnet-4-5", PromptInput::Anthropic(body));
-        assert_eq!(
-            est.count_prompt(),
-            TOKENS_PER_MESSAGE + m("user") + m("done") + 85 + REPLY_PRIMING
-        );
-    }
-
     /// A `data:` URI outside a media slot is text the upstream bills, so it
     /// counts as text: wrapping a prompt in one and disconnecting before the
     /// usage event must not zero the estimate.
@@ -2427,14 +2324,6 @@ mod tests {
         ] {
             assert_eq!(count_part(bpe, &part), m, "{part}");
         }
-        let anthropic = Estimator::new(
-            "gpt-4o",
-            PromptInput::Anthropic(json!({"messages": [{"role": "user", "content": uri}]})),
-        );
-        assert_eq!(
-            anthropic.count_prompt(),
-            TOKENS_PER_MESSAGE + count_text("gpt-4o", "user") + m + REPLY_PRIMING
-        );
     }
 
     /// Argument objects count as their compact JSON, keys and numbers
@@ -2473,30 +2362,5 @@ mod tests {
         let code = json!({"type": "code_interpreter_call", "id": "ci_1", "code": "plot()",
             "outputs": [{"type": "image", "url": uri}]});
         assert_eq!(count_part(bpe, &code), m("plot()") + 85);
-    }
-
-    #[test]
-    fn anthropic_document_counts_its_text() {
-        let bpe = bpe_for("gpt-4o");
-        let m = |s: &str| count_text("gpt-4o", s);
-        let pdf = json!({"type": "document", "title": "Report", "context": "Q3 figures",
-            "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0x".repeat(10_000)}});
-        assert_eq!(count_part(bpe, &pdf), m("Report") + m("Q3 figures"));
-        let url = json!({"type": "document", "source": {"type": "url", "url": "https://example.com/a.pdf"}});
-        assert_eq!(count_part(bpe, &url), 0);
-        let text = json!({"type": "document", "title": "Notes",
-            "source": {"type": "text", "media_type": "text/plain", "data": "The cat sat."}});
-        assert_eq!(count_part(bpe, &text), m("Notes") + m("The cat sat."));
-        let content_str =
-            json!({"type": "document", "source": {"type": "content", "content": "Hello"}});
-        assert_eq!(count_part(bpe, &content_str), m("Hello"));
-        let content_parts = json!({"type": "document", "source": {"type": "content", "content": [
-            {"type": "text", "text": "Hello"},
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD".repeat(50_000)}}
-        ]}});
-        assert_eq!(count_part(bpe, &content_parts), m("Hello") + 85);
-        // Nested in a tool_result, the same rule applies.
-        let nested = json!({"type": "tool_result", "tool_use_id": "t", "content": [text]});
-        assert_eq!(count_part(bpe, &nested), m("Notes") + m("The cat sat."));
     }
 }

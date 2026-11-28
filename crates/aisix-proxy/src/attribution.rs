@@ -182,11 +182,6 @@ pub(crate) struct CancelContext {
     /// forward-proxied upstream normalizes to the CHAT surface. The row
     /// would then be filed as an abandoned chat call with no model.
     pub surface: Option<crate::operation::Surface>,
-    /// Set by a route that files no usage row at ANY outcome but shares a
-    /// normalized endpoint label with a metering sibling. The guard has
-    /// only the label, so the route has to say so itself or a cancelled
-    /// unmetered request is filed as a metered one.
-    pub unmetered: bool,
     /// The authenticated `api_key` row's id. Empty on an unauthenticated
     /// path, which the cancel emitter treats as "nothing to attribute".
     pub api_key_id: String,
@@ -437,8 +432,6 @@ struct Cell {
     /// Parked and completed with `pending_log`; see
     /// [`crate::request_metrics::PendingRequestMetrics`].
     pending_metrics: Option<crate::request_metrics::PendingRequestMetrics>,
-    /// See [`note_stream_owns_access_log`].
-    stream_owns_log: bool,
     /// See [`RequestAttribution::track`]. `None` on a cell no telemetry
     /// middleware installed — a throwaway [`detached`] one, a unit test —
     /// where a line is written at once because nothing would ever flush it.
@@ -1324,13 +1317,6 @@ pub(crate) fn note_authenticated(auth: &crate::auth::AuthenticatedKey) {
     });
 }
 
-/// Note that this route files no usage row whatever the outcome. See
-/// [`CancelContext::unmetered`]; the census in [`crate::operation`] is where
-/// the routes that need it are named.
-pub(crate) fn note_unmetered_route() {
-    with_cancel(|c| c.unmetered = true);
-}
-
 /// Note the passthrough route this request matched, for the row a cancelled
 /// one files. Called once, after `match_route`.
 pub(crate) fn note_passthrough_route(route: &str) {
@@ -1419,25 +1405,6 @@ pub(crate) fn defer_access_log(
         cell.pending_log = Some(pending);
         cell.pending_metrics = Some(metrics);
     });
-}
-
-/// Note that this request answered with a stream whose own terminal
-/// emitter will write the access-log line.
-///
-/// For the handlers that wrap their whole dispatch and log the wrapper's
-/// status (a streaming passthrough route): the streaming branch is several
-/// frames below the tail
-/// that owns the line's fields, so it raises a flag there and the tail
-/// parks the line instead of writing it.
-pub(crate) fn note_stream_owns_access_log() {
-    let _ = CURRENT.try_with(|a| a.lock().stream_owns_log = true);
-}
-
-/// Whether [`note_stream_owns_access_log`] was raised on this request.
-pub(crate) fn stream_owns_access_log() -> bool {
-    CURRENT
-        .try_with(|a| a.lock().stream_owns_log)
-        .unwrap_or(false)
 }
 
 /// Write a request's access-log line. Every emitter in this crate goes
@@ -1544,12 +1511,6 @@ pub(crate) fn note_terminal_event(event: &aisix_obs::UsageEvent, provider_reques
         cell.terminal_provider_request_id = provider_request_id.to_string();
         cell.terminal_tokens = tokens;
     });
-}
-
-/// Name what ended a request whose handler answers with a rendered response
-/// and files no usage event for this failure (see [`rendered_error_source`]).
-pub(crate) fn note_error_source(source: aisix_obs::ErrorSource) {
-    let _ = CURRENT.try_with(|a| a.lock().noted_error_source = Some(source));
 }
 
 /// What ended a request whose emit holds only the status of a rendered

@@ -367,6 +367,7 @@ mod tests {
         assert!(!k.can_access(&snap, "anything"));
     }
 
+    #[test]
     fn can_access_checks_whitelist() {
         let k = sample();
         let snap = empty_snapshot();
