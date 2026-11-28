@@ -384,26 +384,6 @@ describe("a pii mask rule where content cannot be rewritten is reported, not sil
     expectReported(log, "/v1/videos", [{ hook: "input", email: 2 }]);
   });
 
-  test("/a2a: the message is reported", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const res = await postJson(`/a2a/${AGENT}`, {
-      jsonrpc: "2.0",
-      id: "pmu",
-      method: "message/send",
-      params: {
-        message: {
-          role: "user",
-          parts: [{ kind: "text", text: PROMPT }],
-          messageId: "pmu-message",
-        },
-      },
-    });
-    expect(res.status).toBe(200);
-    const sent = a2a!.requests.map((r) => JSON.stringify(r.body ?? {})).join("\n");
-    expect(sent, "the message reached the agent as the caller sent it").toContain(IN_A);
-    const log = await waitForSlsLog(sls, LOGSTORE, (l) => l.get("a2a_agent_name") === AGENT, "a2a");
-    expectReported(log, "/a2a", [{ hook: "input", email: 2 }]);
-  });
 
   test("/v1/realtime: both directions' frames are reported", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();

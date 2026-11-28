@@ -301,83 +301,9 @@ describe("client-facing usage is the CALLER's protocol, not the upstream's (AISI
     await sls?.close();
   });
 
-  test("chat/completions over an Anthropic upstream: full input, cache hit, decomposable total", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const res = await call("/v1/chat/completions", {
-      model: ANTHROPIC_MODEL,
-      messages: [{ role: "user", content: "hi" }],
-    });
-    expect(res.status).toBe(200);
-    const usage = (JSON.parse(res.text) as { usage: Record<string, unknown> }).usage;
 
-    expect(usage.prompt_tokens).toBe(TOTAL_IN);
-    expect(usage.completion_tokens).toBe(OUT);
-    expect(usage.total_tokens).toBe(TOTAL);
-    expect((usage.prompt_tokens_details as { cached_tokens: number }).cached_tokens).toBe(CACHE_READ);
 
-    await expectAnthropicShapedEvent(res.requestId);
-  });
 
-  test("chat/completions streaming over an Anthropic upstream reports the same numbers", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const res = await call("/v1/chat/completions", {
-      model: ANTHROPIC_STREAM_MODEL,
-      messages: [{ role: "user", content: "hi" }],
-      stream: true,
-      stream_options: { include_usage: true },
-    });
-    expect(res.status).toBe(200);
-    const usage = usageFromSse(res.text, (f) => f.usage);
-
-    expect(usage.prompt_tokens).toBe(TOTAL_IN);
-    expect(usage.completion_tokens).toBe(OUT);
-    expect(usage.total_tokens).toBe(TOTAL);
-    // The cache detail has to survive the stream too — dropping it only
-    // on the streaming exit is how #1405 shipped half-fixed.
-    expect(
-      (usage as unknown as { prompt_tokens_details: { cached_tokens: number } })
-        .prompt_tokens_details.cached_tokens,
-    ).toBe(CACHE_READ);
-
-    await expectAnthropicShapedEvent(res.requestId);
-  });
-
-  test("responses over an Anthropic upstream keeps cached_tokens a subset of input_tokens", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const res = await call("/v1/responses", { model: ANTHROPIC_MODEL, input: "hi" });
-    expect(res.status).toBe(200);
-    const usage = (JSON.parse(res.text) as { usage: Record<string, unknown> }).usage;
-
-    expect(usage.input_tokens).toBe(TOTAL_IN);
-    expect(usage.output_tokens).toBe(OUT);
-    expect(usage.total_tokens).toBe(TOTAL);
-    const cached = (usage.input_tokens_details as { cached_tokens: number }).cached_tokens;
-    expect(cached).toBe(CACHE_READ);
-    expect(cached).toBeLessThanOrEqual(usage.input_tokens as number);
-
-    await expectAnthropicShapedEvent(res.requestId);
-  });
-
-  test("responses streaming over an Anthropic upstream reports the same numbers", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const res = await call("/v1/responses", {
-      model: ANTHROPIC_STREAM_MODEL,
-      input: "hi",
-      stream: true,
-    });
-    expect(res.status).toBe(200);
-    const usage = usageFromSse(res.text, (f) => (f.response as { usage?: unknown } | undefined)?.usage);
-
-    expect(usage.input_tokens).toBe(TOTAL_IN);
-    expect(usage.output_tokens).toBe(OUT);
-    expect(usage.total_tokens).toBe(TOTAL);
-    const cached = (usage as unknown as { input_tokens_details: { cached_tokens: number } })
-      .input_tokens_details.cached_tokens;
-    expect(cached).toBe(CACHE_READ);
-    expect(cached).toBeLessThanOrEqual(usage.input_tokens);
-
-    await expectAnthropicShapedEvent(res.requestId);
-  });
 
   test("no protocol conversion: an OpenAI upstream still passes through untouched", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();

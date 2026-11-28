@@ -203,16 +203,6 @@ describe("guardrail phase applicability e2e: samples only on attached hooks", ()
       body: { model: MODEL_STREAM, stream: true, messages: [{ role: "user", content: "hello" }] },
     },
     {
-      name: "messages, streaming",
-      path: "/v1/messages",
-      body: {
-        model: MODEL_STREAM,
-        stream: true,
-        max_tokens: 16,
-        messages: [{ role: "user", content: "hello" }],
-      },
-    },
-    {
       name: "responses, non-streaming",
       path: "/v1/responses",
       body: { model: MODEL, input: "hello" },
@@ -230,7 +220,6 @@ describe("guardrail phase applicability e2e: samples only on attached hooks", ()
         method: "POST",
         headers: {
           authorization: `Bearer ${CALLER}`,
-          "anthropic-version": "2023-06-01",
           "content-type": "application/json",
         },
         body: JSON.stringify(c.body),

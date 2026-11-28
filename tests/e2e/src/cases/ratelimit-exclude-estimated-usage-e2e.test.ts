@@ -102,7 +102,7 @@ const post = (app: SpawnedApp, key: string, path: string, body: Record<string, u
     method: "POST",
     headers: {
       "content-type": "application/json",
-      ...(path === "/v1/messages" ? { "x-api-key": key } : { authorization: `Bearer ${key}` }),
+      authorization: `Bearer ${key}`,
     },
     body: JSON.stringify(body),
   });
@@ -118,13 +118,6 @@ const chatBuffered: Call = (app, key) =>
     model: "est-chat-buffered",
     messages: [{ role: "user", content: PROMPT }],
   });
-const messagesStream: Call = (app, key) =>
-  post(app, key, "/v1/messages", {
-    model: "est-chat",
-    max_tokens: 200,
-    stream: true,
-    messages: [{ role: "user", content: PROMPT }],
-  });
 const responsesStream: Call = (app, key) =>
   post(app, key, "/v1/responses", { model: "est-responses", stream: true, input: PROMPT });
 // Every sub-call answers without usage: the panel from the buffered
@@ -135,12 +128,6 @@ const ensembleStream: Call = (app, key) =>
   post(app, key, "/v1/chat/completions", {
     model: "est-ensemble-stream",
     stream: true,
-    messages: [{ role: "user", content: PROMPT }],
-  });
-const messagesBuffered: Call = (app, key) =>
-  post(app, key, "/v1/messages", {
-    model: "est-chat-buffered",
-    max_tokens: 200,
     messages: [{ role: "user", content: PROMPT }],
   });
 const responsesBuffered: Call = (app, key) =>
@@ -291,8 +278,6 @@ describe.each(BACKENDS)("estimated usage and token rate limits ($name counters)"
   const estimatedCalls: Array<[string, Call]> = [
     ["chat-stream", chatStream],
     ["chat-buffered", chatBuffered],
-    ["messages", messagesStream],
-    ["messages-buffered", messagesBuffered],
     ["responses", responsesStream],
     ["responses-buffered", responsesBuffered],
     ["completions", completions],

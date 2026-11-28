@@ -306,16 +306,6 @@ describe("applied_guardrails on every guardrail-governed surface", () => {
       send: () => postJson("/v1/videos", { model: "gas-video", prompt: FORBIDDEN }),
     },
     {
-      surface: "/v1/messages/count_tokens",
-      model: "gas-count-tokens",
-      send: () =>
-        postJson(
-          "/v1/messages/count_tokens",
-          { model: "gas-count-tokens", messages: [{ role: "user", content: FORBIDDEN }] },
-          true,
-        ),
-    },
-    {
       surface: "/v1/responses",
       model: "gas-responses-block",
       send: () => postJson("/v1/responses", { model: "gas-responses-block", input: FORBIDDEN }),

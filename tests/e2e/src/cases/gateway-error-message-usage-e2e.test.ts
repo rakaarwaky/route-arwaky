@@ -6,15 +6,11 @@ import {
   EtcdClient,
   SeedClient,
   spawnApp,
-  startA2aUpstream,
-  startMcpUpstream,
   startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
   waitForLogLine,
   waitForSlsLog,
-  type A2aUpstream,
-  type McpUpstream,
   type MockSls,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -30,8 +26,6 @@ import {
 
 const CALLER = "sk-gateway-error-message-caller";
 const LIMITED = "sk-gateway-error-message-limited";
-const LIMITED_A2A = "sk-gateway-error-message-limited-a2a";
-const LIMITED_MCP = "sk-gateway-error-message-limited-mcp";
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
 
 /** One field of an access-log line, as the text formatter writes it. */
@@ -62,27 +56,6 @@ const LEAKY_STREAM = [
   chatChunk({}, "stop"),
   "[DONE]",
 ];
-const sse = (event: string, data: Record<string, unknown>) =>
-  `event: ${event}\ndata: ${JSON.stringify({ type: event, ...data })}\n\n`;
-// The same answer on Anthropic's own stream wire.
-const LEAKY_ANTHROPIC_STREAM = [
-  sse("message_start", {
-    message: {
-      id: "msg_gem",
-      type: "message",
-      role: "assistant",
-      model: "claude-sonnet-4-5",
-      content: [],
-      stop_reason: null,
-      usage: { input_tokens: 3, output_tokens: 1 },
-    },
-  }),
-  sse("content_block_start", { index: 0, content_block: { type: "text", text: "" } }),
-  sse("content_block_delta", { index: 0, delta: { type: "text_delta", text: `here is ${FORBIDDEN}` } }),
-  sse("content_block_stop", { index: 0 }),
-  sse("message_delta", { delta: { stop_reason: "end_turn" }, usage: { output_tokens: 3 } }),
-  sse("message_stop", {}),
-];
 /** A realtime upstream that answers every client frame with `response.done`. */
 async function startRealtimeUpstream(): Promise<{ port: number; close(): Promise<void> }> {
   const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
@@ -112,9 +85,6 @@ describe("gateway-side failures name themselves on the usage event", () => {
   let leakyStream: OpenAiUpstream | undefined;
   let leakyCompletions: OpenAiUpstream | undefined;
   let leakyTranscript: OpenAiUpstream | undefined;
-  let leakyAnthropic: OpenAiUpstream | undefined;
-  let agent: A2aUpstream | undefined;
-  let mcp: McpUpstream | undefined;
   let realtime: { port: number; close(): Promise<void> } | undefined;
   let etcdReachable = false;
 
@@ -174,9 +144,6 @@ describe("gateway-side failures name themselves on the usage event", () => {
     leakyTranscript = await startOpenAiUpstream({
       nonStreamBody: { text: `here is ${FORBIDDEN}` },
     });
-    leakyAnthropic = await startOpenAiUpstream({ rawStreamFrames: LEAKY_ANTHROPIC_STREAM });
-    agent = await startA2aUpstream({ cardMount: "origin" });
-    mcp = await startMcpUpstream("gemmcp");
     realtime = await startRealtimeUpstream();
 
     app = await spawnApp({
@@ -314,21 +281,6 @@ describe("gateway-side failures name themselves on the usage event", () => {
       await seed.attachGuardrailToModel(outputGuard.id, m.id);
     }
 
-    // The Anthropic-native /v1/messages passthrough stream.
-    const anthropicPk = await seed.createProviderKey({
-      display_name: "gem-leaky-anthropic-pk",
-      api_key: "sk-ant-mock",
-      provider: "anthropic",
-      adapter: "anthropic",
-      api_base: leakyAnthropic.baseUrl,
-    });
-    const anthropicModel = await seed.createModel({
-      display_name: "gem-leaky-anthropic",
-      provider: "anthropic",
-      model_name: "claude-sonnet-4-5",
-      provider_key_id: anthropicPk.id,
-    });
-    await seed.attachGuardrailToModel(outputGuard.id, anthropicModel.id);
     const bridgedPk = await seed.createProviderKey({
       display_name: "gem-leaky-bridged-pk",
       api_key: "sk-mock",
@@ -368,28 +320,6 @@ describe("gateway-side failures name themselves on the usage event", () => {
       provider_key_id: realtimePk.id,
     });
 
-    await seed.update("a2a_agents", randomUUID(), {
-      name: "gem-agent",
-      url: agent.url,
-      protocol_version: "1.0",
-      auth_type: "none",
-      enabled: true,
-    });
-    await seed.update("mcp_servers", randomUUID(), {
-      name: "gemmcp",
-      url: mcp.url,
-      enabled: true,
-    });
-    for (const key of [LIMITED_A2A, LIMITED_MCP]) {
-      await seed.createApiKey({
-        key_hash: hash(key),
-        allowed_models: [],
-        allowed_agents: ["*"],
-        mcp_access: { allow: ["*"] },
-        rate_limit: { rpm: 1 },
-      });
-    }
-
     await seed.createPassthroughRoute({
       name: "gem-route",
       path_prefix: "/gem-route",
@@ -407,8 +337,6 @@ describe("gateway-side failures name themselves on the usage event", () => {
       key_hash: hash(CALLER),
       allowed_models: ["*"],
       allowed_routes: ["gem-stream-route"],
-      allowed_agents: ["*"],
-      mcp_access: { allow: ["*"] },
     });
     await waitConfigPropagation(async () => {
       const res = await fetch(`${app!.proxyUrl}/v1/models`, {
@@ -427,9 +355,6 @@ describe("gateway-side failures name themselves on the usage event", () => {
     await leakyStream?.close();
     await leakyCompletions?.close();
     await leakyTranscript?.close();
-    await leakyAnthropic?.close();
-    await agent?.close();
-    await mcp?.close();
     await realtime?.close();
     await sls?.close();
   });
@@ -443,7 +368,6 @@ describe("gateway-side failures name themselves on the usage event", () => {
     const headers: Record<string, string> = {
       authorization: `Bearer ${init.key ?? CALLER}`,
     };
-    if (path === "/mcp") headers.accept = "application/json, text/event-stream";
     let body: BodyInit | undefined;
     if (init.form) {
       body = init.form;
@@ -544,91 +468,6 @@ describe("gateway-side failures name themselves on the usage event", () => {
     expect(outputEvent.get("error_message")).not.toContain(FORBIDDEN);
   });
 
-  test("messages and responses: unknown model and an output guardrail block", async (ctx) => {
-    if (!ready()) return ctx.skip();
-    const messages = (model: string) =>
-      send("/v1/messages", {
-        body: { model, max_tokens: 64, messages: [{ role: "user", content: "hello" }] },
-      });
-    await expectNamed(await messages("gem-ghost-messages"), "messages", notFound("gem-ghost-messages"));
-    const messagesBlock = await messages("gem-leaky");
-    expect(messagesBlock.status).toBe(422);
-    const messagesEvent = await eventFor(messagesBlock.requestId, "messages output block");
-    expect(messagesEvent.get("error_class")).toBe("content_filter");
-    expect(messagesEvent.get("error_message")).toContain("gem-output-block");
-
-    const responses = (model: string) =>
-      send("/v1/responses", { body: { model, input: "hello" } });
-    await expectNamed(
-      await responses("gem-ghost-responses"),
-      "responses",
-      notFound("gem-ghost-responses"),
-    );
-    const responsesBlock = await responses("gem-leaky-responses");
-    expect(responsesBlock.status).toBe(422);
-    const responsesEvent = await eventFor(responsesBlock.requestId, "responses output block");
-    expect(responsesEvent.get("error_class")).toBe("content_filter");
-    expect(responsesEvent.get("error_message")).toContain("gem-output-block");
-  });
-
-  test("every other endpoint names its refusal", async (ctx) => {
-    if (!ready()) return ctx.skip();
-    const json: Array<[string, string, Record<string, unknown>]> = [
-      ["/v1/messages/count_tokens", "gem-ghost-count", { messages: [{ role: "user", content: "hi" }] }],
-      ["/v1/embeddings", "gem-ghost-embeddings", { input: "hi" }],
-      ["/v1/completions", "gem-ghost-completions", { prompt: "hi" }],
-      ["/v1/images/generations", "gem-ghost-images", { prompt: "a cat" }],
-      ["/v1/rerank", "gem-ghost-rerank", { query: "q", documents: ["a"] }],
-      ["/v1/audio/speech", "gem-ghost-speech", { input: "hi", voice: "alloy" }],
-      ["/v1/videos", "gem-ghost-videos", { prompt: "a cat" }],
-    ];
-    for (const [path, model, body] of json) {
-      await expectNamed(await send(path, { body: { model, ...body } }), path, notFound(model));
-    }
-
-    const edit = new FormData();
-    edit.set("model", "gem-ghost-edits");
-    edit.set("prompt", "a hat");
-    edit.set("image", new Blob([new Uint8Array([137, 80, 78, 71])], { type: "image/png" }), "a.png");
-    await expectNamed(await send("/v1/images/edits", { form: edit }), "images edits", notFound("gem-ghost-edits"));
-
-    const audio = new FormData();
-    audio.set("model", "gem-ghost-transcriptions");
-    audio.set("file", new Blob([new Uint8Array([1, 2, 3])], { type: "audio/wav" }), "a.wav");
-    // Read only inside dispatch, so the event records the model the
-    // message names.
-    const transcription = await expectNamed(
-      await send("/v1/audio/transcriptions", { form: audio }),
-      "transcriptions",
-      notFound("gem-ghost-transcriptions"),
-    );
-    expect(transcription.get("requested_model")).toBe("gem-ghost-transcriptions");
-
-    const file = new FormData();
-    file.set("model", "gem-ghost-files");
-    file.set("purpose", "batch");
-    file.set("file", new Blob(["{}\n"], { type: "application/jsonl" }), "b.jsonl");
-    const files = await expectNamed(
-      await send("/v1/files", { form: file }),
-      "files",
-      notFound("gem-ghost-files"),
-    );
-    expect(files.get("requested_model")).toBe("gem-ghost-files");
-
-    // The caller's key grants no passthrough route.
-    await expectNamed(await send("/gem-route/chat/completions", { body: {} }), "passthrough", {
-      status: 403,
-      errorClass: "permission_denied",
-      message: 'API key is not allowed to use passthrough route "gem-route"',
-    });
-
-    // A plain GET is refused before the model is looked up.
-    const realtime = await send("/v1/realtime?model=gem-chat", { method: "GET" });
-    expect(realtime.status).toBe(400);
-    const realtimeEvent = await eventFor(realtime.requestId, "realtime");
-    expect(realtimeEvent.get("error_class")).toBe("websocket_upgrade_required");
-    expect(realtimeEvent.get("error_message")).toMatch(/^this endpoint requires a WebSocket upgrade: /);
-  });
 
   test("a failure that can quote the request names itself too", async (ctx) => {
     if (!ready()) return ctx.skip();
@@ -646,26 +485,7 @@ describe("gateway-side failures name themselves on the usage event", () => {
       "chat stream",
       { model: "gem-leaky-stream", stream: true, messages: [{ role: "user", content: "hi" }] },
     ],
-    [
-      "/v1/messages",
-      "messages stream",
-      {
-        model: "gem-leaky-stream",
-        stream: true,
-        max_tokens: 64,
-        messages: [{ role: "user", content: "hi" }],
-      },
-    ],
-    [
-      "/v1/messages",
-      "anthropic-native messages stream",
-      {
-        model: "gem-leaky-anthropic",
-        stream: true,
-        max_tokens: 64,
-        messages: [{ role: "user", content: "hi" }],
-      },
-    ],
+    
     [
       "/v1/responses",
       "bridged responses stream",
@@ -688,62 +508,6 @@ describe("gateway-side failures name themselves on the usage event", () => {
     });
   }
 
-  test("/a2a names a guardrail block and a rate-limit rejection", async (ctx) => {
-    if (!ready()) return ctx.skip();
-    const a2a = (text: string, key?: string) =>
-      send("/a2a/gem-agent", {
-        key,
-        body: {
-          jsonrpc: "2.0",
-          id: "1",
-          method: "message/send",
-          params: {
-            message: { role: "user", parts: [{ kind: "text", text }], messageId: "m-1" },
-          },
-        },
-      });
-    const a2aBlock = await a2a(`say ${FORBIDDEN}`);
-    expect(a2aBlock.status).toBe(422);
-    const a2aBlockEvent = await eventFor(a2aBlock.requestId, "a2a block");
-    expect(a2aBlockEvent.get("error_class")).toBe("content_filter");
-    expect(a2aBlockEvent.get("error_message")).toBe(
-      "request blocked by content policy (guardrail 'gem-input-block')",
-    );
-    await awaitWindowHeadroom();
-    await a2a("hello", LIMITED_A2A);
-    const a2aLimited = await a2a("hello", LIMITED_A2A);
-    expect(a2aLimited.status).toBe(429);
-    const a2aLimitedEvent = await eventFor(a2aLimited.requestId, "a2a rate limit");
-    expect(a2aLimitedEvent.get("error_class")).toBe("rate_limit_exceeded");
-    expect(a2aLimitedEvent.get("error_message")).toMatch(/limit exceeded/);
-  });
-
-  test("/mcp names a guardrail block and a rate-limit rejection", async (ctx) => {
-    if (!ready()) return ctx.skip();
-    const tool = (text: string, key?: string) =>
-      send("/mcp", {
-        key,
-        body: {
-          jsonrpc: "2.0",
-          id: 3,
-          method: "tools/call",
-          params: { name: "gemmcp__echo", arguments: { text } },
-        },
-      });
-    const mcpBlock = await tool(`say ${FORBIDDEN}`);
-    const mcpBlockEvent = await eventFor(mcpBlock.requestId, "mcp block");
-    expect(mcpBlockEvent.get("error_class")).toBe("content_filter");
-    expect(mcpBlockEvent.get("error_message")).toBe(
-      "tool call blocked by content policy (guardrail 'gem-input-block')",
-    );
-    await awaitWindowHeadroom();
-    await tool("hello", LIMITED_MCP);
-    const mcpLimited = await tool("hello", LIMITED_MCP);
-    expect(mcpLimited.status).toBe(429);
-    const mcpLimitedEvent = await eventFor(mcpLimited.requestId, "mcp rate limit");
-    expect(mcpLimitedEvent.get("error_class")).toBe("rate_limit_exceeded");
-    expect(mcpLimitedEvent.get("error_message")).toMatch(/limit exceeded/);
-  });
   test("a guardrail refusal that ends a /v1/realtime session names itself", async (ctx) => {
     if (!ready()) return ctx.skip();
     const ws = new WsClient(

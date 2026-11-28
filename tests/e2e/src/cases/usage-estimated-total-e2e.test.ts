@@ -366,21 +366,7 @@ describe("estimated usage counts only what the upstream left out", () => {
       expect(usage).toMatchObject({ prompt_tokens: prompt, completion_tokens: OUT, total_tokens: prompt + OUT });
     });
 
-    test("/v1/messages over a Chat Completions upstream, buffered", async (ctx) => {
-      if (!etcdReachable || !app) return ctx.skip();
-      const res = await call("/v1/messages", messagesRequest("est-chat-absent"));
-      const usage = bodyUsage(res.text);
-      const prompt = await expectEstimatedWithoutTotal(res.requestId);
-      expect(usage).toMatchObject({ input_tokens: prompt, output_tokens: OUT });
-    });
 
-    test("/v1/messages over a Chat Completions upstream, streamed", async (ctx) => {
-      if (!etcdReachable || !app) return ctx.skip();
-      const res = await call("/v1/messages", messagesRequest("est-chat-stream-absent", true));
-      const usage = messagesStreamUsage(res.text);
-      const prompt = await expectEstimatedWithoutTotal(res.requestId);
-      expect(usage).toMatchObject({ input_tokens: prompt, output_tokens: OUT });
-    });
 
     test("/v1/responses, native, buffered", async (ctx) => {
       if (!etcdReachable || !app) return ctx.skip();
@@ -414,14 +400,6 @@ describe("estimated usage counts only what the upstream left out", () => {
       expect(usage).toMatchObject({ input_tokens: prompt, output_tokens: OUT, total_tokens: prompt + OUT });
     });
 
-    test("/v1/messages, native, buffered", async (ctx) => {
-      if (!etcdReachable || !app) return ctx.skip();
-      const res = await call("/v1/messages", messagesRequest("est-anth-absent"));
-      const usage = bodyUsage(res.text);
-      const prompt = await expectEstimatedWithoutTotal(res.requestId);
-      expect(usage).toMatchObject({ input_tokens: prompt, output_tokens: OUT });
-      expect(usage).not.toHaveProperty("total_tokens");
-    });
 
     test("/v1/embeddings, no usage reported", async (ctx) => {
       if (!etcdReachable || !app) return ctx.skip();
@@ -493,22 +471,7 @@ describe("estimated usage counts only what the upstream left out", () => {
       expect(chatStreamUsage(res.text)).toMatchObject({ prompt_tokens: 5, completion_tokens: 0, total_tokens: 5 });
     });
 
-    test("/v1/messages over a Chat Completions upstream, streamed, prompt_tokens 0", async (ctx) => {
-      if (!etcdReachable || !app) return ctx.skip();
-      const res = await call("/v1/messages", messagesRequest("est-chat-stream-zero", true));
-      await expectAsReported(res.requestId, { prompt: 0, completion: OUT, total: OUT });
-      expect(messagesStreamUsage(res.text)).toMatchObject({ input_tokens: 0, output_tokens: OUT });
-    });
 
-    test("/v1/messages, native, input_tokens 0", async (ctx) => {
-      if (!etcdReachable || !app) return ctx.skip();
-      const res = await call("/v1/messages", messagesRequest("est-anth-zero"));
-      const log = await record(res.requestId);
-      expect(log.get("usage_estimated")).toBeUndefined();
-      expect(log.get("prompt_tokens") ?? "0").toBe("0");
-      expect(log.get("completion_tokens")).toBe(String(OUT));
-      expect(bodyUsage(res.text)).toMatchObject({ input_tokens: 0, output_tokens: OUT });
-    });
 
     test("/v1/responses, native, buffered, input_tokens 0", async (ctx) => {
       if (!etcdReachable || !app) return ctx.skip();

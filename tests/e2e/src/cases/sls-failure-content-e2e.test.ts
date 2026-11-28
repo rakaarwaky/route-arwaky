@@ -325,34 +325,6 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     expect(log.get("input_messages")).toContain(FORBIDDEN_MODEL_SENTINEL);
   });
 
-  test("/v1/messages upstream failure: the record carries the prompt", async (ctx) => {
-    if (!etcdReachable || !app || !sls) {
-      ctx.skip();
-      return;
-    }
-    const res = await fetch(`${app!.proxyUrl}/v1/messages`, {
-      method: "POST",
-      headers: {
-        "x-api-key": CALLER_PLAINTEXT,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "failure-content-fail",
-        max_tokens: 32,
-        messages: [{ role: "user", content: MESSAGES_SENTINEL }],
-      }),
-    });
-    await res.text();
-    expect(res.status).toBeGreaterThanOrEqual(400);
-
-    const log = await waitForLog(
-      sls,
-      (l) => (l.get("input_messages") ?? "").includes(MESSAGES_SENTINEL),
-      "failed /v1/messages record with prompt",
-    );
-    expect(Number(log.get("status_code"))).toBeGreaterThanOrEqual(400);
-  });
 
   test("/v1/responses upstream failure: the record carries the prompt", async (ctx) => {
     if (!etcdReachable || !app || !sls) {

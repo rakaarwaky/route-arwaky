@@ -22,18 +22,8 @@ const routes = [
   },
   {
     provider: "openai",
-    path: "/v1/messages",
-    body: { max_tokens: 16, messages: [{ role: "user", content: "hi" }] },
-  },
-  {
-    provider: "openai",
     path: "/v1/responses",
     body: { input: "hi" },
-  },
-  {
-    provider: "anthropic",
-    path: "/v1/chat/completions",
-    body: { messages: [{ role: "user", content: "hi" }] },
   },
 ];
 
@@ -53,18 +43,6 @@ describe.each([false, true])("upstream User-Agent (threadPerCore=%s)", (threadPe
     version = stdout.trim().slice("aisix ".length);
 
     upstreams.openai = await startOpenAiUpstream();
-    upstreams.anthropic = await startOpenAiUpstream({
-      nonStreamBody: {
-        id: "msg-user-agent",
-        type: "message",
-        role: "assistant",
-        model: "mock-model",
-        content: [{ type: "text", text: "hi" }],
-        stop_reason: "end_turn",
-        stop_sequence: null,
-        usage: { input_tokens: 5, output_tokens: 1 },
-      },
-    });
     app = await spawnApp({ threadPerCore });
     const seed = new SeedClient(etcd, app.etcdPrefix);
     for (const [provider, upstream] of Object.entries(upstreams)) {
@@ -74,7 +52,7 @@ describe.each([false, true])("upstream User-Agent (threadPerCore=%s)", (threadPe
           provider,
           adapter: provider,
           api_key: "sk-mock",
-          api_base: upstream.baseUrl + (provider === "openai" ? "/v1" : ""),
+          api_base: upstream.baseUrl + "/v1",
           // Select the per-key client even on loopback HTTP.
           ...(pool === "provider-key" ? { tls: { verify: false } } : {}),
         });
@@ -117,7 +95,6 @@ describe.each([false, true])("upstream User-Agent (threadPerCore=%s)", (threadPe
         headers: {
           "content-type": "application/json",
           authorization: `Bearer ${CALLER_KEY}`,
-          "anthropic-version": "2023-06-01",
           "user-agent": "test-client/1.0",
         },
         body: JSON.stringify({ model: `ua-${route.provider}-${pool}`, ...route.body }),

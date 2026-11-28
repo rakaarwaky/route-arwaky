@@ -19,8 +19,8 @@ import {
 // broken across half the gateway's provider matrix.
 //
 // User journey: caller speaks OpenAI Chat Completions to the
-// gateway → gateway dispatches to {anthropic, gemini, deepseek}
-// upstream → upstream returns 4xx in its native shape → gateway
+// gateway → gateway dispatches to {gemini, deepseek} OpenAI-compatible
+// upstreams → upstream returns 4xx in its native shape → gateway
 // translates body to OpenAI shape AND preserves the upstream's
 // status code → SDK caller sees an APIError with parseable
 // envelope.
@@ -28,11 +28,9 @@ import {
 // Native error shapes (each derived from the upstream provider's
 // official docs, not from gateway source):
 //
-//   - Anthropic: `{ type: "error", error: { type, message } }`
-//     <https://docs.anthropic.com/en/api/errors>
-//   - Gemini via OpenAI-compat endpoint (the wire the gateway's
-//     gemini bridge actually talks to per Google's published
-//     compatibility doc) returns OpenAI-shape errors:
+//   - Gemini via OpenAI-compat endpoint (the wire OpenAI-compatible
+//     vendors actually talk per Google's published compatibility
+//     doc) returns OpenAI-shape errors:
 //     `{ error: { message, type, code } }`
 //     <https://ai.google.dev/gemini-api/docs/openai>
 //   - DeepSeek (OpenAI-compat): `{ error: { message, type, code } }`
@@ -42,10 +40,9 @@ import {
 //   `{ error: { message: string, type: string, code?: string|null } }`
 //   <https://platform.openai.com/docs/guides/error-codes/api-errors>
 //
-// Two of the three providers (gemini, deepseek) speak OpenAI-shape
-// upstream → the gateway's job is faithful pass-through; a regression
-// that mangled the envelope would fail those cases. Anthropic is the
-// one true translation case (Anthropic-shape in, OpenAI-shape out).
+// Both providers speak OpenAI-shape upstream → the gateway's job is
+// faithful pass-through; a regression that mangled the envelope
+// would fail those cases.
 
 const CALLER_PLAINTEXT = "sk-err-norm-caller";
 const CALLER_KEY_HASH = createHash("sha256")
@@ -53,13 +50,12 @@ const CALLER_KEY_HASH = createHash("sha256")
   .digest("hex");
 
 interface ProviderCase {
-  readonly provider: "anthropic" | "google" | "deepseek";
-  // Post-#302 Phase A wire-shape adapter cp-api stamps on the PK
-  // alongside `provider`. `Hub::dispatch_two_tier` routes to the
-  // `Adapter::Anthropic` family bridge for `"anthropic"` and to
-  // `Adapter::Openai` for every OpenAI-compat vendor (google +
-  // deepseek here, plus any long-tail vendor cp-api admits later).
-  readonly adapter: "openai" | "anthropic";
+  readonly provider: "google" | "deepseek";
+  // The wire-shape adapter cp-api stamps on the PK alongside
+  // `provider`. Every OpenAI-compat vendor (google + deepseek here,
+  // plus any long-tail vendor cp-api admits later) dispatches to
+  // `Adapter::Openai`.
+  readonly adapter: "openai";
   readonly upstreamModelId: string;
   readonly displayName: string;
   // The wire shape the upstream sends back on a 400. Each provider
@@ -70,35 +66,13 @@ interface ProviderCase {
   // shape, but the underlying reason must be preserved so the
   // caller knows what actually went wrong).
   readonly upstreamMessageSubstr: string;
-  // Anthropic's documented endpoint is
-  // `https://api.anthropic.com/v1/messages` so api_base is the bare
-  // host (the bridge composes `/v1/messages` on its own).
   // OpenAI-compat providers expose at `<host>/v1/chat/completions`
   // — `/v1` belongs to api_base; cf. `docs/api-admin.md` example
   // `"api_base": "https://api.openai.com/v1"`.
-  readonly apiBaseSuffix: "" | "/v1";
+  readonly apiBaseSuffix: "/v1";
 }
 
 const CASES: ReadonlyArray<ProviderCase> = [
-  {
-    provider: "anthropic",
-    adapter: "anthropic",
-    upstreamModelId: "claude-3-5-haiku-20241022",
-    displayName: "err-norm-anthropic",
-    // Anthropic native 400 per
-    // <https://docs.anthropic.com/en/api/errors#http-errors>:
-    //   {"type":"error","error":{"type":"invalid_request_error","message":"..."}}
-    nativeErrorBody: {
-      type: "error",
-      error: {
-        type: "invalid_request_error",
-        message:
-          "Anthropic upstream rejected the request: bogus_param missing",
-      },
-    },
-    upstreamMessageSubstr: "bogus_param missing",
-    apiBaseSuffix: "",
-  },
   {
     provider: "google",
     adapter: "openai",

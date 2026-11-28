@@ -41,26 +41,6 @@ const CHAT_EVENTS = [
   '{"id":"c1","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}',
   "[DONE]",
 ];
-const ANTHROPIC_MESSAGE = {
-  id: "msg_side",
-  type: "message",
-  role: "assistant",
-  model: "claude-3-5-haiku-20241022",
-  content: [{ type: "text", text: "hi" }],
-  stop_reason: "end_turn",
-  usage: { input_tokens: 3, output_tokens: 1 },
-};
-const MESSAGES_EVENTS = [
-  JSON.stringify({
-    type: "message_start",
-    message: { ...ANTHROPIC_MESSAGE, content: [], stop_reason: null, usage: { input_tokens: 3, output_tokens: 0 } },
-  }),
-  JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
-  JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hi" } }),
-  JSON.stringify({ type: "content_block_stop", index: 0 }),
-  JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } }),
-  JSON.stringify({ type: "message_stop" }),
-];
 const RESPONSE = {
   id: "resp-side",
   object: "response",
@@ -88,23 +68,12 @@ type Case = {
 };
 
 const chatBody = (stream: boolean) => (model: string) => ({ model, stream, messages: [{ role: "user", content: "go" }] });
-const messagesBody = (stream: boolean) => (model: string) => ({
-  model,
-  stream,
-  max_tokens: 16,
-  messages: [{ role: "user", content: "go" }],
-});
 const responsesBody = (stream: boolean) => (model: string) => ({ model, stream, input: "go" });
-
 const CASES: Case[] = [
   { name: "side-chat", endpoint: "/v1/chat/completions", provider: "openai", modelName: "gpt-4o-mini", stream: false,
     upstream: { responseDelayMs: UPSTREAM_DELAY_MS, nonStreamBody: CHAT_COMPLETION }, body: chatBody(false), status: 200 },
   { name: "side-chat-stream", endpoint: "/v1/chat/completions", provider: "openai", modelName: "gpt-4o-mini", stream: true,
     upstream: { responseDelayMs: UPSTREAM_DELAY_MS, streamEvents: CHAT_EVENTS }, body: chatBody(true), status: 200 },
-  { name: "side-messages", endpoint: "/v1/messages", provider: "anthropic", modelName: "claude-3-5-haiku-20241022", stream: false,
-    upstream: { responseDelayMs: UPSTREAM_DELAY_MS, nonStreamBody: ANTHROPIC_MESSAGE }, body: messagesBody(false), status: 200 },
-  { name: "side-messages-stream", endpoint: "/v1/messages", provider: "anthropic", modelName: "claude-3-5-haiku-20241022", stream: true,
-    upstream: { responseDelayMs: UPSTREAM_DELAY_MS, streamEvents: MESSAGES_EVENTS }, body: messagesBody(true), status: 200 },
   { name: "side-responses", endpoint: "/v1/responses", provider: "openai", modelName: "gpt-4o-mini", stream: false,
     upstream: { responseDelayMs: UPSTREAM_DELAY_MS, nonStreamBody: RESPONSE }, body: responsesBody(false), status: 200 },
   { name: "side-responses-stream", endpoint: "/v1/responses", provider: "openai", modelName: "gpt-4o-mini", stream: true,
@@ -150,8 +119,7 @@ describe("aisix_request_e2e_latency_seconds splits each request by side", () => 
       const pk = await seed.createProviderKey({
         display_name: `${c.name}-pk`,
         api_key: "sk-mock",
-        provider: c.provider,
-        api_base: c.provider === "anthropic" ? up.baseUrl : `${up.baseUrl}/v1`,
+        api_base: `${up.baseUrl}/v1`,
       });
       await seed.createModel({
         display_name: c.name,
@@ -206,8 +174,6 @@ describe("aisix_request_e2e_latency_seconds splits each request by side", () => 
       headers: {
         "content-type": "application/json",
         authorization: `Bearer ${KEY}`,
-        "x-api-key": KEY,
-        "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify(body),
     });

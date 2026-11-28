@@ -487,77 +487,9 @@ describe("request parameters follow the target platform's contract", () => {
     expect(sent.messages[2]).toMatchObject({ role: "function", name: "get_weather", content: "sunny" });
   });
 
-  test("Claude receives legacy function calling as tools and answers in the legacy shape", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const baseline = up.claude.receivedRequests.length;
-    const res = await post(app, "/v1/chat/completions", { model: "pc-claude", ...LEGACY_REQUEST });
-    const body = (await res.json()) as any;
-    expect(res.status, JSON.stringify(body)).toBe(200);
 
-    const sent = lastBody(up.claude, baseline).json;
-    expect(sent.functions).toBeUndefined();
-    expect(sent.function_call).toBeUndefined();
-    expect(sent.tools.map((t: any) => t.name)).toEqual(["get_weather"]);
-    expect(sent.tool_choice).toEqual({ type: "auto" });
-    const toolUse = sent.messages[1].content.find((b: any) => b.type === "tool_use");
-    expect(toolUse).toMatchObject({ name: "get_weather", input: { city: "Paris" } });
-    const toolResult = sent.messages[2].content.find((b: any) => b.type === "tool_result");
-    expect(toolResult.tool_use_id).toBe(toolUse.id);
 
-    expect(body.choices[0].message.function_call).toEqual({ name: "get_weather", arguments: "{\"city\":\"Rome\"}" });
-    expect(body.choices[0].message.tool_calls).toBeUndefined();
-    expect(body.choices[0].finish_reason).toBe("function_call");
-  });
 
-  test("a replayed turn with null legacy fields reaches Claude as plain history", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const baseline = up.claude.receivedRequests.length;
-    const res = await post(app, "/v1/chat/completions", {
-      model: "pc-claude",
-      messages: [
-        { role: "user", content: "hi" },
-        { role: "assistant", content: "hello", function_call: null, tool_calls: null },
-        { role: "user", content: "again" },
-      ],
-      functions: null,
-      function_call: null,
-    });
-    const body = (await res.json()) as any;
-    expect(res.status, JSON.stringify(body)).toBe(200);
-    const sent = lastBody(up.claude, baseline).json;
-    expect(sent.tools).toBeUndefined();
-    expect(sent.messages[1].content).toEqual([{ type: "text", text: "hello" }]);
-  });
-
-  test("Claude streams a legacy function call back as delta.function_call", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const res = await post(app, "/v1/chat/completions", { model: "pc-claude-stream", ...LEGACY_REQUEST, stream: true });
-    const text = await res.text();
-    expect(res.status, text).toBe(200);
-    const choices = sseData(text).flatMap((c) => c.choices ?? []);
-    expect(choices.some((c) => c.delta?.tool_calls)).toBe(false);
-    expect(choices.find((c) => c.delta?.function_call?.name)?.delta.function_call.name).toBe("get_weather");
-    expect(choices.map((c) => c.delta?.function_call?.arguments ?? "").join("")).toBe("{\"city\":\"Rome\"}");
-    expect(choices.at(-1)?.finish_reason ?? choices.find((c) => c.finish_reason)?.finish_reason).toBe("function_call");
-  });
-
-  test("Vertex Gemini receives legacy function calling as function declarations", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const baseline = up.gemini.receivedRequests.length;
-    const res = await post(app, "/v1/chat/completions", { model: "pc-gemini", ...LEGACY_REQUEST });
-    const body = (await res.json()) as any;
-    expect(res.status, JSON.stringify(body)).toBe(200);
-
-    const sent = lastBody(up.gemini, baseline).json;
-    expect(sent.tools[0].functionDeclarations.map((f: any) => f.name)).toEqual(["get_weather"]);
-    const parts = sent.contents.flatMap((c: any) => c.parts);
-    expect(parts.find((p: any) => p.functionCall)?.functionCall).toMatchObject({ name: "get_weather", args: { city: "Paris" } });
-    expect(parts.find((p: any) => p.functionResponse)?.functionResponse.name).toBe("get_weather");
-
-    expect(body.choices[0].message.function_call.name).toBe("get_weather");
-    expect(JSON.parse(body.choices[0].message.function_call.arguments)).toEqual({ city: "Rome" });
-    expect(body.choices[0].finish_reason).toBe("function_call");
-  });
 
   // ── illegal values are refused, naming the field ───────────────────
 

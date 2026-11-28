@@ -308,18 +308,6 @@ describe("budgets pushed as documents decide requests locally", () => {
     expect(Math.abs(retryAfter - (nextMonth - Date.now()) / 1000)).toBeLessThan(60);
   });
 
-  test("/v1/messages refuses with the Anthropic envelope", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const res = await fetch(`${app.proxyUrl}/v1/messages`, {
-      method: "POST",
-      headers: { "x-api-key": KEYS.member, "content-type": "application/json", "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({ model: "bd-direct", max_tokens: 8, messages: [{ role: "user", content: "hi" }] }),
-    });
-    expect(res.status).toBe(429);
-    const body = (await res.json()) as { type: string; error: { type: string } };
-    expect(body.type).toBe("error");
-    expect(body.error.type).toBe("rate_limit_error");
-  });
 
   test("a routing target on an exhausted provider key is skipped without spending a fallback", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();

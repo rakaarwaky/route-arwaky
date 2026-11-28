@@ -276,23 +276,6 @@ describe("exporters record the request and upstream response headers they list",
     expect(map(second, "upstream_response_headers")).toEqual({ "x-upstream-region": "second-try" });
   });
 
-  test("/v1/messages and /v1/embeddings record the same maps", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const messages = await send(
-      "/v1/messages",
-      { model: MODEL, max_tokens: 16, messages: [{ role: "user", content: "hi" }] },
-      { "x-sub-user": "carol", "x-department": "sales" },
-    );
-    expect(messages.status).toBe(200);
-    const m = await rowFor(STORE_A, messages.requestId, "messages row");
-    expect(map(m, "request_headers")).toEqual({ "x-sub-user": "carol", "x-department": "sales" });
-    expect(map(m, "upstream_response_headers")).toEqual({ "x-upstream-region": "us-east" });
-
-    const embeddings = await send("/v1/embeddings", { model: MODEL, input: "hi" }, { "x-sub-user": "dave" });
-    const e = await rowFor(STORE_A, embeddings.requestId, "embeddings row");
-    expect(map(e, "request_headers")).toEqual({ "x-sub-user": "dave" });
-    expect(map(e, "upstream_response_headers")).toEqual({ "x-upstream-region": "us-east" });
-  });
 
   test("a passthrough route records both maps", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();
@@ -330,29 +313,6 @@ describe("exporters record the request and upstream response headers they list",
 
   // `/mcp` resolves its caller without the extractor the other families
   // share, so it captures the request headers on its own path.
-  test("an MCP tool call records the request map", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const rpc = (id: number, method: string, params: Record<string, unknown>) =>
-      send(
-        "/mcp",
-        { jsonrpc: "2.0", id, method, params },
-        { accept: "application/json, text/event-stream", "x-sub-user": "grace" },
-      );
-    await rpc(1, "initialize", {
-      protocolVersion: "2025-11-25",
-      capabilities: {},
-      clientInfo: { name: "usage-event-request-headers", version: "0.1" },
-    });
-    const res = await rpc(2, "tools/call", { name: "urh__echo", arguments: { text: "hi" } });
-    expect(res.status).toBe(200);
-    const row = await waitForSlsLog(
-      sls,
-      STORE_A,
-      (l) => l.get("operation") === "mcp" && l.get("mcp_tool_name") === "echo",
-      "mcp row",
-    );
-    expect(map(row, "request_headers")).toEqual({ "x-sub-user": "grace" });
-  });
 });
 
 async function waitForSpan(

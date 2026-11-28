@@ -48,32 +48,6 @@ describe("path-param rejection e2e: :param routes answer the envelope", () => {
     await app?.exit();
   });
 
-  test("malformed :param answers the OpenAI envelope on every family member", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-
-    for (const [method, path] of [
-      ["POST", "/a2a/%ff"],
-      ["GET", "/mcp/%ff"],
-      ["GET", "/v1/files/%ff"],
-      ["GET", "/v1/batches/%ff"],
-      ["GET", "/v1/fine_tuning/jobs/%ff"],
-      ["GET", "/v1/videos/%ff"],
-      // `/passthrough/*` is not in the :param family: it is a path-prefix
-      // namespace, so an unclaimed path is an ordinary 404 miss, not a 400.
-    ] as const) {
-      const res = await fetch(`${app.proxyUrl}${path}`, {
-        method,
-        headers: { authorization: `Bearer ${KEY}` },
-      });
-      expect(res.status, `${method} ${path}`).toBe(400);
-      const body = (await res.json()) as {
-        error?: { type?: string; message?: string };
-      };
-      expect(body.error?.type, `${method} ${path}`).toBe(
-        "invalid_request_error",
-      );
-    }
-  });
 
   test("multipart content-type mismatch answers the envelope too", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();

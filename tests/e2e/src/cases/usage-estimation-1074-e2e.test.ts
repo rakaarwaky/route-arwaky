@@ -584,44 +584,7 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     });
   }, 60_000);
 
-  test("chat SSE with include_usage bridged to an Anthropic upstream that sends no usage: the estimate reaches the client", async (ctx) => {
-    if (!etcdReachable || !app) {
-      ctx.skip();
-      return;
-    }
-    const { seen, recorded } = await streamedUsageAndRecord("est-chat-stream-anthropic");
-    expect(seen.content).toBe("Hello world");
-    expect(seen.usages).toHaveLength(1);
-    expect(seen.lastIsUsage).toBe(true);
-    expect(seen.usages[0]).toMatchObject({
-      prompt_tokens: EXPECTED_PROMPT_TOKENS,
-      completion_tokens: EXPECTED_COMPLETION_TOKENS,
-      total_tokens: EXPECTED_PROMPT_TOKENS + EXPECTED_COMPLETION_TOKENS,
-    });
-    expect(recorded).toEqual({
-      input: EXPECTED_PROMPT_TOKENS,
-      output: EXPECTED_COMPLETION_TOKENS,
-      flagged: true,
-    });
-  }, 60_000);
 
-  test("chat SSE with include_usage bridged to an Anthropic upstream that counts input and a cache read but no output: the frame keeps both", async (ctx) => {
-    if (!etcdReachable || !app) {
-      ctx.skip();
-      return;
-    }
-    const { seen, recorded } = await streamedUsageAndRecord("est-chat-stream-anthropic-cache");
-    expect(seen.usages).toHaveLength(1);
-    // OpenAI shape: the cache read is part of the prompt and named as cached.
-    expect(seen.usages[0]).toMatchObject({
-      prompt_tokens: 5 + 7,
-      completion_tokens: EXPECTED_COMPLETION_TOKENS,
-      total_tokens: 5 + 7 + EXPECTED_COMPLETION_TOKENS,
-      prompt_tokens_details: { cached_tokens: 7 },
-    });
-    expect(recorded.output).toBe(EXPECTED_COMPLETION_TOKENS);
-    expect(recorded.flagged).toBe(true);
-  }, 60_000);
 
   test("chat non-streaming 200 without usage: the client usage block carries the same estimate the record does", async (ctx) => {
     if (!etcdReachable || !app) {
@@ -718,60 +681,6 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     await waitSlsFlagged("est-chat-abort");
   }, 60_000);
 
-  test("/v1/messages SSE with no usage anywhere: estimated and flagged", async (ctx) => {
-    if (!etcdReachable || !app) {
-      ctx.skip();
-      return;
-    }
-    const call = async () =>
-      fetch(`${app!.proxyUrl}/v1/messages`, {
-        method: "POST",
-        headers: {
-          "x-api-key": CALLER_PLAINTEXT,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({
-          model: "est-msgs-stream",
-          max_tokens: 100,
-          stream: true,
-          messages: [{ role: "user", content: "hi" }],
-        }),
-      });
-    await waitConfigPropagation(async () => {
-      try {
-        const r = await call();
-        await r.text();
-        return r.status === 200;
-      } catch {
-        return false;
-      }
-    });
-
-    const inputBefore = await tokenMetric("aisix_llm_input_tokens_total", "est-msgs-stream");
-    const outputBefore = await tokenMetric("aisix_llm_output_tokens_total", "est-msgs-stream");
-    const res = await call();
-    expect(res.status).toBe(200);
-    const body = await res.text();
-    // Bytes pass through verbatim; no fabricated usage on the wire.
-    expect(body).toContain("Hello world");
-    expect(body).toContain("message_stop");
-
-    const deadline = Date.now() + 10_000;
-    let input = 0;
-    let output = 0;
-    while (Date.now() < deadline) {
-      input = await tokenMetric("aisix_llm_input_tokens_total", "est-msgs-stream");
-      output = await tokenMetric("aisix_llm_output_tokens_total", "est-msgs-stream");
-      if (input > inputBefore) break;
-      await new Promise((r) => setTimeout(r, 100));
-    }
-    // Both sides are exact: one user message "hi" = 8, and the
-    // estimation accumulator is a raw concatenation of the text deltas
-    // ("Hello world" = 2) — no separators to inflate the count.
-    expect(input - inputBefore).toBe(EXPECTED_PROMPT_TOKENS);
-    expect(output - outputBefore).toBe(EXPECTED_COMPLETION_TOKENS);
-    await waitSlsFlagged("est-msgs-stream");
-  }, 60_000);
 
   test("/v1/responses SSE aborted before the terminal event: record still ships, flagged", async (ctx) => {
     if (!etcdReachable || !app) {

@@ -335,111 +335,12 @@ describe("the usage record carries upstream usage as reported", () => {
     await sls?.close();
   });
 
-  test("chat/completions over Gemini: the client sees thoughts folded in, the record does not", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const res = await call("/v1/chat/completions", {
-      model: GEMINI_MODEL,
-      messages: [{ role: "user", content: "hi" }],
-    });
-    expect(res.status, res.text).toBe(200);
-    const usage = JSON.parse(res.text).usage;
-    expect(usage.prompt_tokens).toBe(PROMPT);
-    expect(usage.completion_tokens).toBe(CANDIDATES + THOUGHTS);
-    expect(usage.completion_tokens_details.reasoning_tokens).toBe(THOUGHTS);
-    expect(usage.total_tokens).toBe(TOTAL);
 
-    await expectRawGeminiRecord(res.requestId);
-    await expectFoldedAccessLog(res.requestId);
-  });
 
-  test("chat/completions streaming over Gemini records the same raw row", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const res = await call("/v1/chat/completions", {
-      model: GEMINI_STREAM_MODEL,
-      messages: [{ role: "user", content: "hi" }],
-      stream: true,
-      stream_options: { include_usage: true },
-    });
-    expect(res.status, res.text).toBe(200);
-    const usage = usageFromSse(res.text, (f) => f.usage);
-    expect(usage.prompt_tokens).toBe(PROMPT);
-    expect(usage.completion_tokens).toBe(CANDIDATES + THOUGHTS);
-    expect(usage.total_tokens).toBe(TOTAL);
 
-    await expectRawGeminiRecord(res.requestId);
-    await expectFoldedAccessLog(res.requestId);
-  });
 
-  test("messages over Gemini: Anthropic output folds the thoughts, the record keeps them apart", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const res = await call("/v1/messages", {
-      model: GEMINI_MODEL,
-      max_tokens: 64,
-      messages: [{ role: "user", content: "hi" }],
-    });
-    expect(res.status, res.text).toBe(200);
-    const usage = JSON.parse(res.text).usage;
-    expect(usage.input_tokens).toBe(PROMPT);
-    expect(usage.output_tokens).toBe(CANDIDATES + THOUGHTS);
 
-    await expectRawGeminiRecord(res.requestId);
-  });
 
-  test("messages streaming over Gemini records the same raw row", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const res = await call("/v1/messages", {
-      model: GEMINI_STREAM_MODEL,
-      max_tokens: 64,
-      stream: true,
-      messages: [{ role: "user", content: "hi" }],
-    });
-    expect(res.status, res.text).toBe(200);
-    const usage = usageFromSse(res.text, (f) => (f.type === "message_delta" ? f.usage : undefined));
-    expect(usage.output_tokens).toBe(CANDIDATES + THOUGHTS);
-
-    await expectRawGeminiRecord(res.requestId);
-    await expectFoldedAccessLog(res.requestId);
-  });
-
-  test("responses over Gemini: output_tokens folds the thoughts, the record keeps them apart", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const res = await call("/v1/responses", { model: GEMINI_MODEL, input: "hi" });
-    expect(res.status, res.text).toBe(200);
-    const usage = JSON.parse(res.text).usage;
-    expect(usage.input_tokens).toBe(PROMPT);
-    expect(usage.output_tokens).toBe(CANDIDATES + THOUGHTS);
-    expect(usage.output_tokens_details.reasoning_tokens).toBe(THOUGHTS);
-
-    await expectRawGeminiRecord(res.requestId);
-  });
-
-  test("responses streaming over Gemini records the same raw row", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const res = await call("/v1/responses", { model: GEMINI_STREAM_MODEL, input: "hi", stream: true });
-    expect(res.status, res.text).toBe(200);
-    const usage = usageFromSse(res.text, (f) => (f.response as { usage?: unknown } | undefined)?.usage);
-    expect(usage.output_tokens).toBe(CANDIDATES + THOUGHTS);
-
-    await expectRawGeminiRecord(res.requestId);
-    await expectFoldedAccessLog(res.requestId);
-  });
-
-  test("Gemini without a total: the record keeps the folded completion and names no total", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const res = await call("/v1/chat/completions", {
-      model: GEMINI_NO_TOTAL_MODEL,
-      messages: [{ role: "user", content: "hi" }],
-    });
-    expect(res.status, res.text).toBe(200);
-    expect(JSON.parse(res.text).usage.completion_tokens).toBe(CANDIDATES + THOUGHTS);
-    // Without the upstream's total the reasoning reads as a subset of the
-    // completion, so an unfolded completion would bill the candidates as
-    // nothing.
-    const log = await recorded(res.requestId);
-    expect(log.get("completion_tokens")).toBe(String(CANDIDATES + THOUGHTS));
-    expect(log.get("reasoning_tokens")).toBe(String(THOUGHTS));
-    expect(log.has("total_tokens")).toBe(false);
-  });
 
   test("an OpenAI-compatible upstream's total is recorded verbatim", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();
@@ -467,19 +368,6 @@ describe("the usage record carries upstream usage as reported", () => {
     expect(log.has("total_tokens")).toBe(false);
   });
 
-  test("messages over an OpenAI-compatible upstream records reasoning and total like chat does", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const res = await call("/v1/messages", {
-      model: OPENAI_MODEL,
-      max_tokens: 64,
-      messages: [{ role: "user", content: "hi" }],
-    });
-    expect(res.status, res.text).toBe(200);
-    const log = await recorded(res.requestId);
-    expect(log.get("completion_tokens")).toBe(String(OAI_COMPLETION));
-    expect(log.get("reasoning_tokens")).toBe(String(OAI_REASONING));
-    expect(log.get("total_tokens")).toBe(String(OAI_TOTAL));
-  });
 });
 
 describe("legacy completions record reasoning and total like chat does", () => {

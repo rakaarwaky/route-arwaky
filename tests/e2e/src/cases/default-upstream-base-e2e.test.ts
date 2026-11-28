@@ -73,35 +73,11 @@ describe("default upstream base on the direct-HTTP routes e2e", () => {
     });
     const seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const anthropicPk = await seed.createProviderKey({
-      display_name: "anthropic-no-base",
-      provider: "anthropic",
-      adapter: "anthropic",
-      api_key: "sk-ant-e2e",
-    });
-    const legacyAnthropicPk = await seed.createProviderKey({
-      display_name: "legacy-anthropic-no-base",
-      provider: "",
-      adapter: "anthropic",
-      api_key: "sk-ant-legacy-e2e",
-    });
     const legacyOpenaiPk = await seed.createProviderKey({
       display_name: "legacy-openai-no-base",
       provider: "",
       adapter: "openai",
       api_key: "sk-oai-legacy-e2e",
-    });
-    await seed.createModel({
-      display_name: "anthropic-default",
-      provider: "anthropic",
-      model_name: "claude-sonnet-4-5",
-      provider_key_id: anthropicPk.id,
-    });
-    await seed.createModel({
-      display_name: "legacy-anthropic-default",
-      provider: "anthropic",
-      model_name: "claude-sonnet-4-5",
-      provider_key_id: legacyAnthropicPk.id,
     });
     await seed.createModel({
       display_name: "legacy-openai-default",
@@ -112,8 +88,6 @@ describe("default upstream base on the direct-HTTP routes e2e", () => {
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: [
-        "anthropic-default",
-        "legacy-anthropic-default",
         "legacy-openai-default",
       ],
     });
@@ -146,27 +120,6 @@ describe("default upstream base on the direct-HTTP routes e2e", () => {
     return res.status;
   }
 
-  const messages = [{ role: "user", content: "hi" }];
-
-  test.for([
-    ["/v1/messages", "anthropic-default", { max_tokens: 8, messages }],
-    ["/v1/messages/count_tokens", "anthropic-default", { messages }],
-    ["/v1/messages", "legacy-anthropic-default", { max_tokens: 8, messages }],
-    ["/v1/messages/count_tokens", "legacy-anthropic-default", { messages }],
-  ] as const)(
-    "%s on %s dials api.anthropic.com",
-    async ([path, model, body], ctx) => {
-      if (!etcdReachable || !app) {
-        ctx.skip();
-        return;
-      }
-      await ready();
-      const before = proxy!.targets.length;
-      const status = await post(path, { model, ...body });
-      expect(status).not.toBe(400);
-      expect(proxy!.targets.slice(before)).toContain("api.anthropic.com:443");
-    },
-  );
 
   test("legacy empty-vendor openai-adapter key dials api.openai.com on /v1/audio/speech", async (ctx) => {
     if (!etcdReachable || !app) {

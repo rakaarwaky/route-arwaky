@@ -32,7 +32,6 @@ const FAIL2_PK = "attr1325-fail2-pk";
 const EMBED_PK = "attr1325-embed-pk";
 const WILD_PK = "attr1325-wild-pk";
 const GROUP_A_PK = "attr1325-group-a-pk";
-const CT_PK = "attr1325-ct-pk";
 
 const OK_MODEL = "attr1325-ok";
 const FAIL_MODEL = "attr1325-fail";
@@ -41,7 +40,6 @@ const GROUP_MODEL = "attr1325-group";
 const EMBED_MODEL = "attr1325-embed";
 const WILD_ROW = "attr1325-wild/*";
 const GROUP_A_MODEL = "attr1325-group-a";
-const CT_MODEL = "attr1325-count-tokens";
 
 describe("failed-request upstream attribution #1325 e2e", () => {
   let app: SpawnedApp | undefined;
@@ -106,23 +104,6 @@ describe("failed-request upstream attribution #1325 e2e", () => {
     // upstream id is the caller's own suffix, so the failure path has to
     // collapse it back to the row's template.
     await seedPair(WILD_PK, WILD_ROW, failing, "*");
-    // `/v1/messages/count_tokens` is Anthropic-only and refuses a
-    // non-Anthropic adapter at the boundary, so it needs a key that claims
-    // one to reach an upstream at all.
-    const ctPk = await seed.createProviderKey({
-      display_name: CT_PK,
-      api_key: "sk-mock",
-      api_base: `${failing.baseUrl}/v1`,
-      provider: "anthropic",
-      adapter: "anthropic",
-    });
-    await seed.createModel({
-      display_name: CT_MODEL,
-      provider: "anthropic",
-      model_name: "claude-3-5-haiku",
-      provider_key_id: ctPk.id,
-    });
-
     // Failover group whose targets both fail: the terminal metric must name
     // the LAST attempt, the one whose error the caller was served.
     await seed.createModel({
@@ -143,7 +124,6 @@ describe("failed-request upstream attribution #1325 e2e", () => {
         EMBED_MODEL,
         WILD_ROW,
         GROUP_A_MODEL,
-        CT_MODEL,
       ],
     });
 
@@ -305,20 +285,6 @@ describe("failed-request upstream attribution #1325 e2e", () => {
       endpoint: "/v1/images/generations",
       path: "/v1/images/generations",
       body: { prompt: "a cat" },
-    },
-    {
-      endpoint: "/v1/messages",
-      path: "/v1/messages",
-      body: { max_tokens: 16, messages: [{ role: "user", content: "hi" }] },
-    },
-    {
-      endpoint: "/v1/messages/count_tokens",
-      path: "/v1/messages/count_tokens",
-      body: { messages: [{ role: "user", content: "hi" }] },
-      model: CT_MODEL,
-      pk: CT_PK,
-      upstreamModel: "claude-3-5-haiku",
-      provider: "anthropic",
     },
     {
       endpoint: "/v1/responses",

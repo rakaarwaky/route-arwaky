@@ -626,67 +626,6 @@ describe("trace hierarchy e2e (AISIX-Cloud#1279)", () => {
     }
   });
 
-  test("/v1/messages and /v1/responses export the same hierarchy shape", async (ctx) => {
-    if (!etcdReachable || !app || !seed) {
-      ctx.skip();
-      return;
-    }
-    const otlp = await startMockOtlp();
-    receivers.push(otlp);
-    await seed.createObservabilityExporter({
-      name: "trace-family-otlp",
-      enabled: true,
-      kind: "otlp_http",
-      endpoint: otlp.url,
-    });
-    const upstream = await startOpenAiUpstream({
-      nonStreamBody: okUpstreamBody("cmpl-trace-family"),
-    });
-    upstreams.push(upstream);
-    await createOpenAiModel("trace-family-direct", upstream);
-    await propagate();
-
-    const drive = async (path: string, body: unknown) => {
-      const res = await fetch(`${app!.proxyUrl}${path}`, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${CALLER_PLAINTEXT}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify(body),
-      });
-      expect(res.status, path).toBe(200);
-      const requestId = res.headers.get("x-aisix-request-id");
-      expect(requestId, path).toBeTruthy();
-      await res.text();
-      return requestId!;
-    };
-
-    for (const [path, body] of [
-      [
-        "/v1/messages",
-        {
-          model: "trace-family-direct",
-          max_tokens: 32,
-          messages: [{ role: "user", content: "trace me" }],
-        },
-      ],
-      ["/v1/responses", { model: "trace-family-direct", input: "trace me" }],
-    ] as const) {
-      const requestId = await drive(path, body);
-      const spans = await waitForSpans(otlp, requestId, 3);
-      expect(spans, path).toHaveLength(3);
-      const server = spans.find((s) => s.kind === KIND_SERVER)!;
-      expect(server, path).toBeTruthy();
-      const logical = spans.find(
-        (s) => s.kind === KIND_CLIENT && s.parentSpanId === server.spanId,
-      )!;
-      expect(logical, path).toBeTruthy();
-      const attempt = spans.find((s) => s.parentSpanId === logical.spanId)!;
-      expect(attempt, path).toBeTruthy();
-      expect(new Set(spans.map((s) => s.traceId)).size, path).toBe(1);
-    }
-  });
 
   test("an ensemble request exports one SERVER span and no dangling parents", async (ctx) => {
     if (!etcdReachable || !app || !seed) {

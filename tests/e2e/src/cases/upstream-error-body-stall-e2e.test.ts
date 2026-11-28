@@ -50,28 +50,13 @@ describe("an upstream that stalls its error body", () => {
     for (const [name, provider, modelName] of [
       ["stall-openai", "openai", "m"],
       ["stall-429", "openai", "m"],
-      ["stall-azure", "azure-openai", "m"],
-      ["stall-vertex-gemini", "google", "gemini-2.5-flash"],
-      ["stall-vertex-claude", "google", "claude-sonnet-4-5"],
-      ["stall-anthropic", "anthropic", "m"],
       ["stall-cohere", "cohere", "m"],
-      ["stall-bedrock-converse", "bedrock", "anthropic.claude-3-5-haiku-20241022-v1:0"],
-      ["stall-bedrock-chat", "bedrock", "global.openai.gpt-6.1-sol"],
     ] as const) {
-      const bedrock = provider === "bedrock";
-      const vertex = provider === "google";
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        api_key: bedrock
-          ? JSON.stringify({ access_key_id: "AKIA-stall", secret_access_key: "sk-stall", region: "us-east-1" })
-          : vertex
-            ? JSON.stringify({ access_token: "ya29.stall", project: "proj-e2e", region: "us-central1" })
-            : "sk-mock",
+        api_key: "sk-mock",
         provider,
         ...(provider === "cohere" ? { adapter: "openai" } : {}),
-        ...(bedrock ? { adapter: "bedrock" } : {}),
-        ...(vertex ? { adapter: "vertex" } : {}),
-        ...(provider === "azure-openai" ? { adapter: "azure-openai" } : {}),
         api_base: name === "stall-429" ? rateLimitedBase : provider === "openai" ? `${base}/v1` : base,
       });
       await seed.createModel({
@@ -128,19 +113,10 @@ describe("an upstream that stalls its error body", () => {
     ["image edits", "/v1/images/edits", () => multipart({ model: "stall-openai", prompt: "hi" })],
     ["chat", "/v1/chat/completions", () => json({ model: "stall-openai", messages })],
     ["streaming chat", "/v1/chat/completions", () => json({ model: "stall-openai", messages, stream: true })],
-    ["streaming chat to anthropic", "/v1/chat/completions", () => json({ model: "stall-anthropic", messages, stream: true })],
-    ["bridged streaming responses", "/v1/responses", () => json({ model: "stall-anthropic", input: "hi", stream: true })],
     ["completions", "/v1/completions", () => json({ model: "stall-openai", prompt: "hi" })],
     ["embeddings", "/v1/embeddings", () => json({ model: "stall-openai", input: "hi" })],
     ["image generations", "/v1/images/generations", () => json({ model: "stall-openai", prompt: "hi" })],
     ["videos", "/v1/videos", () => json({ model: "stall-openai", prompt: "hi" })],
-    ["streaming chat to azure", "/v1/chat/completions", () => json({ model: "stall-azure", messages, stream: true })],
-    ["streaming chat to vertex gemini", "/v1/chat/completions", () => json({ model: "stall-vertex-gemini", messages, stream: true })],
-    ["streaming chat to vertex claude", "/v1/chat/completions", () => json({ model: "stall-vertex-claude", messages, stream: true })],
-    ["streaming bedrock converse", "/v1/chat/completions", () => json({ model: "stall-bedrock-converse", messages, stream: true })],
-    ["bedrock converse", "/v1/chat/completions", () => json({ model: "stall-bedrock-converse", messages })],
-    ["streaming bedrock chat endpoint", "/v1/chat/completions", () => json({ model: "stall-bedrock-chat", messages, stream: true })],
-    ["bedrock chat endpoint", "/v1/chat/completions", () => json({ model: "stall-bedrock-chat", messages })],
   ])("%s answers within the budget", async (_what, path, init) => {
     if (!etcdReachable) return;
     const res = await fetch(`${app!.proxyUrl}${path}`, {

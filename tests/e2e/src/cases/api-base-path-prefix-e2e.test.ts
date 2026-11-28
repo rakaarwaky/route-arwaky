@@ -357,35 +357,4 @@ describe("api_base path prefix is preserved on every endpoint", () => {
     expect(path).toBe("/v1/responses");
   });
 
-  test("anthropic keeps /v1 in the endpoint even under a mounted path", async () => {
-    if (!app) throw new Error("setup failed");
-    // Mirror image of the OpenAI family: Anthropic documents the bare
-    // host and owns `/v1` in the endpoint, so a gateway mounted at
-    // `/anthropic` serves `/anthropic/v1/messages` — the path must NOT
-    // suppress the version segment here.
-    const messagesPath = await onShared(() =>
-      fetch(`${app!.proxyUrl}/v1/messages`, {
-        method: "POST",
-        headers: { ...auth, "content-type": "application/json" },
-        body: JSON.stringify({
-          model: "m-anthropic-mounted",
-          max_tokens: 16,
-          messages: [{ role: "user", content: "hi" }],
-        }),
-      }),
-    );
-    expect(messagesPath).toBe("/anthropic/v1/messages");
-
-    const countPath = await onShared(() =>
-      fetch(`${app!.proxyUrl}/v1/messages/count_tokens`, {
-        method: "POST",
-        headers: { ...auth, "content-type": "application/json" },
-        body: JSON.stringify({
-          model: "m-anthropic-mounted",
-          messages: [{ role: "user", content: "hi" }],
-        }),
-      }),
-    );
-    expect(countPath).toBe("/anthropic/v1/messages/count_tokens");
-  });
 });

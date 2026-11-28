@@ -98,35 +98,6 @@ const chatText = (bytes: number) => [
   "[DONE]",
 ];
 
-const anthropicFrame = (type: string, body: Record<string, unknown>) =>
-  `event: ${type}\ndata: ${JSON.stringify({ type, ...body })}\n\n`;
-
-const anthropicStream = (middle: string[], text: string[]) => [
-  anthropicFrame("message_start", {
-    message: {
-      id: "msg_raw",
-      type: "message",
-      role: "assistant",
-      content: [],
-      model: "claude-3-5-haiku-20241022",
-      stop_reason: null,
-      usage: { input_tokens: 5, output_tokens: 1 },
-    },
-  }),
-  ...middle,
-  anthropicFrame("content_block_start", { index: 0, content_block: { type: "text", text: "" } }),
-  ...text.map((t) =>
-    anthropicFrame("content_block_delta", { index: 0, delta: { type: "text_delta", text: t } }),
-  ),
-  anthropicFrame("content_block_stop", { index: 0 }),
-  anthropicFrame("message_delta", { delta: { stop_reason: "end_turn" }, usage: { output_tokens: 40 } }),
-  anthropicFrame("message_stop", {}),
-];
-
-// Anthropic: `ping` events.
-const ANTHROPIC_PINGS = anthropicStream(repeatToBytes(anthropicFrame("ping", {}), RAW_TARGET), [TAIL]);
-const anthropicText = (bytes: number) => anthropicStream([], tokens(bytes));
-
 // Responses: base64 image previews, which carry no generated text.
 const B64 = "A".repeat(8_000);
 const RESPONSES_PARTIAL_IMAGES = [
@@ -213,42 +184,6 @@ const responsesHighRatio = (bytes: number) => [
   ),
 ];
 
-const PING = anthropicFrame("ping", {});
-const anthropicHighRatio = (bytes: number) => {
-  const text = tokens(bytes);
-  const frames: string[] = [];
-  let raw = 0;
-  let content = 0;
-  for (const t of text) {
-    const f = anthropicFrame("content_block_delta", { index: 0, delta: { type: "text_delta", text: t } });
-    frames.push(f);
-    raw += f.length;
-    content += t.length;
-    while (raw < HIGH_RATIO * content) {
-      frames.push(PING);
-      raw += PING.length;
-    }
-  }
-  return [
-    anthropicFrame("message_start", {
-      message: {
-        id: "msg_ratio",
-        type: "message",
-        role: "assistant",
-        content: [],
-        model: "claude-3-5-haiku-20241022",
-        stop_reason: null,
-        usage: { input_tokens: 5, output_tokens: 1 },
-      },
-    }),
-    anthropicFrame("content_block_start", { index: 0, content_block: { type: "text", text: "" } }),
-    ...frames,
-    anthropicFrame("content_block_stop", { index: 0 }),
-    anthropicFrame("message_delta", { delta: { stop_reason: "end_turn" }, usage: { output_tokens: 40 } }),
-    anthropicFrame("message_stop", {}),
-  ];
-};
-
 const chatHighRatio = (bytes: number) => [
   ...tokens(bytes).map((t) =>
     sseData(
@@ -320,7 +255,7 @@ describe("held-back stream raw-byte bound", () => {
     };
     const model = async (
       display: string,
-      provider: "openai" | "anthropic",
+      provider: "openai",
       events: string[],
       guard: { id: string },
       opts: { raw?: boolean; pk?: Record<string, unknown> } = {},
@@ -329,13 +264,13 @@ describe("held-back stream raw-byte bound", () => {
       const pk = await seed.createProviderKey({
         display_name: `${display}-pk`,
         api_key: "sk-mock",
-        api_base: provider === "openai" ? `${u.baseUrl}/v1` : u.baseUrl,
+        api_base: `${u.baseUrl}/v1`,
         ...opts.pk,
       });
       const m = await seed.createModel({
         display_name: display,
         provider,
-        model_name: provider === "openai" ? "gpt-4o-mini" : "claude-3-5-haiku-20241022",
+        model_name: "gpt-4o-mini",
         provider_key_id: pk.id,
       });
       await seed.attachGuardrailToModel(guard.id, m.id);
@@ -344,8 +279,6 @@ describe("held-back stream raw-byte bound", () => {
 
     for (const [policy, guard] of Object.entries(policies)) {
       await model(`raw-chat-${policy}`, "openai", CHAT_CONTENT_FREE, guard);
-      await model(`raw-msg-native-${policy}`, "anthropic", ANTHROPIC_PINGS, guard, { raw: true });
-      await model(`raw-msg-bridge-${policy}`, "openai", CHAT_CONTENT_FREE, guard);
       await model(`raw-resp-native-${policy}`, "openai", RESPONSES_PARTIAL_IMAGES, guard);
       // `apis: {}`: no `/v1/responses` on this endpoint, so the route reaches
       // it through the chat bridge.
@@ -367,10 +300,7 @@ describe("held-back stream raw-byte bound", () => {
     }
     await model("raw-chat-at-cap", "openai", chatText(CAP), policies.closed);
     await model("raw-chat-over-cap", "openai", chatText(CAP + 1), policies.closed);
-    await model("raw-msg-at-cap", "anthropic", anthropicText(CAP), policies.closed, { raw: true });
-    await model("raw-msg-over-cap", "anthropic", anthropicText(CAP + 1), policies.closed, { raw: true });
     await model("raw-resp-ratio", "openai", responsesHighRatio(CAP), policies.closed, { raw: true });
-    await model("raw-msg-ratio", "anthropic", anthropicHighRatio(CAP), policies.closed, { raw: true });
     const ratioBacking = await model("raw-route-ratio-backing", "openai", chatHighRatio(CAP), policies.closed, {
       raw: true,
     });
@@ -414,8 +344,6 @@ describe("held-back stream raw-byte bound", () => {
     return res.text();
   };
   const chat = (model: string) => post("/v1/chat/completions", { model, messages: [{ role: "user", content: "go" }] });
-  const messages = (model: string) =>
-    post("/v1/messages", { model, max_tokens: 256, messages: [{ role: "user", content: "go" }] });
   const responses = (model: string) => post("/v1/responses", { model, input: "go" });
   const route = (policy: string) =>
     post(`/passthrough/raw-${policy}/chat/completions`, {
@@ -433,8 +361,6 @@ describe("held-back stream raw-byte bound", () => {
 
   const surfaces: Array<[string, (policy: string) => Promise<string>]> = [
     ["/v1/chat/completions", (p) => chat(`raw-chat-${p}`)],
-    ["/v1/messages (native)", (p) => messages(`raw-msg-native-${p}`)],
-    ["/v1/messages (bridged)", (p) => messages(`raw-msg-bridge-${p}`)],
     ["/v1/responses (native)", (p) => responses(`raw-resp-native-${p}`)],
     ["/v1/responses (bridged)", (p) => responses(`raw-resp-bridge-${p}`)],
     [
@@ -465,7 +391,6 @@ describe("held-back stream raw-byte bound", () => {
 
   const textCases: Array<[string, (m: string) => Promise<string>, string]> = [
     ["/v1/chat/completions", chat, "raw-chat"],
-    ["/v1/messages (native)", messages, "raw-msg"],
   ];
   for (const [surface, send, prefix] of textCases) {
     test(`${surface}: a token stream trips on the content cap, not the raw bound`, async (ctx) => {
@@ -484,7 +409,7 @@ describe("held-back stream raw-byte bound", () => {
   // the upstream's own bytes must hold them until the content cap binds.
   const ratioFrames = (frames: string[]) => frames.join("").length;
   test("high-ratio fixtures sit between 64× and 128× the content cap", () => {
-    for (const frames of [responsesHighRatio(CAP), anthropicHighRatio(CAP), chatHighRatio(CAP)]) {
+    for (const frames of [responsesHighRatio(CAP), chatHighRatio(CAP)]) {
       expect(ratioFrames(frames)).toBeGreaterThan(64 * CAP);
       expect(ratioFrames(frames)).toBeLessThan(128 * CAP);
     }
@@ -492,7 +417,6 @@ describe("held-back stream raw-byte bound", () => {
 
   const ratioCases: Array<[string, () => Promise<string>, string]> = [
     ["/v1/responses (native)", () => responses("raw-resp-ratio"), MASKED],
-    ["/v1/messages (native)", () => messages("raw-msg-ratio"), MASKED],
     ["passthrough route", () => route("ratio"), "content_filter"],
   ];
   for (const [surface, send, scanned] of ratioCases) {

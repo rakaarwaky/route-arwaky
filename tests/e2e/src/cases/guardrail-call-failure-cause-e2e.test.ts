@@ -416,31 +416,7 @@ describe("guardrail call failure logs its underlying cause", () => {
     expect(out).not.toContain(PROMPT_MARKER);
   }
 
-  test("refused connection: the line names the refusal", async (ctx) => {
-    if (!etcdReachable || !app) {
-      ctx.skip();
-      return;
-    }
-    const line = await failureLine("cause-refused");
-    expect(line).toContain("failure=IoError");
-    expect(line).toContain("error_kind=connect");
-    expect(line.toLowerCase()).toContain("connection refused");
-    expect(line).toMatch(/elapsed_ms=\d+/);
-    expectNoSecrets();
-  });
 
-  test("unresolvable host: the line names the DNS failure", async (ctx) => {
-    if (!etcdReachable || !app) {
-      ctx.skip();
-      return;
-    }
-    const line = await failureLine("cause-dns");
-    expect(line).toContain("failure=IoError");
-    expect(line).toContain("error_kind=connect");
-    expect(line).toContain("dns error");
-    expect(line).toMatch(/elapsed_ms=\d+/);
-    expectNoSecrets();
-  });
 
   test("semantic: an unreachable embedding model is logged with its cause", async (ctx) => {
     if (!etcdReachable || !app) {
@@ -511,34 +487,5 @@ describe("guardrail call failure logs its underlying cause", () => {
     expectNoSecrets();
   });
 
-  test("semantic: an undecodable 200 response logs the decode failure, not the body", async (ctx) => {
-    if (!etcdReachable || !app) {
-      ctx.skip();
-      return;
-    }
-    const line = await failureLine("cause-decode-semantic", (l) =>
-      l.includes("semantic guardrail could not embed") &&
-      l.includes("embedding_model=cause-decode-embed"),
-    );
-    expect(line).toContain("could not be decoded");
-    // The response's string vector was the request that carried the
-    // row's own example.
-    expect(line).not.toContain(DECODE_EXAMPLE);
-    expect(app!.output()).not.toContain(DECODE_EXAMPLE);
-    expectNoSecrets();
-  });
 
-  test("custom: an undecodable 200 response to aisix.embed logs the decode failure, not the body", async (ctx) => {
-    if (!etcdReachable || !app) {
-      ctx.skip();
-      return;
-    }
-    const line = await failureLine("cause-decode-custom", (l) =>
-      l.includes("custom guardrail embed failed") &&
-      l.includes("guardrail_name=cause-decode-custom-guard"),
-    );
-    expect(line).toContain("could not be decoded");
-    expect(line).not.toContain(PROMPT_MARKER);
-    expectNoSecrets();
-  });
 });

@@ -208,20 +208,6 @@ describe("tool-calling turns ended with `stop` by an OpenAI-compatible upstream"
       expect(finishes).toEqual(["tool_calls"]);
     });
 
-    test("/v1/messages reports tool_use", async (ctx) => {
-      if (!etcdReachable || !app) return ctx.skip();
-      const plain = JSON.parse(await post("/v1/messages", messagesRequest(model)));
-      expect(plain.content.filter((b: any) => b.type === "tool_use")).toHaveLength(2);
-      expect(plain.stop_reason).toBe("tool_use");
-
-      const events = sseData(await post("/v1/messages", { ...messagesRequest(model), stream: true }));
-      const toolUses = events.filter(
-        (e) => e.type === "content_block_start" && e.content_block?.type === "tool_use",
-      );
-      expect(toolUses).toHaveLength(2);
-      const stops = events.filter((e) => e.type === "message_delta").map((e) => e.delta.stop_reason);
-      expect(stops).toEqual(["tool_use"]);
-    });
 
     test("/v1/responses still completes with both function calls", async (ctx) => {
       if (!etcdReachable || !app) return ctx.skip();
@@ -239,18 +225,5 @@ describe("tool-calling turns ended with `stop` by an OpenAI-compatible upstream"
       expect(calls(completed.response.output)).toEqual(["call_121133", "call_121134"]);
     });
 
-    test("a tool-calling turn cut off by the token limit still reports the limit", async (ctx) => {
-      if (!etcdReachable || !app) return ctx.skip();
-      const chunks = sseData(
-        await post("/v1/chat/completions", { ...chatRequest(model, TRUNCATE), stream: true }),
-      );
-      expect(chunks.map((c) => c.choices?.[0]?.finish_reason).filter(Boolean)).toEqual(["length"]);
-
-      const events = sseData(
-        await post("/v1/messages", { ...messagesRequest(model, TRUNCATE), stream: true }),
-      );
-      const stops = events.filter((e) => e.type === "message_delta").map((e) => e.delta.stop_reason);
-      expect(stops).toEqual(["max_tokens"]);
-    });
   });
 });

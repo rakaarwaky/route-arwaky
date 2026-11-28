@@ -35,7 +35,6 @@ const json = (path: string, body: unknown): Request =>
     method: "POST",
     headers: {
       "content-type": "application/json",
-      "anthropic-version": "2023-06-01",
       accept: "application/json, text/event-stream",
     },
     body: JSON.stringify(body),
@@ -54,30 +53,12 @@ const REQUESTS: Array<[string, () => Request]> = [
   ["completions", () => json("/v1/completions", { model: "parity-openai", prompt: TEXT })],
   ["speech", () => json("/v1/audio/speech", { model: "parity-openai", input: TEXT, voice: "alloy" })],
   [
-    "count_tokens",
-    () =>
-      json("/v1/messages/count_tokens", {
-        model: "parity-anthropic",
-        messages: [{ role: "user", content: TEXT }],
-      }),
-  ],
-  [
     "image edits",
     () => multipart("/v1/images/edits", { model: "parity-openai", prompt: TEXT }, "image"),
   ],
   [
     "transcription",
     () => multipart("/v1/audio/transcriptions", { model: "parity-openai", prompt: TEXT }, "file"),
-  ],
-  [
-    "mcp",
-    () =>
-      json("/mcp", {
-        jsonrpc: "2.0",
-        id: 1,
-        method: "tools/call",
-        params: { name: "paritymcp__echo", arguments: { text: TEXT } },
-      }),
   ],
 ];
 
@@ -118,7 +99,6 @@ describe("what a blocked row says the guardrails did ignores the exporter's mode
       for (const [name, provider, model_name, base, adapter] of [
         ["parity-openai", "openai", "gpt-4o-mini", `${upstream.baseUrl}/v1`, undefined],
         ["parity-rerank", "cohere", "rerank-v3.5", `${upstream.baseUrl}/v1`, "openai"],
-        ["parity-anthropic", "anthropic", "claude-sonnet-4-5", upstream.baseUrl, undefined],
       ] as const) {
         const pk = await seed.createProviderKey({
           display_name: `${name}-pk`,

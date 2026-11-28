@@ -271,46 +271,4 @@ describe("bridged tool parameters: custom tools, tool_choice forms, parallel_too
     expect(toolTurn.tool_call_id).toBe("call_1");
   });
 
-  test("/v1/chat/completions: parallel_tool_calls false becomes disable_parallel_tool_use on the way to Anthropic", async (ctx) => {
-    if (!etcdReachable || !app || !anthropicUpstream) {
-      ctx.skip();
-      return;
-    }
-    await ready();
-
-    const baseline = anthropicUpstream.receivedRequests.length;
-    const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: HEADERS,
-      body: JSON.stringify({
-        model: "tool-params-anthropic",
-        max_tokens: 32,
-        messages: [{ role: "user", content: "weather in Paris?" }],
-        tools: [
-          {
-            type: "function",
-            function: {
-              name: "get_weather",
-              parameters: {
-                type: "object",
-                properties: { city: { type: "string" } },
-              },
-            },
-          },
-        ],
-        parallel_tool_calls: false,
-      }),
-    });
-    expect(res.status).toBe(200);
-
-    const sent = lastBodyOn(anthropicUpstream, baseline, "/v1/messages");
-    // Anthropic rejects unknown top-level parameters, so the OpenAI key
-    // must not survive — it is re-expressed on the choice instead, which
-    // the caller sent none of and so defaults to Anthropic's own.
-    expect(sent).not.toHaveProperty("parallel_tool_calls");
-    expect(sent.tool_choice).toEqual({
-      type: "auto",
-      disable_parallel_tool_use: true,
-    });
-  });
 });

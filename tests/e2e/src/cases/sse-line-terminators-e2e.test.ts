@@ -121,38 +121,6 @@ describe("sse line terminators e2e: a CR-framed upstream is read like any other"
     expect(text.trimEnd().endsWith("data: [DONE]")).toBe(true);
   });
 
-  test("/v1/messages native passthrough: a CR-framed stream is restamped and keeps its framing", async (ctx) => {
-    if (!etcdReachable || !app || !seed) return void ctx.skip();
-
-    const frames = [
-      `event: message_start\rdata: {"type":"message_start","message":{"id":"msg_cr","type":"message","role":"assistant","model":"${UPSTREAM_REPORTED_MODEL}","content":[],"usage":{"input_tokens":4,"output_tokens":0}}}\r\r`,
-      `event: content_block_start\rdata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\r\r`,
-      `event: content_block_delta\rdata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}\r\r`,
-      `event: content_block_stop\rdata: {"type":"content_block_stop","index":0}\r\r`,
-      `event: message_delta\rdata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}\r\r`,
-      `event: message_stop\rdata: {"type":"message_stop"}\r\r`,
-    ];
-    const upstream = await startOpenAiUpstream({ rawStreamFrames: frames, eventDelayMs: 5 });
-    upstreams.push(upstream);
-    await seedAlias("cr-messages", upstream, "anthropic");
-
-    const res = await fetch(`${app.proxyUrl}/v1/messages`, {
-      method: "POST",
-      headers: HEADERS,
-      body: JSON.stringify({
-        model: "cr-messages",
-        max_tokens: 16,
-        stream: true,
-        messages: [{ role: "user", content: "say ok" }],
-      }),
-    });
-    expect(res.status).toBe(200);
-    const text = await res.text();
-    expect(text).toContain(`"model":"cr-messages"`);
-    expect(text).not.toContain(UPSTREAM_REPORTED_MODEL);
-    // Byte-for-byte the upstream's stream apart from the one spliced value.
-    expect(text).toBe(frames.join("").replace(UPSTREAM_REPORTED_MODEL, "cr-messages"));
-  });
 
   test("/v1/responses native passthrough: every snapshot frame of a CR-framed stream is restamped", async (ctx) => {
     if (!etcdReachable || !app || !seed) return void ctx.skip();

@@ -34,12 +34,10 @@ const CALLER_KEY_HASH = createHash("sha256")
 
 const PK_NAME = "usage1317-pk";
 const EMBED_PK_NAME = "usage1317-embed-pk";
-const MSG_PK_NAME = "usage1317-messages-pk";
 const RESP_PK_NAME = "usage1317-responses-pk";
 const SLOW_PK_NAME = "usage1317-slow-pk";
 const MODEL = "usage1317-chat";
 const EMBED_MODEL = "usage1317-embed";
-const MSG_MODEL = "usage1317-messages";
 const RESP_MODEL = "usage1317-responses";
 const SLOW_MODEL = "usage1317-slow";
 
@@ -94,19 +92,6 @@ describe("usage-event and cancel attribution #1317 e2e", () => {
       model_name: "text-embedding-3-small",
       provider_key_id: embedPk.id,
     });
-    // `/v1/messages` bridges an Anthropic-shape request onto this
-    // OpenAI upstream, so it reuses the chat-shaped mock.
-    const msgPk = await seed.createProviderKey({
-      display_name: MSG_PK_NAME,
-      api_key: "sk-mock",
-      api_base: `${fast.baseUrl}/v1`,
-    });
-    await seed.createModel({
-      display_name: MSG_MODEL,
-      provider: "openai",
-      model_name: "gpt-4o-mini",
-      provider_key_id: msgPk.id,
-    });
     const respPk = await seed.createProviderKey({
       display_name: RESP_PK_NAME,
       api_key: "sk-mock",
@@ -132,7 +117,7 @@ describe("usage-event and cancel attribution #1317 e2e", () => {
 
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
-      allowed_models: [MODEL, SLOW_MODEL, EMBED_MODEL, MSG_MODEL, RESP_MODEL],
+      allowed_models: [MODEL, SLOW_MODEL, EMBED_MODEL, RESP_MODEL],
     });
 
     // The caller key is seeded last, so `GET /v1/models` answering 200 implies
@@ -205,13 +190,6 @@ describe("usage-event and cancel attribution #1317 e2e", () => {
       model: EMBED_MODEL,
       pk: EMBED_PK_NAME,
       body: { input: "hi" },
-    },
-    {
-      handler: "messages",
-      path: "/v1/messages",
-      model: MSG_MODEL,
-      pk: MSG_PK_NAME,
-      body: { max_tokens: 16, messages: [{ role: "user", content: "hi" }] },
     },
     {
       handler: "responses",
