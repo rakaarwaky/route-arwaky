@@ -290,18 +290,16 @@ fn census_snapshot() -> AisixSnapshot {
     .expect("valid provider key");
     snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
 
-    for (id, name, provider, model_name, pk_id) in
-        [("m-openai", "census-openai", "openai", "gpt-4o-mini", PK_ID)]
-    {
-        let model: aisix_core::Model = serde_json::from_value(serde_json::json!({
-            "display_name": name,
-            "provider": provider,
-            "model_name": model_name,
-            "provider_key_id": pk_id,
-        }))
-        .expect("valid model");
-        snap.models.insert(ResourceEntry::new(id, model, 1));
-    }
+    let (id, name, provider, model_name, pk_id) =
+        ("m-openai", "census-openai", "openai", "gpt-4o-mini", PK_ID);
+    let model: aisix_core::Model = serde_json::from_value(serde_json::json!({
+        "display_name": name,
+        "provider": provider,
+        "model_name": model_name,
+        "provider_key_id": pk_id,
+    }))
+    .expect("valid model");
+    snap.models.insert(ResourceEntry::new(id, model, 1));
 
     let embedding: aisix_core::Model = serde_json::from_value(serde_json::json!({
         "display_name": "census-embedding",

@@ -4244,20 +4244,29 @@ managed:
         assert!(build_hub().dispatch_two_tier(&pk).is_none());
     }
 
-    /// The canonical `provider: "openai"` / `provider: "anthropic"` keys
-    /// cp-api writes reach a SPECIALIZED bridge, so their protocol comes
-    /// from the vendor tier — reading `pk.adapter` alone would report
-    /// `unknown` for a key that omits it.
+    /// The canonical `provider: "openai"` keys cp-api writes reach a
+    /// SPECIALIZED bridge, so their protocol comes from the vendor tier
+    /// — reading `pk.adapter` alone would report `unknown` for a key
+    /// that omits it. An adapter-less long-tail key has no protocol and
+    /// must stay `unknown`, never silently re-routed to another
+    /// upstream's wire protocol.
     #[test]
     fn upstream_protocol_reads_the_specialized_tier_before_the_adapter() {
-        for (vendor, want) in [("openai", "openai"), ("anthropic", "anthropic")] {
-            let pk: aisix_core::ProviderKey = serde_json::from_str(&format!(
-                r#"{{"display_name":"pk","api_key":"k","provider":"{vendor}"}}"#
-            ))
-            .unwrap();
-            assert!(pk.adapter.is_none());
-            assert_eq!(aisix_gateway::upstream_protocol(&pk), want);
-        }
+        let pk: aisix_core::ProviderKey =
+            serde_json::from_str(r#"{"display_name":"pk","api_key":"k","provider":"openai"}"#)
+                .unwrap();
+        assert!(pk.adapter.is_none());
+        assert_eq!(aisix_gateway::upstream_protocol(&pk), "openai");
+
+        let byo: aisix_core::ProviderKey =
+            serde_json::from_str(r#"{"display_name":"pk","api_key":"k","provider":"byo"}"#)
+                .unwrap();
+        assert!(byo.adapter.is_none());
+        assert_eq!(
+            aisix_gateway::upstream_protocol(&byo),
+            "unknown",
+            "an adapter-less non-openai key must not be labelled with a guessed protocol",
+        );
     }
 
     /// `build_hub()` must NOT register `cohere` as a specialized chat
@@ -4328,35 +4337,6 @@ managed:
         );
     }
 
-    /// `build_hub()` MUST register `Adapter::Anthropic` as a family
-    /// bridge for symmetry with `Adapter::Openai`. The Anthropic
-    /// family bridge serves any Anthropic-compat vendor cp-api admits.
-    #[test]
-    fn build_hub_registers_anthropic_family_bridge() {
-        let hub = build_hub();
-        // Tighten: assert the dispatch comes from the family tier,
-        // not from an accidentally-registered specialized bridge.
-        // The bare vendor string `"some-anthropic-compat"` is not in
-        // the specialized list, so `dispatch_two_tier` must fall
-        // through to the `Adapter::Anthropic` family registration.
-        assert!(
-            hub.get_specialized("some-anthropic-compat").is_none(),
-            "`some-anthropic-compat` must not be specialized; the test must exercise the family tier"
-        );
-        let pk: aisix_core::ProviderKey = serde_json::from_str(
-            r#"{"display_name":"anth-compat-pk","api_key":"sk-test","provider":"some-anthropic-compat","adapter":"anthropic","api_base":"https://example.com"}"#,
-        )
-        .unwrap();
-        let bridge = hub
-            .dispatch_two_tier(&pk)
-            .unwrap_or_else(|| panic!("Adapter::Anthropic family bridge must be registered"));
-        assert_eq!(
-            bridge.name(),
-            "anthropic",
-            "family Anthropic bridge MUST be the bare `AnthropicBridge::new()`",
-        );
-    }
-
     /// `build_hub()` MUST register the specialized `openai` vendor so a
     /// ProviderKey with `provider: "openai"` dispatches to the dedicated
     /// `OpenAiBridge`. This pins the registration end-to-end against the
@@ -4372,21 +4352,6 @@ managed:
             bridge.name(),
             "openai",
             "specialized 'openai' MUST be `OpenAiBridge::new()` (bridge name 'openai')",
-        );
-    }
-
-    /// Parallel of the openai specialized-registration test, for the
-    /// Anthropic side.
-    #[test]
-    fn build_hub_registers_specialized_anthropic_vendor() {
-        let hub = build_hub();
-        let bridge = hub
-            .get_specialized("anthropic")
-            .expect("anthropic vendor must be registered as specialized");
-        assert_eq!(
-            bridge.name(),
-            "anthropic",
-            "specialized 'anthropic' MUST be `AnthropicBridge::new()` (bridge name 'anthropic')",
         );
     }
 

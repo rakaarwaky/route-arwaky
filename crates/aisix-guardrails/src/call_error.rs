@@ -46,21 +46,6 @@ pub(crate) struct CallFailure<F> {
     pub(crate) elapsed_ms: u64,
 }
 
-impl<F> CallFailure<F> {
-    /// A failure with no cause attached, for tests that drive a kind's
-    /// failure handling directly.
-    #[cfg(test)]
-    pub(crate) fn bare(failure: F) -> Self {
-        Self {
-            failure,
-            http_status: None,
-            error: None,
-            error_kind: None,
-            elapsed_ms: 0,
-        }
-    }
-}
-
 /// Started right before a guardrail call is sent; every failure of that call
 /// is built from it so the elapsed time is measured the same way everywhere,
 /// and every await of that call is bounded by its one deadline.

@@ -2549,7 +2549,7 @@ mod tests {
         assert_eq!(hits[0].action, "would_block");
         assert_eq!(
             hits[0].reason,
-            "openai moderation unavailable (openai_moderation_5xx)"
+            "openai_moderation guardrail evaluation unavailable (openai_moderation_5xx)"
         );
         assert_eq!(hits[0].error_type, "openai_moderation_5xx");
     }

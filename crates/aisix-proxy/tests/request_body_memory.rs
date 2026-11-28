@@ -244,13 +244,12 @@ fn upstream_response(path: &str) -> serde_json::Value {
 
 fn snapshot(api_base: &str, capture_content: bool) -> AisixSnapshot {
     let snap = AisixSnapshot::new();
-    for (pk_id, provider) in [(PK_ID, "openai")] {
-        let pk: aisix_core::ProviderKey = serde_json::from_str(&format!(
-            r#"{{"display_name":"{provider}-up","api_key":"sk-upstream","api_base":"{api_base}","provider":"{provider}","adapter":"{provider}"}}"#
-        ))
-        .unwrap();
-        snap.provider_keys.insert(ResourceEntry::new(pk_id, pk, 1));
-    }
+    let (pk_id, provider) = (PK_ID, "openai");
+    let pk: aisix_core::ProviderKey = serde_json::from_str(&format!(
+        r#"{{"display_name":"{provider}-up","api_key":"sk-upstream","api_base":"{api_base}","provider":"{provider}","adapter":"{provider}"}}"#
+    ))
+    .unwrap();
+    snap.provider_keys.insert(ResourceEntry::new(pk_id, pk, 1));
     for (id, name, provider, upstream, pk_id) in [
         ("model-chat", "vision", "openai", "gpt-4o", PK_ID),
         (

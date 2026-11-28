@@ -6,7 +6,6 @@
       "enabled": true,
       "tls": null
     },
-    "bedrock_endpoint_url": null,
     "cache": {
       "backend": "memory",
       "redis": null
@@ -62,7 +61,6 @@
       "log_level": "warn",
       "metrics": {
         "buckets": {
-          "a2a_ttfb": null,
           "guardrail_latency": null,
           "request_e2e_latency": null,
           "request_ttft": null
@@ -113,9 +111,6 @@
       "min_drain_secs": 30
     },
     "upstream": {
-      "bedrock": {
-        "mantle_endpoint": null
-      },
       "connect_timeout_ms": 5000,
       "media_fetch": {
         "enabled": true,

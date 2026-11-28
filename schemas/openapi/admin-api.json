@@ -4508,9 +4508,11 @@
             ],
             "properties": {
               "match": {
+                "description": "Matching parameters shared across the routes: similarity metric, per-example aggregation, and the default similarity threshold. Required.",
                 "type": "object"
               },
               "routes": {
+                "description": "Routes evaluated for each request. At least one is required, and every route names its example utterances.",
                 "items": {
                   "required": [
                     "examples"

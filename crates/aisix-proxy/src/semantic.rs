@@ -82,21 +82,21 @@ pub(crate) fn decide(
 /// access log. Free text about the failure goes only to the warn line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecisionFailure {
-    EmbeddingTimeout,
+    Timeout,
     /// The embedding upstream answered an error, or the call failed in
     /// transport or decoding.
-    EmbeddingUpstream,
+    Upstream,
     /// The embedding model is missing, misconfigured, or returned vectors
     /// that do not fit it.
-    EmbeddingUnavailable,
+    Unavailable,
 }
 
 impl DecisionFailure {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::EmbeddingTimeout => "embedding_timeout",
-            Self::EmbeddingUpstream => "embedding_upstream",
-            Self::EmbeddingUnavailable => "embedding_unavailable",
+            Self::Timeout => "embedding_timeout",
+            Self::Upstream => "embedding_upstream",
+            Self::Unavailable => "embedding_unavailable",
         }
     }
 
@@ -104,7 +104,7 @@ impl DecisionFailure {
         use aisix_gateway::BridgeError;
         match err {
             EmbedTextsError::Dispatch(ProxyError::Bridge(BridgeError::Timeout { .. })) => {
-                Self::EmbeddingTimeout
+                Self::Timeout
             }
             EmbedTextsError::Dispatch(ProxyError::Bridge(
                 BridgeError::UpstreamStatus { .. }
@@ -114,9 +114,9 @@ impl DecisionFailure {
                 | BridgeError::TokenExchangeDecode(_)
                 | BridgeError::Transport(_)
                 | BridgeError::StreamAborted,
-            )) => Self::EmbeddingUpstream,
+            )) => Self::Upstream,
             EmbedTextsError::Dispatch(_) | EmbedTextsError::UnusableResponse(_) => {
-                Self::EmbeddingUnavailable
+                Self::Unavailable
             }
         }
     }
@@ -669,7 +669,7 @@ async fn decide_by_embedding(
                 "semantic router references a missing or non-embedding embedding_model; \
                  applying on_embedding_failure",
             );
-            return Err(DecisionFailure::EmbeddingUnavailable);
+            return Err(DecisionFailure::Unavailable);
         }
     };
     let dims = embed_entry

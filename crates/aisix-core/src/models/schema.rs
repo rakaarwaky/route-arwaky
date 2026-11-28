@@ -1077,8 +1077,14 @@ fn split_semantic_modes(node: &mut serde_json::Map<String, Value>) {
         "allOf": [embedder_clause],
         "required": ["match"],
         "properties": {
-            "match": {"type": "object"},
-            "routes": {"items": {"required": ["examples"]}}
+            "match": {
+                "type": "object",
+                "description": "Matching parameters shared across the routes: similarity metric, per-example aggregation, and the default similarity threshold. Required.",
+            },
+            "routes": {
+                "items": {"required": ["examples"]},
+                "description": "Routes evaluated for each request. At least one is required, and every route names its example utterances.",
+            }
         }
     });
     match node.get_mut("allOf").and_then(Value::as_array_mut) {

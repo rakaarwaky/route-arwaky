@@ -1579,7 +1579,7 @@ async fn multipart_dispatch(
                                 aisix_gateway::upstream_error_within(
                                     connect_deadline,
                                     resp,
-                                    |resp| crate::dispatch::held_route_http_error(resp),
+                                    crate::dispatch::held_route_http_error,
                                 )
                                 .await,
                             ));

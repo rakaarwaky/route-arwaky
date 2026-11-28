@@ -2955,7 +2955,7 @@ async fn dispatch(
                         completion.min(u64::from(u32::MAX)) as u32,
                     );
                 }
-                let (mut response, captured_content) = unary_openai(now, cached, &req, content_cap);
+                let (mut response, captured_content) = unary_openai(now, cached, req, content_cap);
                 if state.expose_debug_headers {
                     response
                         .headers_mut()
@@ -3603,7 +3603,7 @@ async fn dispatch(
             completion_tokens_u32,
         );
     }
-    let (mut response, captured_content) = unary_openai(now, upstream, &req, content_cap);
+    let (mut response, captured_content) = unary_openai(now, upstream, req, content_cap);
     // Header only when the gate was open — policy-disabled requests have
     // no cache header at all so a user can tell at a glance whether the
     // gate ran. `bypass` = the caller's `Cache-Control: no-cache`
@@ -4619,7 +4619,7 @@ async fn dispatch_ensemble(
             acc.saturating_add(&p.usage)
         });
     outcome.response.usage = aggregate_usage.clone();
-    let (response, _) = unary_openai(created_ts, outcome.response, &req, None);
+    let (response, _) = unary_openai(created_ts, outcome.response, req, None);
     Ok(Success {
         response,
         // No single provider/model/key governs an ensemble response.
