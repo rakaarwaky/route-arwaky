@@ -15,11 +15,11 @@
 //! snapshot into a new one, mutate, and `store` it. That keeps the
 //! read path reading a fully-formed `Arc<Snapshot>` the whole time.
 
-use aisix_core::config_status::{
+use aisix_core::taxonomy_config_status_vo::{
     hash_record, hash_records, AppliedSnapshot, ConfigStatus, IncomingRejection, LazyHash,
     LoadObservation, PartialCompatResource, SourceKind,
 };
-use aisix_core::snapshot::SnapshotHandle;
+use aisix_core::taxonomy_snapshot_vo::SnapshotHandle;
 use aisix_core::AisixSnapshot;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
@@ -30,13 +30,13 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
-use crate::backoff::ExpBackoff;
-use crate::key::{PrefixScope, PrefixSet, WatchedPrefix};
-use crate::loader::{
+use crate::taxonomy_backoff_vo::ExpBackoff;
+use crate::taxonomy_etcd_key_vo::{PrefixScope, PrefixSet, WatchedPrefix};
+use crate::surface_config_loader_action::{
     self, BuildStats, PartialCompatEntry, PartialCompatRow, RejectedEntry, RejectionKind,
 };
-use crate::provider::{ConfigProvider, ProviderError, RawEntry, WatchEvent};
-use crate::snapshot_cache::{encode_entry, encode_stale, SnapshotCache};
+use crate::taxonomy_provider_vo::{ConfigProvider, ProviderError, RawEntry, WatchEvent};
+use crate::surface_snapshot_cache_store::{encode_entry, encode_stale, SnapshotCache};
 use std::sync::atomic::AtomicBool;
 
 /// Cheap clonable handle for the watch supervisor's freshness state —
@@ -254,7 +254,7 @@ impl Eq for StaleServing {}
 #[derive(Debug, Clone)]
 struct StateEntry {
     entry: RawEntry,
-    /// [`aisix_core::config_status::hash_record`] of `entry`. A pure
+    /// [`aisix_core::taxonomy_config_status_vo::hash_record`] of `entry`. A pure
     /// function of `(key, value)`, so it is valid for exactly as long as
     /// this map holds these bytes.
     record: Arc<[u8]>,
@@ -780,7 +780,7 @@ impl<P: ConfigProvider> Supervisor<P> {
     }
 
     /// Map a loader [`RejectedEntry`] to the source-agnostic wire shape. The
-    /// key is split into `<kind>/<id>` via [`key::parse`]; an unparseable key
+    /// key is split into `<kind>/<id>` via [`taxonomy_etcd_key_vo::parse`]; an unparseable key
     /// (the `bad_key` path) reports empty kind/id, mirroring the control
     /// plane's rejected-resources surface. `stale` joins in the instant the
     /// key began serving its last known good value, if it is (#871).
@@ -878,7 +878,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         let guard = self.partial_compat.lock().unwrap();
         let rows: Vec<PartialCompatRow> = guard.values().cloned().collect();
         drop(guard);
-        loader::aggregate_partial_compat(&rows)
+        surface_config_loader_action::aggregate_partial_compat(&rows)
     }
 
     /// Replace the retained partially-compatible state wholesale. Called
@@ -930,7 +930,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         let guard = self.partial_compat.lock().unwrap();
         let rows: Vec<PartialCompatRow> = guard.values().cloned().collect();
         drop(guard);
-        let aggregated = loader::aggregate_partial_compat(&rows)
+        let aggregated = surface_config_loader_action::aggregate_partial_compat(&rows)
             .into_iter()
             .map(|e| PartialCompatResource {
                 resource_kind: e.kind,
@@ -1365,7 +1365,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         dirty: &mut Dirty,
     ) -> bool {
         // Build a tiny snapshot out of just the new entry, then merge.
-        let (tiny, mut stats) = loader::build_snapshot(&self.prefixes, std::slice::from_ref(entry));
+        let (tiny, mut stats) = surface_config_loader_action::build_snapshot(&self.prefixes, std::slice::from_ref(entry));
         if stats.accepted == 0 {
             // The previous good value keeps serving. Pin it now (#871):
             // the next resync rebuilds from the rejected etcd bytes and
@@ -1572,7 +1572,7 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// outage would then serve a cache claiming a revision whose changes it
     /// does not contain.
     pub fn apply_resync_at(&self, entries: &[RawEntry], read_revision: Option<i64>) -> BuildStats {
-        let (snap, mut stats) = loader::build_snapshot(&self.prefixes, entries);
+        let (snap, mut stats) = surface_config_loader_action::build_snapshot(&self.prefixes, entries);
 
         // Reconcile the last-known-good state against this build, then
         // inject the retained values into the fresh snapshot.
@@ -1633,7 +1633,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         // build can no longer parse (e.g. after a DP downgrade) drops
         // its retention with an ERROR — same contract as any RED row.
         if !injected.is_empty() {
-            let (lkg_snap, lkg_stats) = loader::build_snapshot(&self.prefixes, &injected);
+            let (lkg_snap, lkg_stats) = surface_config_loader_action::build_snapshot(&self.prefixes, &injected);
             if !lkg_stats.rejections.is_empty() {
                 let mut stale = self.stale_serving.lock().unwrap();
                 for r in &lkg_stats.rejections {
@@ -1647,7 +1647,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             }
             merge_snapshot(&snap, &lkg_snap);
             stats.partial_rows.extend(lkg_stats.partial_rows);
-            stats.partially_compatible = loader::aggregate_partial_compat(&stats.partial_rows);
+            stats.partially_compatible = surface_config_loader_action::aggregate_partial_compat(&stats.partial_rows);
             if lkg_stats.accepted > 0 {
                 tracing::warn!(
                     count = lkg_stats.accepted,
@@ -2645,7 +2645,7 @@ fn remove_from_snapshot(snap: &AisixSnapshot, kind: &str, id: &str) {
         }
         // Not the `pricing` kind but the table selector — a global-prefix
         // pricing row arrives here as `global_pricing`. See
-        // [`crate::key::ScopedKey::table_kind`].
+        // [`crate::taxonomy_etcd_key_vo::ScopedKey::table_kind`].
         "pricing" => {
             pricing.remove(id);
         }
@@ -2816,7 +2816,7 @@ pub const BACKOFF_SATURATE_AFTER: Duration = Duration::from_secs(63);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{RawEntry, WatchEvent};
+    use crate::taxonomy_provider_vo::{RawEntry, WatchEvent};
     use async_trait::async_trait;
     use futures::stream;
     use std::sync::Mutex;
@@ -2883,7 +2883,7 @@ mod tests {
     }"#;
 
     fn assert_observed_hash(state: &mut ObservedState) {
-        let expected = aisix_core::config_status::hash_entries(
+        let expected = aisix_core::taxonomy_config_status_vo::hash_entries(
             state
                 .entries
                 .iter()
@@ -3006,7 +3006,7 @@ mod tests {
             "an apply nothing is reading must not digest the configuration",
         );
 
-        let expected = aisix_core::config_status::hash_entries(
+        let expected = aisix_core::taxonomy_config_status_vo::hash_entries(
             rows.iter()
                 .map(|row| (row.key.as_str(), row.value.as_slice())),
         );
@@ -3038,7 +3038,7 @@ mod tests {
         rows[200].value = b"invalid JSON".to_vec();
         rows.push(entry("/aisix/models/0256", VALID_MODEL, 2));
         sup.apply_resync_at(&rows, Some(2));
-        let expected = aisix_core::config_status::hash_entries(
+        let expected = aisix_core::taxonomy_config_status_vo::hash_entries(
             rows.iter()
                 .map(|row| (row.key.as_str(), row.value.as_slice())),
         );
@@ -3745,10 +3745,10 @@ mod tests {
             .collect();
         assert_eq!(rejected.len(), 2);
 
-        let expected_source = aisix_core::config_status::hash_entries(
+        let expected_source = aisix_core::taxonomy_config_status_vo::hash_entries(
             state.iter().map(|(k, v)| (k.as_str(), v.as_slice())),
         );
-        let expected_config = aisix_core::config_status::hash_entries(
+        let expected_config = aisix_core::taxonomy_config_status_vo::hash_entries(
             state
                 .iter()
                 .filter(|(k, _)| !rejected.contains(k) && !stale.contains_key(k))
@@ -3772,7 +3772,7 @@ mod tests {
         // must not flip to the ones that do not load.
         assert!(sup.remove_rejection_for_key("/aisix/guardrails/g-1"));
         sup.sync_config_status(false);
-        let expected_overflow = aisix_core::config_status::hash_entries(
+        let expected_overflow = aisix_core::taxonomy_config_status_vo::hash_entries(
             state
                 .iter()
                 .filter(|(k, _)| k != "/aisix/models/m-2" && !stale.contains_key(k))
@@ -5619,8 +5619,8 @@ mod tests {
         assert!(!sup.apply_put(&entry("/aisix/models/m-bad-2", b"not-json", 2)));
         let rejections = sup.recent_rejections();
         assert_eq!(rejections.len(), 2);
-        assert_eq!(rejections[0].kind, loader::RejectionKind::SchemaFailed);
-        assert_eq!(rejections[1].kind, loader::RejectionKind::NonJson);
+        assert_eq!(rejections[0].kind, surface_config_loader_action::RejectionKind::SchemaFailed);
+        assert_eq!(rejections[1].kind, surface_config_loader_action::RejectionKind::NonJson);
     }
 
     // #1207. The two classes have independent retention budgets *here*, at
@@ -5697,7 +5697,7 @@ mod tests {
 
         let rejections = sup.recent_rejections();
         assert_eq!(rejections.len(), 1);
-        assert_eq!(rejections[0].kind, loader::RejectionKind::NonJson);
+        assert_eq!(rejections[0].kind, surface_config_loader_action::RejectionKind::NonJson);
     }
 
     #[tokio::test]

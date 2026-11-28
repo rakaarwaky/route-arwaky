@@ -391,7 +391,7 @@ pub fn response_into_chat_response(raw: OpenAiResponse) -> ChatResponse {
     };
     let more_choices = choices
         .map(
-            |(index, message, finish_reason, logprobs)| aisix_gateway::chat::ChatChoice {
+            |(index, message, finish_reason, logprobs)| aisix_gateway::taxonomy_chat_vo::ChatChoice {
                 index,
                 message,
                 finish_reason,
@@ -656,7 +656,7 @@ pub struct OpenAiStreamDelta {
     /// Canonical reasoning slot — DeepSeek emits this directly; for
     /// upstreams that put their reasoning text at a different path
     /// (issue #302 §5 `response.reasoning_field`) the bridge runs
-    /// [`extract_reasoning_field`](crate::overrides::extract_reasoning_field)
+    /// [`extract_reasoning_field`](crate::surface_overrides_action::extract_reasoning_field)
     /// over the parsed [`Value`] before the typed parse so the lifted
     /// string lands here.
     #[serde(default)]
@@ -751,7 +751,7 @@ impl ChoiceToolCallIndexer {
 /// A non-empty reasoning field wins over reasoning parts,
 /// as it does on a non-streamed answer (`ChatMessage::reasoning_text`),
 /// and leads the text. Reasoning parts are read through
-/// [`aisix_gateway::chat::reasoning_part_text`]; a part-array delta with
+/// [`aisix_gateway::taxonomy_chat_vo::reasoning_part_text`]; a part-array delta with
 /// neither text nor reasoning keeps relaying an empty `content`.
 fn delta_runs(
     reasoning_field: Option<String>,
@@ -766,11 +766,11 @@ fn delta_runs(
     let mut runs: Vec<(Option<String>, Option<String>)> = vec![(reasoning_field, None)];
     for part in &parts {
         let (open_reasoning, open_text) = runs.last_mut().expect("seeded");
-        if aisix_gateway::chat::is_reasoning_part(part) {
+        if aisix_gateway::taxonomy_chat_vo::is_reasoning_part(part) {
             if field_wins {
                 continue;
             }
-            let Some(text) = aisix_gateway::chat::reasoning_part_text(part) else {
+            let Some(text) = aisix_gateway::taxonomy_chat_vo::reasoning_part_text(part) else {
                 continue;
             };
             match (open_reasoning, open_text) {

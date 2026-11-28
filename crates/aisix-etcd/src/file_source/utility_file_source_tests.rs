@@ -1,5 +1,5 @@
 use super::*;
-use crate::loader::{build_snapshot, RejectionKind};
+use super::{build_snapshot, RejectionKind};
 
 const PK: &str = "0b6f3c1e-2f0a-4c5e-9d55-7d1a8b0c2e11";
 const MODEL: &str = "6efd592d-a73b-573d-8e2c-e9e103692f92";
@@ -234,7 +234,7 @@ async fn the_global_section_loads_through_the_supervisor() {
 #[tokio::test]
 async fn a_file_runs_through_the_supervisor_like_etcd() {
     use crate::{SnapshotCache, Supervisor};
-    use aisix_core::config_status::{ConfigState, SourceKind};
+    use aisix_core::taxonomy_config_status_vo::{ConfigState, SourceKind};
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("resources.yaml");
@@ -301,7 +301,7 @@ async fn a_file_runs_through_the_supervisor_like_etcd() {
 #[tokio::test]
 async fn a_reload_that_cannot_be_read_is_reported_out_of_sync() {
     use crate::{SnapshotCache, Supervisor};
-    use aisix_core::config_status::{ConfigState, SourceKind};
+    use aisix_core::taxonomy_config_status_vo::{ConfigState, SourceKind};
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("resources.yaml");
@@ -364,7 +364,7 @@ fn a_collection_name_is_one_key_segment_and_an_id_is_never_echoed() {
 #[tokio::test]
 async fn a_load_after_the_first_read_does_not_read_the_file_again() {
     use crate::{SnapshotCache, Supervisor};
-    use aisix_core::config_status::{ConfigState, SourceKind};
+    use aisix_core::taxonomy_config_status_vo::{ConfigState, SourceKind};
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("resources.yaml");

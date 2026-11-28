@@ -37,14 +37,14 @@ use aisix_core::models::{
     validate_team_lenient, validate_usage_accounting_lenient, validate_user_lenient, Budget,
     BudgetPolicy, Pricing, Team, UsageAccounting, User,
 };
-use aisix_core::resource::ResourceEntry;
+use aisix_core::taxonomy_resource_vo::ResourceEntry;
 use aisix_core::AisixSnapshot;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::key::{PrefixScope, PrefixSet, ScopedKey};
-use crate::provider::RawEntry;
+use crate::taxonomy_etcd_key_vo::{PrefixScope, PrefixSet, ScopedKey};
+use crate::taxonomy_provider_vo::RawEntry;
 
 /// Why the loader skipped an entry. Surfaced in [`RejectedEntry`] so
 /// the heartbeat / health surface can tell operators what kind of
@@ -797,8 +797,8 @@ mod tests {
     /// `/aisix/global/`, the shape a managed gateway watches.
     fn scoped_prefixes() -> PrefixSet {
         PrefixSet::new(vec![
-            crate::key::WatchedPrefix::environment("/aisix/env-1/"),
-            crate::key::WatchedPrefix::global("/aisix/global/"),
+            crate::taxonomy_etcd_key_vo::WatchedPrefix::environment("/aisix/env-1/"),
+            crate::taxonomy_etcd_key_vo::WatchedPrefix::global("/aisix/global/"),
         ])
     }
 

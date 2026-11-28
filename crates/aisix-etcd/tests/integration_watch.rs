@@ -5,7 +5,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aisix_etcd::provider::ConfigProvider;
+use aisix_etcd::taxonomy_provider_vo::ConfigProvider;
 use aisix_etcd::EtcdConfigProvider;
 use etcd_client::Client;
 use futures::StreamExt;

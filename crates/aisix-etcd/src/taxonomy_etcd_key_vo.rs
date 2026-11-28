@@ -75,7 +75,7 @@ pub enum PrefixScope {
     /// resource kind.
     Environment,
     /// The shared catalog: `<base>/global/`. Carries `pricing` and
-    /// nothing else — see [`crate::loader::build_snapshot`].
+    /// nothing else — see [`crate::surface_config_loader_action::build_snapshot`].
     Global,
 }
 

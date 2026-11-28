@@ -33,8 +33,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex;
 
-use crate::provider::RawEntry;
-use crate::supervisor::StaleServing;
+use crate::taxonomy_provider_vo::RawEntry;
+use crate::surface_supervisor_controller::StaleServing;
 
 /// File-format version. Bumped whenever the wire shape of [`CachedFile`]
 /// changes incompatibly so old DPs ignore future caches instead of

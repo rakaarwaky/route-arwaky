@@ -1,6 +1,6 @@
 //! The [`ConfigProvider`] abstraction the supervisor runs against.
 //!
-//! The real implementation is etcd (see [`crate::etcd_provider`]). Tests
+//! The real implementation is etcd (see [`crate::surface_etcd_provider_controller`]). Tests
 //! plug in an in-memory provider so the supervisor can be exercised
 //! deterministically without a container.
 //!

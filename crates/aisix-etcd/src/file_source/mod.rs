@@ -6,7 +6,7 @@
 //! it, grouped by the kind segment of its etcd key. Reading the file turns
 //! each entry into the [`RawEntry`] etcd would have returned for
 //! `<prefix>/<kind>/<id>`, and from there the gateway runs exactly what it
-//! runs on etcd: [`crate::loader::build_snapshot`] decodes, validates and
+//! runs on etcd: [`crate::surface_config_loader_action::build_snapshot`] decodes, validates and
 //! assembles the snapshot, and [`crate::Supervisor`] applies it, keeps the
 //! last known good value of a row that stops loading, and reports through
 //! `/status/config`. So a document loads from a file exactly when it would
@@ -33,9 +33,10 @@
 //! fails the load as a whole: at boot the gateway does not start, and on
 //! a SIGHUP reload the previous configuration keeps serving.
 
-mod yaml;
+mod surface_yaml_loader_action;
 
-pub use yaml::EnvLookup;
+pub use surface_yaml_loader_action::EnvLookup;
+pub use crate::surface_config_loader_action::{build_snapshot, RejectionKind};
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -46,12 +47,12 @@ use async_trait::async_trait;
 use serde_json::Value;
 use yaml_rust2::{Yaml, YamlLoader};
 
-use aisix_core::config_status::{
+use aisix_core::taxonomy_config_status_vo::{
     hash_entries, ConfigStatus, IncomingRejection, LazyHash, LoadObservation,
 };
 
-use crate::key::{PrefixSet, WatchedPrefix};
-use crate::provider::{ConfigProvider, ProviderError, RawEntry, WatchEvent};
+use crate::taxonomy_etcd_key_vo::{PrefixSet, WatchedPrefix};
+use crate::taxonomy_provider_vo::{ConfigProvider, ProviderError, RawEntry, WatchEvent};
 
 /// The supported `_format_version`. A missing or different value is a load
 /// error, so a file written for another revision of the format is never
@@ -68,7 +69,7 @@ pub const ENV_PREFIX: &str = "/aisix";
 pub const GLOBAL_PREFIX: &str = "/aisix/global/";
 
 /// The prefixes a file's keys resolve against — what
-/// [`crate::loader::build_snapshot`] and the supervisor are given in file
+/// [`crate::surface_config_loader_action::build_snapshot`] and the supervisor are given in file
 /// mode.
 pub fn prefixes() -> PrefixSet {
     PrefixSet::new(vec![
@@ -271,7 +272,7 @@ fn read_kind(
             error("entry must be a mapping".into());
             continue;
         }
-        let mut doc = match yaml::yaml_to_json(item, "", env) {
+        let mut doc = match surface_yaml_loader_action::yaml_to_json(item, "", env) {
             Ok(Value::Object(doc)) => doc,
             Ok(_) => unreachable!("a YAML mapping converts to a JSON object"),
             Err((path, message)) => {
@@ -549,4 +550,4 @@ impl ConfigProvider for FileConfigProvider {
 }
 
 #[cfg(test)]
-mod tests;
+mod utility_file_source_tests;

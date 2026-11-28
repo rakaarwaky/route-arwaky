@@ -20,11 +20,11 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use crate::client::{
+use crate::surface_etcd_client_component::{
     announce_while_pending, classify, failed_on_transport, format_etcd_error, kv_client,
     watch_client, CallError, ConnectError, LazyEtcdClient, DIAL_WAIT_LOG_INTERVAL,
 };
-use crate::provider::{ConfigProvider, ProviderError, RawEntry, WatchEvent};
+use crate::taxonomy_provider_vo::{ConfigProvider, ProviderError, RawEntry, WatchEvent};
 
 /// Fixed-interval retry: 5s × 5 attempts (spec §2).
 pub const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(5);

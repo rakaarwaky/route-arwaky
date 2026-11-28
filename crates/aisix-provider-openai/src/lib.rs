@@ -11,13 +11,13 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
-mod bridge;
-pub mod cohere;
-pub mod overrides;
-pub mod reasoning;
-pub mod wire;
+mod surface_bridge_controller;
+pub mod surface_cohere_controller;
+pub mod surface_overrides_action;
+pub mod taxonomy_reasoning_family_vo;
+pub mod taxonomy_wire_vo;
 
-pub use bridge::{
+pub use surface_bridge_controller::{
     close_strict_response_format_schema, held_route_http_error, parse_openai_error_envelope,
     OpenAiBridge, OPENAI_DEFAULT_BASE,
 };

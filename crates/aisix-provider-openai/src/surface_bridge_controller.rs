@@ -20,8 +20,8 @@
 //! - elapsed deadline → `BridgeError::Timeout { elapsed_ms }`
 
 use aisix_core::{RequestOverrides, ResponseOverrides, StreamDoneMarker};
-use aisix_gateway::structured_output::close_object_schemas;
-use aisix_gateway::url_cache::cached_endpoint_url;
+use aisix_gateway::surface_structured_output_action::close_object_schemas;
+use aisix_gateway::surface_url_cache_store::cached_endpoint_url;
 use aisix_gateway::{
     apply_request_headers, Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream,
     ChatFormat, ChatResponse, EmbeddingRequest, EmbeddingResponse, SseDecoder, SseEvent,
@@ -38,13 +38,13 @@ use reqwest::{header, Client, StatusCode};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
-use crate::overrides::{
+use crate::surface_overrides_action::{
     apply_content_list_to_string, apply_default_body_fields, apply_param_constraints,
     apply_param_renames, apply_stream_done_marker_policy, extract_reasoning_field,
     StreamDoneOutcome,
 };
-use crate::reasoning::{is_reasoning_model, ReasoningFamily};
-use crate::wire::{
+use crate::taxonomy_reasoning_family_vo::{is_reasoning_model, ReasoningFamily};
+use crate::taxonomy_wire_vo::{
     build_request, embed_request_body, embed_response_into, messages_from,
     response_into_chat_response, stream_chunk_into_chat_chunks, DeveloperRoleMode,
     OpenAiEmbedResponse, OpenAiResponse, OpenAiStreamChunk, ToolCallIndexer,
@@ -116,7 +116,7 @@ impl OpenAiBridge {
     /// the resolved Provider Key carries its own connection overrides
     /// (TLS trust settings, a name-resolution address).
     fn client_for(&self, ctx: &BridgeContext) -> Client {
-        aisix_gateway::upstream_tls::client_for_provider_key(
+        aisix_gateway::surface_upstream_tls_component::client_for_provider_key(
             &self.client,
             ctx.provider_key.upstream_connection().as_ref(),
         )
@@ -171,7 +171,7 @@ impl OpenAiBridge {
                     // provider_metadata field names are not part of any
                     // wire contract a customer should depend on).
                     tracing::error!(
-                        target: "aisix_provider_openai::bridge",
+                        target: "aisix_provider_openai::surface_bridge_controller",
                         pk_display_name = %ctx.provider_key.display_name,
                         pk_vendor = %pk_vendor_raw,
                         "provider_key has no api_base; family bridge refusing fallback to \
@@ -188,11 +188,11 @@ impl OpenAiBridge {
                 return Ok(OPENAI_DEFAULT_BASE.to_string());
             }
         };
-        if crate::cohere::is_cohere(&ctx.provider_key.provider) {
+        if crate::surface_cohere_controller::is_cohere(&ctx.provider_key.provider) {
             return Ok(format!(
                 "{}{}",
-                crate::cohere::api_root(strip_known_endpoint(&raw)),
-                crate::cohere::COMPATIBILITY_PATH
+                crate::surface_cohere_controller::api_root(strip_known_endpoint(&raw)),
+                crate::surface_cohere_controller::COMPATIBILITY_PATH
             ));
         }
         Ok(normalize_api_base(&raw))
@@ -372,7 +372,7 @@ where
 
 /// Convert the typed [`build_request`] output to a `serde_json::Value`
 /// and apply every [`RequestOverrides`] / [`ResponseOverrides`] field
-/// whose primitive lives in [`crate::overrides`]. Issue #302 §5 lays
+/// whose primitive lives in [`crate::surface_overrides_action`]. Issue #302 §5 lays
 /// out the apply order: `param_renames` → `param_constraints` →
 /// `default_body_fields` (request side), `content_list_to_string`
 /// (response side flag, but it transforms the *request* body before
@@ -402,7 +402,7 @@ fn apply_outbound_overrides(
 ) {
     // Before `param_renames`, so an operator's explicit rename wins.
     if reasoning_model {
-        crate::reasoning::apply_reasoning_token_cap(body);
+        crate::taxonomy_reasoning_family_vo::apply_reasoning_token_cap(body);
     }
     if let Some(r) = request {
         apply_param_renames(body, &r.param_renames);
@@ -415,7 +415,7 @@ fn apply_outbound_overrides(
         let had_max_tokens = body.get("max_tokens").is_some();
         apply_default_body_fields(body, &r.default_body_fields);
         if reasoning_model && !had_max_tokens {
-            crate::reasoning::apply_reasoning_token_cap(body);
+            crate::taxonomy_reasoning_family_vo::apply_reasoning_token_cap(body);
         }
     }
     if response.is_some_and(|r| r.content_list_to_string) {
@@ -538,7 +538,7 @@ impl Bridge for OpenAiBridge {
         req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
-        let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
+        let req = aisix_gateway::surface_tool_calls_action::chat_without_thought_signatures(req);
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -584,7 +584,7 @@ impl Bridge for OpenAiBridge {
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
             }
-            let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
+            let header_tier = aisix_gateway::taxonomy_chat_vo::gemini_header_service_tier(resp.headers());
 
             let parsed: OpenAiResponse =
                 aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::OpenAI)
@@ -782,7 +782,7 @@ impl Bridge for OpenAiBridge {
         req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
-        let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
+        let req = aisix_gateway::surface_tool_calls_action::chat_without_thought_signatures(req);
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -851,7 +851,7 @@ impl Bridge for OpenAiBridge {
         let bridge_name = "openai";
         let request_id_for_log = ctx.request_id.clone();
 
-        let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
+        let header_tier = aisix_gateway::taxonomy_chat_vo::gemini_header_service_tier(resp.headers());
         let byte_stream = resp.bytes_stream();
         let stream = build_chunk_stream(
             byte_stream,
