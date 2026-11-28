@@ -11,17 +11,6 @@ export {
   type OpenAiUpstreamOptions,
   type ReceivedRequest,
 } from "./upstream-openai.js";
-export {
-  startMcpUpstream,
-  type McpUpstream,
-  type McpUpstreamOptions,
-} from "./upstream-mcp.js";
-export {
-  startA2aUpstream,
-  type A2aUpstream,
-  type A2aCardMount,
-  type A2aReceivedRequest,
-} from "./upstream-a2a.js";
 export { startRestUpstream, type RestUpstream } from "./upstream-rest.js";
 export { pickFreePort, pickFreePorts } from "./ports.js";
 export {
@@ -50,24 +39,7 @@ export {
   type MockIdp,
   type SignOpts,
 } from "./jwks-mock.js";
-export {
-  eventStream,
-  eventStreamException,
-  eventStreamFrame,
-  invokeChunk,
-} from "./aws-eventstream.js";
 export { startMockControlPlane, type MockControlPlane, type StoreRecord } from "./managed-cp.js";
-export { OAuthMcpUpstream, type OAuthMcpUpstreamOptions } from "./upstream-oauth-mcp.js";
 export { startMockOidcProvider, type MockOidcProvider } from "./mock-oidc-provider.js";
 export { startPrefixStrippingProxy } from "./prefix-proxy.js";
-export {
-  Browser,
-  ClientAuthState,
-  connectMcpClient,
-  consentForm,
-  followBrowser,
-  OAUTH_CLIENT_REDIRECT,
-  signInMcpClient,
-  whoami,
-} from "./mcp-oauth-client.js";
 export { droppedRows, fileId, keyHash } from "./resources-file.js";

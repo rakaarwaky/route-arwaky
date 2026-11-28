@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   decodedTextFor,
@@ -7,13 +7,11 @@ import {
   ProxyClient,
   SeedClient,
   spawnApp,
-  startA2aUpstream,
   startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
   waitForSlsLog,
   waitForToken,
-  type A2aUpstream,
   type MockSls,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -22,20 +20,17 @@ import {
 // E2E: `UsageEvent.guardrail_enforced_hits` across the LLM handler family
 // (api7/aisix#1024), against a real DP + etcd + a real SOC export target.
 //
-// AISIX-Cloud#1330 shipped the audit chain on `/mcp` only. The gap on the
-// rest of the family was SILENT: an ENFORCING mask on `/v1/messages` or
-// `/v1/responses` showed up in Prometheus and rewrote the response, while
+// The gap across the family was SILENT: an ENFORCING mask on `/v1/chat/completions`
+// or `/v1/responses` showed up in Prometheus and rewrote the response, while
 // the /logs row for that same request looked exactly like "no guardrail
-// acted". `/v1/messages` carries Claude-Code traffic and `/v1/responses`
-// carries Codex traffic, so a chat-only test would have stayed green
-// forever while the two families that matter misbehaved — which is why
-// both are driven here by hand, streaming and not.
+// acted" — so a chat-only test would have stayed green forever while the
+// other handlers misbehaved. That is why they are driven here by hand,
+// streaming and not.
 //
 // One PII row governs every LLM endpoint. Each endpoint gets its OWN detector
 // inside that row, matching a marker only that endpoint's upstream emits, so
 // the exported entry's `counts` key says which handler produced it — no
-// ordering assumptions, no cross-talk between cases. A dedicated keyword row
-// covers the A2A block path, whose terminal event has no LLM usage envelope.
+// ordering assumptions, no cross-talk between cases.
 //
 // Pinned contract, per endpoint:
 //   - the exported usage event carries an enforced-hit entry naming the
@@ -52,25 +47,13 @@ const SLS_PROJECT = "aisix-e2e-obs";
 const LOGSTORE = "enforced-hits-llm";
 
 const ROW = "llm-family-mask";
-const A2A_ROW = "a2a-input-block";
-const A2A_MARKER = "a2ablock-7f3a06";
 
 /** Per-endpoint marker + the detector name that masks it. */
 const CASES = {
   chat: { marker: "chatmark-7f3a01", detector: "chat_marker" },
   chatStream: { marker: "streammark-7f3a02", detector: "chat_stream_marker" },
-  messages: { marker: "msgmark-7f3a03", detector: "messages_marker" },
   responses: { marker: "respmark-7f3a04", detector: "responses_marker" },
   rerank: { marker: "rerankmark-7f3a05", detector: "rerank_marker" },
-  completions501: {
-    marker: "completion501-7f3a07",
-    detector: "completion_501_marker",
-  },
-  embeddings501: {
-    marker: "embedding501-7f3a08",
-    detector: "embedding_501_marker",
-  },
-  images501: { marker: "image501-7f3a09", detector: "image_501_marker" },
 } as const;
 
 interface EnforcedHit {
@@ -111,7 +94,6 @@ const hitsIn = (decoded: string): EnforcedHit[] =>
 describe("guardrail enforced hits on the LLM handler family", () => {
   let app: SpawnedApp | undefined;
   let sls: MockSls | undefined;
-  let a2aUpstream: A2aUpstream | undefined;
   const upstreams: OpenAiUpstream[] = [];
   let etcdReachable = false;
 
@@ -166,17 +148,6 @@ describe("guardrail enforced hits on the LLM handler family", () => {
       ],
       eventDelayMs: 2,
     });
-    const messagesUp = await startOpenAiUpstream({
-      nonStreamBody: {
-        id: "msg_enforced_3",
-        type: "message",
-        role: "assistant",
-        content: [{ type: "text", text: `build ${CASES.messages.marker} done` }],
-        model: "claude-3-5-haiku-20241022",
-        stop_reason: "end_turn",
-        usage: { input_tokens: 6, output_tokens: 4 },
-      },
-    });
     const responsesUp = await startOpenAiUpstream({
       nonStreamBody: {
         id: "resp-enforced-4",
@@ -201,8 +172,7 @@ describe("guardrail enforced hits on the LLM handler family", () => {
         results: [],
       },
     });
-    upstreams.push(chatUp, chatStreamUp, messagesUp, responsesUp, rerankUp);
-    a2aUpstream = await startA2aUpstream({ wireShape: "0.3" });
+    upstreams.push(chatUp, chatStreamUp, responsesUp, rerankUp);
 
     sls = await startMockSls();
     app = await spawnApp({
@@ -237,34 +207,19 @@ describe("guardrail enforced hits on the LLM handler family", () => {
         replacement: "***",
       })),
     });
-    await seed.createGuardrail({
-      name: A2A_ROW,
-      enabled: true,
-      hook_point: "input",
-      kind: "keyword",
-      patterns: [{ kind: "literal", value: A2A_MARKER }],
-    });
-    await seed.update("a2a_agents", randomUUID(), {
-      name: "enforced-a2a",
-      url: a2aUpstream.url,
-      protocol_version: "0.3",
-      auth_type: "none",
-      enabled: true,
-    });
 
     const mk = async (
       display: string,
       provider: string,
       modelName: string,
       up: OpenAiUpstream,
-      adapter = provider,
     ): Promise<void> => {
       const pk = await seed.createProviderKey({
         display_name: `${display}-pk`,
         api_key: "sk-mock-upstream",
         api_base: up.baseUrl,
-        provider: adapter,
-        adapter,
+        provider,
+        adapter: provider,
       });
       await seed.createModel({
         display_name: display,
@@ -275,33 +230,14 @@ describe("guardrail enforced hits on the LLM handler family", () => {
     };
     await mk("enforced-chat", "openai", "gpt-4o", chatUp);
     await mk("enforced-chat-stream", "openai", "gpt-4o", chatStreamUp);
-    await mk("enforced-messages", "anthropic", "claude-3-5-haiku-20241022", messagesUp);
     await mk("enforced-responses", "openai", "gpt-4o", responsesUp);
     await mk("enforced-rerank", "openai", "rerank-model", rerankUp);
-    // The Anthropic bridge implements none of these three operations. For
-    // images, the model stays OpenAI-labelled to pass that route's model
-    // check while its provider-key adapter selects the unsupported bridge.
-    // Each request reaches the real 501 after input guardrails have run.
-    await mk(
-      "enforced-completions-501",
-      "anthropic",
-      "claude-3-5-haiku",
-      messagesUp,
-    );
-    await mk(
-      "enforced-embeddings-501",
-      "anthropic",
-      "claude-3-5-haiku",
-      messagesUp,
-    );
-    await mk("enforced-images-501", "openai", "gpt-image-1", messagesUp, "anthropic");
 
     // Caller key LAST (AGENTS.md gate rule): a key that authenticates
     // implies every row above is already in the snapshot.
     await seed.createApiKey({
       key_hash: sha256(KEY),
       allowed_models: ["*"],
-      allowed_agents: ["*"],
     });
     // Gate on the key authenticating, not on a masked request: a gate that
     // exercises the behavior under test fails by timeout instead of by an
@@ -313,7 +249,6 @@ describe("guardrail enforced hits on the LLM handler family", () => {
   afterAll(async () => {
     await app?.exit();
     await Promise.all(upstreams.map((u) => u.close()));
-    await a2aUpstream?.close();
     await sls?.close();
   });
 

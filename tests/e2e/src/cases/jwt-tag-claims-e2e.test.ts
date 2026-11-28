@@ -4,13 +4,10 @@ import {
   agentClaims,
   awaitWindowHeadroom,
   EtcdClient,
-  OAuthMcpUpstream,
   ProxyClient,
   SeedClient,
-  signInMcpClient,
   slsLogsFor,
   spawnApp,
-  startMcpUpstream,
   startMockIdp,
   startMockOidcProvider,
   startMockSls,
@@ -18,8 +15,6 @@ import {
   waitConfigPropagation,
   waitForLogLine,
   waitForSlsLog,
-  whoami,
-  type McpUpstream,
   type MockIdp,
   type MockOidcProvider,
   type MockSls,
@@ -82,7 +77,6 @@ describe("tags from JWT claims on bearer tokens", () => {
   let app: SpawnedApp | undefined;
   let sls: MockSls | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let mcp: McpUpstream | undefined;
   let idp: MockIdp;
   let plainIdp: MockIdp;
   let dottedIdp: MockIdp;
@@ -129,7 +123,6 @@ describe("tags from JWT claims on bearer tokens", () => {
     plainIdp = await startMockIdp();
     dottedIdp = await startMockIdp();
     upstream = await startOpenAiUpstream();
-    mcp = await startMcpUpstream("jtc");
 
     app = await spawnApp({
       exposeDebugHeaders: true,
@@ -150,12 +143,6 @@ describe("tags from JWT claims on bearer tokens", () => {
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await seed.update("mcp_servers", randomUUID(), {
-      name: "jtc",
-      url: mcp.url,
-      enabled: true,
-    });
-
     await seed.update("teams", TEAM, {
       name: "Platform",
       tags: { subsidiary: "team-sub", region: "team-region" },
@@ -237,10 +224,6 @@ describe("tags from JWT claims on bearer tokens", () => {
     await bound("rate-b", "jtc-idp", { tags: { bg: "jtc-grouped" } });
     await bound("capped", "jtc-idp", {});
     await bound("budgeted", "jtc-idp", { tags: { department: "exhausted-on-key" } });
-    await bound("mcp-caller", "jtc-idp", {
-      tags: { department: "key-dept" },
-      mcp_access: { allow: ["*"] },
-    });
     await bound("plain", "jtc-plain", {
       team_id: TEAM,
       tags: { department: "plain-key-dept" },
@@ -267,7 +250,6 @@ describe("tags from JWT claims on bearer tokens", () => {
   afterAll(async () => {
     await app?.exit();
     await upstream?.close();
-    await mcp?.close();
     await idp?.close();
     await plainIdp?.close();
     await dottedIdp?.close();

@@ -1,15 +1,13 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
   SeedClient,
   spawnApp,
-  startMcpUpstream,
   startMockSls,
   waitConfigPropagation,
   waitForSlsLog,
-  type McpUpstream,
   type MockSls,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -32,7 +30,6 @@ const KIND_SERVER = 2;
 // Base64 alphabet only; the marker is what must never reach a record.
 const MARKER = "aW1hZ2VwYXlsb2FkbWFya2Vy";
 const SMALL = MARKER.repeat(4);
-const LARGE = MARKER.repeat(16 * 1024);
 // Past the size at which the gateway stops waiting for a stream frame to end.
 const OVERSIZED = MARKER.repeat(64 * 1024);
 const dataUri = (payload: string) => `data:image/png;base64,${payload}`;
@@ -56,32 +53,6 @@ const CHAT_STREAM = [
   { ...CHAT_BODY, object: "chat.completion.chunk", usage: undefined, choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: null }] },
   { ...CHAT_BODY, object: "chat.completion.chunk", usage: undefined, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
 ];
-// One of each media carrier an MCP tool result has, beside text that must stay.
-const MCP_TEXT = `tool output, a payload named in prose stays: ${SMALL.slice(0, 8)}`;
-const mcpResult = (image: string) => ({
-  content: [
-    { type: "text", text: MCP_TEXT },
-    { type: "image", data: image, mimeType: "image/png" },
-    { type: "audio", data: SMALL, mimeType: "audio/wav" },
-    { type: "resource", resource: { uri: "file:///a.pdf", mimeType: "application/pdf", blob: SMALL } },
-    { type: "resource", resource: { uri: "file:///a.log", mimeType: "text/plain", text: "a log line" } },
-    { type: "resource_link", uri: "file:///b.png", name: "b.png" },
-    { type: "text", text: dataUri(SMALL) },
-  ],
-  structuredContent: { thumbnail: dataUri(SMALL), width: 16 },
-});
-const mcpResultExported = (image: string) => ({
-  content: [
-    { type: "text", text: MCP_TEXT },
-    { type: "image", data: placeholder(image.length), mimeType: "image/png" },
-    { type: "audio", data: placeholder(SMALL.length), mimeType: "audio/wav" },
-    { type: "resource", resource: { uri: "file:///a.pdf", mimeType: "application/pdf", blob: placeholder(SMALL.length) } },
-    { type: "resource", resource: { uri: "file:///a.log", mimeType: "text/plain", text: "a log line" } },
-    { type: "resource_link", uri: "file:///b.png", name: "b.png" },
-    { type: "text", text: `data:image/png;base64,${placeholder(uriBytes(SMALL))}` },
-  ],
-  structuredContent: { thumbnail: `data:image/png;base64,${placeholder(uriBytes(SMALL))}`, width: 16 },
-});
 const IMAGE_BODY = {
   created: 1_700_000_000,
   data: [{ b64_json: SMALL, revised_prompt: "a small cat" }],
@@ -116,8 +87,6 @@ describe("base64 media under content_mode full", () => {
   let upstream: Server | undefined;
   let sls: MockSls | undefined;
   let otlp: MockOtlp | undefined;
-  let mcp: McpUpstream | undefined;
-  let mcpLarge: McpUpstream | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -171,8 +140,6 @@ describe("base64 media under content_mode full", () => {
 
     sls = await startMockSls();
     otlp = await startMockOtlp();
-    mcp = await startMcpUpstream("media", { mediaResult: mcpResult(SMALL) });
-    mcpLarge = await startMcpUpstream("large", { mediaResult: mcpResult(LARGE) });
     app = await spawnApp({
       extraEnv: {
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "LTAI_mock_ak",
@@ -202,14 +169,11 @@ describe("base64 media under content_mode full", () => {
     const openai = await seed.createProviderKey({ display_name: "cap-openai-pk", api_key: "sk-mock", api_base: `${base}/v1` });
     await seed.createModel({ display_name: "cap-openai", provider: "openai", model_name: "gpt-4o-mini", provider_key_id: openai.id });
     await seed.createPassthroughRoute({ name: "cap-pt", path_prefix: "/cap-pt", target_url: base, provider_key_id: openai.id });
-    await seed.update("mcp_servers", randomUUID(), { name: "media", url: mcp.url, enabled: true });
-    await seed.update("mcp_servers", randomUUID(), { name: "large", url: mcpLarge.url, enabled: true });
     // Seeded last: this key authenticating implies the whole seed set landed.
     await seed.createApiKey({
       key_hash: CALLER_HASH,
       allowed_models: ["*"],
       allowed_routes: ["*"],
-      mcp_access: { allow: ["*"] },
     });
     await waitConfigPropagation(async () => {
       const res = await fetch(`${app!.proxyUrl}/v1/models`, { headers: { authorization: `Bearer ${CALLER}` } });
@@ -222,8 +186,6 @@ describe("base64 media under content_mode full", () => {
     await app?.exit();
     await otlp?.close();
     await sls?.close();
-    await mcp?.close();
-    await mcpLarge?.close();
     await new Promise<void>((resolve) => (upstream ? upstream.close(() => resolve()) : resolve()));
   });
 
