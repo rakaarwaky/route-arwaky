@@ -90,7 +90,7 @@
           "additionalProperties": {
             "type": "string"
           },
-          "description": "Top-level headers added to the outbound request when the caller did not set them. Values may reference the request context with `${...}` variables, such as `\"${request.api_key.team_id}\"`; a header whose variables do not all resolve is dropped rather than sent blank. See [`crate::header_template`] for the closed variable vocabulary.\n\n\"When the caller did not set them\" includes the gateway itself: an entry naming the slot this ProviderKey's credential occupies is not applied. Use `forward_client_headers` to put the caller's own credential there instead.",
+          "description": "Top-level headers added to the outbound request when the caller did not set them. Values may reference the request context with `${...}` variables, such as `\"${request.api_key.team_id}\"`; a header whose variables do not all resolve is dropped rather than sent blank. See [`crate::taxonomy_header_template_vo`] for the closed variable vocabulary.\n\n\"When the caller did not set them\" includes the gateway itself: an entry naming the slot this ProviderKey's credential occupies is not applied. Use `forward_client_headers` to put the caller's own credential there instead.",
           "type": "object"
         },
         "forward_client_headers": {

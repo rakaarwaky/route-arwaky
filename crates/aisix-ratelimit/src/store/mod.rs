@@ -3,7 +3,7 @@
 //! The limiter itself only knows about *buckets* (an opaque key) and a
 //! [`RateLimit`]; where the counters actually live is a [`RateStore`].
 //!
-//! - [`local::LocalStore`] keeps the historical per-process in-memory
+//! - [`surface_local_store::LocalStore`] keeps the historical per-process in-memory
 //!   counters (a `DashMap` of fixed-window counters). This is the default
 //!   and is behaviour-identical to the pre-#798 limiter.
 //! - [`redis::RedisStore`] keeps the counters in a shared Redis so every
@@ -29,11 +29,11 @@ use std::time::Duration;
 use aisix_core::{RateLimit, RateLimitWindowType};
 use async_trait::async_trait;
 
-use crate::error::RateLimitError;
-use crate::limiter::RateLimitStatus;
+use crate::taxonomy_rate_limit_error_vo::RateLimitError;
+use crate::surface_rate_limiter_controller::RateLimitStatus;
 
-pub mod local;
-pub mod redis;
+pub mod surface_local_store;
+pub mod surface_redis_store;
 
 pub(crate) const SECOND_SECS: u64 = 1;
 pub(crate) const MINUTE_SECS: u64 = 60;

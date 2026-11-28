@@ -1,0 +1,5080 @@
+//! `POST /v1/audio/{transcriptions,translations,speech}` — audio API
+//! pass-through.
+//!
+//! Three sub-endpoints with different request shapes:
+//!
+//! * **transcriptions** & **translations** — `multipart/form-data` with an
+//!   audio `file`, a `model` field, and optional metadata fields.
+//!   The gateway resolves the model name, swaps in the upstream model id,
+//!   and re-assembles the multipart form before forwarding.
+//!
+//! * **speech** — JSON body `{model, input, voice, …}`.
+//!   Standard JSON passthrough, identical to `/v1/completions`.
+//!
+//! In all cases the upstream response is returned verbatim: JSON for
+//! transcription/translation results, binary audio bytes for speech.
+//!
+//! Auth and model authorisation follow the same rules as every other
+//! proxy endpoint.
+
+// 1 MiB upper bound on an in-flight SSE frame buffer. Kept
+// from the Anthropic messages handler (#436); shared with the
+// `/v1/responses` streaming usage parser (#808).
+pub(crate) const MAX_SSE_FRAME_BUF_BYTES: usize = 1 << 20; // 1 MiB
+
+use aisix_core::AppliedGuardrail;
+use aisix_gateway::{ChatMessage, ChatResponse, FinishReason, UsageStats};
+use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
+use axum::body::Bytes;
+use axum::extract::{Multipart, State};
+use axum::http::{header, HeaderMap};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use reqwest::multipart;
+use serde_json::Value;
+use std::time::{Duration, Instant};
+
+use crate::surface_auth_controller::AuthenticatedKey;
+use crate::surface_client_ip_controller::ClientContext;
+use crate::surface_proxy_error_view::ProxyError;
+use crate::surface_proxy_state_store::ProxyState;
+
+/// Per-request payload from a successful multipart dispatch
+/// (transcriptions/translations) — adds `model_id` + parsed `usage` to
+/// the response/model/provider triplet so the handler can emit a
+/// UsageEvent (#406).
+struct AudioDispatchSuccess {
+    response: Response,
+    model_name: String,
+    provider: String,
+    model_id: String,
+    /// Resolved ProviderKey UUID — feeds the per-PK telemetry attribution
+    /// tags on the emitted UsageEvent (AISIX-Cloud#867 parity).
+    provider_key_id: String,
+    /// Provider-side model name, for the `upstream_model` metric label
+    /// (AISIX-Cloud#1234 parity with chat / messages / responses).
+    upstream_model: String,
+    /// The upstream `usage` token block when the model returns one
+    /// (gpt-4o-transcribe). `None` for whisper-1 (no usage block) — those
+    /// still emit a zero-token event so the request is visible +
+    /// attributed.
+    usage: Option<UsageStats>,
+    /// Set on the streamed-transcription relay (#998): the SSE frames are
+    /// consumed by the caller after this handler returns, so the terminal
+    /// event's counts are only known inside the stream — its Drop guard
+    /// owns the UsageEvent and `usage` stays `None` here. Guards the
+    /// handler against a second, zero-token emit.
+    usage_handled_by_stream: bool,
+    /// Audio length in seconds — the cost basis for the duration-billed
+    /// models (whisper-1), which report no tokens at all (#457).
+    duration_seconds: f64,
+    /// The `{kind, hook}` set of guardrails that governed this request
+    /// (#379 parity, wired with #696) — surfaced on the emitted UsageEvent.
+    applied_guardrails: Vec<AppliedGuardrail>,
+    /// Per-detector PII mask counts (#932/#696): the multipart `prompt`
+    /// field (input side) + the transcript (output side), merged. Attached
+    /// to the emitted UsageEvent. Empty = no redaction.
+    redactions: crate::surface_redact_action::RedactionCounts,
+    /// Monitor-mode guardrail observations (AISIX-Cloud#562), input +
+    /// output merged.
+    monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    /// #696: set when an OUTPUT guardrail blocked the transcript AFTER the
+    /// upstream billed for it. The response body is the redacted 422, but
+    /// `usage` keeps the billed counts so the UsageEvent (marked
+    /// `guardrail_blocked`) doesn't under-report spend — same convention as
+    /// completions #911 [23] / responses #543.
+    guardrail_blocked: bool,
+    /// The refusal's own text, from [`crate::surface_attempt_controller::gateway_error_message`],
+    /// so the usage event names the block the way an input refusal does.
+    /// Empty when nothing was blocked.
+    guardrail_block_message: String,
+    /// Captured request/response content for content-capturing exporters
+    /// (#700, LiteLLM parity: the audio bytes are represented by their
+    /// sha256, text form fields verbatim; the response is the post-redaction
+    /// transcript). `Some` only when an exporter opted into
+    /// `content_mode = full`.
+    captured_content: Option<CapturedContent>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// /v1/audio/transcriptions
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub async fn transcriptions(
+    State(state): State<ProxyState>,
+    auth: AuthenticatedKey,
+    client: ClientContext,
+    multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
+) -> Response {
+    let started = Instant::now();
+    let request_id = client.request_id.clone();
+    let api_key_id = auth.entry.id.clone();
+
+    // Same silent class as the body-extractor rejections #863 collected: a
+    // non-multipart content-type answered axum's bare 400 with no access
+    // log, metrics, or envelope.
+    let multipart = match multipart {
+        Ok(multipart) => multipart,
+        Err(_) => {
+            return crate::surface_reject_action::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/audio/transcriptions",
+                &request_id,
+                Some(&api_key_id),
+                started,
+                crate::surface_reject_action::Envelope::OpenAi,
+                ProxyError::InvalidRequest("invalid multipart form data".into()),
+            );
+        }
+    };
+
+    // Loaded by `multipart_dispatch` AFTER the upload is drained, then
+    // reused by the emits below (#941) — see the note on its signature.
+    let mut snapshot = None;
+
+    // See `embeddings`: filled inside `multipart_dispatch` so the failure
+    // branch — where a guardrail block lands — stamps the enforced hits
+    // too (AISIX-Cloud#1330 / #1024).
+    let mut audit = crate::surface_usage_attr_view::GuardrailAudit::default();
+    // Every upstream attempt, filled by the dispatch (#655).
+    let mut routing = crate::surface_attempt_controller::RoutingTelemetry::default();
+
+    match multipart_dispatch(
+        &state,
+        &mut snapshot,
+        &auth,
+        multipart,
+        // Version-independent path — multipart_dispatch's URL builder
+        // appends it to the configured api_base.
+        "/audio/transcriptions",
+        &request_id,
+        &client,
+        &mut audit,
+        &mut routing,
+    )
+    .await
+    {
+        Ok(success) => {
+            // `multipart_dispatch` loaded it once the upload was drained.
+            let snapshot = snapshot.unwrap_or_else(|| state.snapshot.load());
+            let elapsed = started.elapsed();
+            // Actual status, not a hardcoded 200 — the #696 billed-then-
+            // output-blocked path returns Ok(success) carrying a 422.
+            let status = success.response.status().as_u16();
+            // ONE ProviderKey lookup for both terminal emits (#941).
+            let pk = crate::surface_usage_attr_view::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
+            let deferred_metrics = record_audio_metrics(
+                &state,
+                &pk,
+                "/v1/audio/transcriptions",
+                &auth,
+                &success,
+                status,
+                crate::surface_attempt_controller::answered_error_source(success.guardrail_blocked, &routing),
+                elapsed,
+                routing.fallback_count() > 0,
+                success.usage_handled_by_stream.then_some(started),
+            );
+            // On this family the flag IS "the response is a live relay" — it
+            // is set only inside the `is_event_stream` branch and is what
+            // labels the metric as streaming — so there is no second
+            // predicate to conjoin, unlike `/v1/responses`. If it ever comes to mean "already emitted"
+            // too, park on the relay itself instead: a parked line with no
+            // later emitter is a line silently lost.
+            if let Some(deferred_metrics) = deferred_metrics {
+                // A relayed transcription stream has no outcome yet — the caller may
+                // read it to the terminal event or walk away. Park the line and
+                // let the relay's own Drop emitter write it beside the usage
+                // event it already owns (AISIX-Cloud#1571).
+                crate::surface_attribution_view::defer_access_log(
+                    crate::surface_attribution_view::PendingAccessLog::new(
+                        "POST",
+                        "/v1/audio/transcriptions",
+                        &request_id,
+                        &api_key_id,
+                        started,
+                    )
+                    .with_model(&success.provider, &success.model_name)
+                    .with_routing(&routing),
+                    deferred_metrics,
+                );
+            } else {
+                emit_access_log(
+                    "POST",
+                    "/v1/audio/transcriptions",
+                    &success.model_name,
+                    &success.provider,
+                    &api_key_id,
+                    status,
+                    elapsed,
+                    &request_id,
+                    &routing,
+                    None,
+                );
+            }
+            // One zero-token event per attempt that failed before the
+            // winner (#655); a live relay's own event is the winner's.
+            crate::surface_usage_attr_view::emit_failed_attempts(
+                &state,
+                &snapshot,
+                crate::surface_operation_controller::TRANSCRIPTION,
+                &request_id,
+                &success.model_name,
+                &api_key_id,
+                &client,
+                &success.applied_guardrails,
+                &routing.attempts,
+                /* terminal_last */ false,
+                false,
+                Vec::new(),
+                crate::surface_redact_action::RedactionCounts::new(),
+                &audit,
+            );
+            // #998: the streamed relay's Drop guard emits the event once
+            // the terminal `transcript.text.done` has been parsed off the
+            // wire; emitting here too would double-count the request with
+            // zero tokens.
+            if !success.usage_handled_by_stream {
+                emit_audio_usage(
+                    &state,
+                    &snapshot,
+                    &pk,
+                    &request_id,
+                    "/v1/audio/transcriptions",
+                    crate::surface_operation_controller::TRANSCRIPTION,
+                    &success,
+                    &api_key_id,
+                    status,
+                    elapsed,
+                    &client,
+                    &audit,
+                    routing.winner(),
+                );
+            }
+            success.response
+        }
+        Err(err) => {
+            // The dispatch can fail before it ever loaded one (a malformed
+            // form), so fall back rather than assume.
+            let snapshot = snapshot.unwrap_or_else(|| state.snapshot.load());
+            let status = err.status().as_u16();
+            let elapsed = started.elapsed();
+            let attributed = crate::surface_attribution_view::current().unwrap_or_default();
+            let last_target = crate::surface_request_metrics_view::LastTarget::new(&snapshot, &attributed);
+            emit_access_log(
+                "POST",
+                "/v1/audio/transcriptions",
+                Some(attributed.requested_model.as_str())
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or("unknown"),
+                last_target.provider(),
+                &api_key_id,
+                status,
+                elapsed,
+                &request_id,
+                &routing,
+                Some(&err),
+            );
+            // AISIX-Cloud#1325: the multipart form is parsed inside the
+            // dispatch that failed, so this branch never sees the model —
+            // but the request's attribution cell recorded it along with the
+            // target it selected, so an upstream failure here is attributed
+            // exactly like on the JSON endpoints instead of landing wholly
+            // on `unknown`.
+            let metric_model =
+                crate::surface_request_metrics_view::LastTarget::requested_model(&snapshot, &attributed);
+            crate::surface_request_metrics_view::record(
+                &state,
+                "/v1/audio/transcriptions",
+                crate::surface_request_metrics_view::Caller::new(&auth),
+                last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
+                status,
+                crate::surface_attempt_controller::error_source(&err),
+                elapsed,
+            );
+            // Per #655 parity: surface the failed request in Logs. The model
+            // isn't extracted from the multipart form on this error path, so
+            // requested_model is empty; status + error class still identify it.
+            // Per #655: one zero-token event per failed upstream attempt,
+            // the last of them terminal when every attempt failed.
+            crate::surface_usage_attr_view::note_client_error(&snapshot, &err);
+            let failed_terminal = crate::surface_usage_attr_view::failed_attempts_are_terminal(&routing);
+            crate::surface_usage_attr_view::emit_failed_attempts(
+                &state,
+                &snapshot,
+                crate::surface_operation_controller::TRANSCRIPTION,
+                &request_id,
+                &attributed.requested_model,
+                &api_key_id,
+                &client,
+                &crate::surface_usage_attr_view::applied_guardrails(&audit),
+                &routing.attempts,
+                failed_terminal,
+                err.is_guardrail_block(),
+                Vec::new(),
+                crate::surface_redact_action::RedactionCounts::new(),
+                &audit,
+            );
+            // A failure no attempt answers for — pre-dispatch, or after the
+            // winner — is one zero-token terminal event.
+            if !failed_terminal {
+                crate::surface_usage_attr_view::emit_error_usage_event(
+                    &state,
+                    &snapshot,
+                    crate::surface_operation_controller::TRANSCRIPTION,
+                    "openai",
+                    &request_id,
+                    "",
+                    &api_key_id,
+                    status,
+                    crate::surface_usage_attr_view::EventError::of(&err),
+                    err.is_guardrail_block(),
+                    &client,
+                    crate::surface_usage_attr_view::applied_guardrails(&audit),
+                    crate::surface_usage_attr_view::enforced_hits(&audit),
+                    crate::surface_usage_attr_view::guardrail_scores(&audit),
+                    crate::surface_usage_attr_view::bypass_reason(&audit),
+                );
+            }
+            err.into_response()
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// /v1/audio/translations
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub async fn translations(
+    State(state): State<ProxyState>,
+    auth: AuthenticatedKey,
+    client: ClientContext,
+    multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
+) -> Response {
+    let started = Instant::now();
+    let request_id = client.request_id.clone();
+    let api_key_id = auth.entry.id.clone();
+
+    // See `transcriptions`: the rejection is recorded, not silently bare.
+    let multipart = match multipart {
+        Ok(multipart) => multipart,
+        Err(_) => {
+            return crate::surface_reject_action::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/audio/translations",
+                &request_id,
+                Some(&api_key_id),
+                started,
+                crate::surface_reject_action::Envelope::OpenAi,
+                ProxyError::InvalidRequest("invalid multipart form data".into()),
+            );
+        }
+    };
+
+    // Loaded by `multipart_dispatch` AFTER the upload is drained, then
+    // reused by the emits below (#941) — see the note on its signature.
+    let mut snapshot = None;
+
+    // See `embeddings`: filled inside `multipart_dispatch` so the failure
+    // branch — where a guardrail block lands — stamps the enforced hits
+    // too (AISIX-Cloud#1330 / #1024).
+    let mut audit = crate::surface_usage_attr_view::GuardrailAudit::default();
+    // Every upstream attempt, filled by the dispatch (#655).
+    let mut routing = crate::surface_attempt_controller::RoutingTelemetry::default();
+
+    match multipart_dispatch(
+        &state,
+        &mut snapshot,
+        &auth,
+        multipart,
+        // Version-independent path — multipart_dispatch's URL builder
+        // appends it to the configured api_base.
+        "/audio/translations",
+        &request_id,
+        &client,
+        &mut audit,
+        &mut routing,
+    )
+    .await
+    {
+        Ok(success) => {
+            // `multipart_dispatch` loaded it once the upload was drained.
+            let snapshot = snapshot.unwrap_or_else(|| state.snapshot.load());
+            let elapsed = started.elapsed();
+            // Actual status, not a hardcoded 200 — the #696 billed-then-
+            // output-blocked path returns Ok(success) carrying a 422.
+            let status = success.response.status().as_u16();
+            // ONE ProviderKey lookup for both terminal emits (#941).
+            let pk = crate::surface_usage_attr_view::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
+            let deferred_metrics = record_audio_metrics(
+                &state,
+                &pk,
+                "/v1/audio/translations",
+                &auth,
+                &success,
+                status,
+                crate::surface_attempt_controller::answered_error_source(success.guardrail_blocked, &routing),
+                elapsed,
+                routing.fallback_count() > 0,
+                success.usage_handled_by_stream.then_some(started),
+            );
+            if let Some(deferred_metrics) = deferred_metrics {
+                // A relayed transcription stream has no outcome yet — the caller may
+                // read it to the terminal event or walk away. Park the line and
+                // let the relay's own Drop emitter write it beside the usage
+                // event it already owns (AISIX-Cloud#1571).
+                crate::surface_attribution_view::defer_access_log(
+                    crate::surface_attribution_view::PendingAccessLog::new(
+                        "POST",
+                        "/v1/audio/translations",
+                        &request_id,
+                        &api_key_id,
+                        started,
+                    )
+                    .with_model(&success.provider, &success.model_name)
+                    .with_routing(&routing),
+                    deferred_metrics,
+                );
+            } else {
+                emit_access_log(
+                    "POST",
+                    "/v1/audio/translations",
+                    &success.model_name,
+                    &success.provider,
+                    &api_key_id,
+                    status,
+                    elapsed,
+                    &request_id,
+                    &routing,
+                    None,
+                );
+            }
+            // One zero-token event per attempt that failed before the
+            // winner (#655); a live relay's own event is the winner's.
+            crate::surface_usage_attr_view::emit_failed_attempts(
+                &state,
+                &snapshot,
+                crate::surface_operation_controller::TRANSLATION,
+                &request_id,
+                &success.model_name,
+                &api_key_id,
+                &client,
+                &success.applied_guardrails,
+                &routing.attempts,
+                /* terminal_last */ false,
+                false,
+                Vec::new(),
+                crate::surface_redact_action::RedactionCounts::new(),
+                &audit,
+            );
+            // #998: the streamed relay's Drop guard emits the event once
+            // the terminal `transcript.text.done` has been parsed off the
+            // wire; emitting here too would double-count the request with
+            // zero tokens.
+            if !success.usage_handled_by_stream {
+                emit_audio_usage(
+                    &state,
+                    &snapshot,
+                    &pk,
+                    &request_id,
+                    "/v1/audio/translations",
+                    crate::surface_operation_controller::TRANSLATION,
+                    &success,
+                    &api_key_id,
+                    status,
+                    elapsed,
+                    &client,
+                    &audit,
+                    routing.winner(),
+                );
+            }
+            success.response
+        }
+        Err(err) => {
+            // The dispatch can fail before it ever loaded one (a malformed
+            // form), so fall back rather than assume.
+            let snapshot = snapshot.unwrap_or_else(|| state.snapshot.load());
+            let status = err.status().as_u16();
+            let elapsed = started.elapsed();
+            let attributed = crate::surface_attribution_view::current().unwrap_or_default();
+            let last_target = crate::surface_request_metrics_view::LastTarget::new(&snapshot, &attributed);
+            emit_access_log(
+                "POST",
+                "/v1/audio/translations",
+                Some(attributed.requested_model.as_str())
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or("unknown"),
+                last_target.provider(),
+                &api_key_id,
+                status,
+                elapsed,
+                &request_id,
+                &routing,
+                Some(&err),
+            );
+            // AISIX-Cloud#1325: the multipart form is parsed inside the
+            // dispatch that failed, so this branch never sees the model —
+            // but the request's attribution cell recorded it along with the
+            // target it selected, so an upstream failure here is attributed
+            // exactly like on the JSON endpoints instead of landing wholly
+            // on `unknown`.
+            let metric_model =
+                crate::surface_request_metrics_view::LastTarget::requested_model(&snapshot, &attributed);
+            crate::surface_request_metrics_view::record(
+                &state,
+                "/v1/audio/translations",
+                crate::surface_request_metrics_view::Caller::new(&auth),
+                last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
+                status,
+                crate::surface_attempt_controller::error_source(&err),
+                elapsed,
+            );
+            // Per #655 parity: surface the failed request in Logs (model not
+            // extracted on the multipart error path → empty requested_model).
+            // Per #655: one zero-token event per failed upstream attempt,
+            // the last of them terminal when every attempt failed.
+            crate::surface_usage_attr_view::note_client_error(&snapshot, &err);
+            let failed_terminal = crate::surface_usage_attr_view::failed_attempts_are_terminal(&routing);
+            crate::surface_usage_attr_view::emit_failed_attempts(
+                &state,
+                &snapshot,
+                crate::surface_operation_controller::TRANSLATION,
+                &request_id,
+                &attributed.requested_model,
+                &api_key_id,
+                &client,
+                &crate::surface_usage_attr_view::applied_guardrails(&audit),
+                &routing.attempts,
+                failed_terminal,
+                err.is_guardrail_block(),
+                Vec::new(),
+                crate::surface_redact_action::RedactionCounts::new(),
+                &audit,
+            );
+            // A failure no attempt answers for — pre-dispatch, or after the
+            // winner — is one zero-token terminal event.
+            if !failed_terminal {
+                crate::surface_usage_attr_view::emit_error_usage_event(
+                    &state,
+                    &snapshot,
+                    crate::surface_operation_controller::TRANSLATION,
+                    "openai",
+                    &request_id,
+                    "",
+                    &api_key_id,
+                    status,
+                    crate::surface_usage_attr_view::EventError::of(&err),
+                    err.is_guardrail_block(),
+                    &client,
+                    crate::surface_usage_attr_view::applied_guardrails(&audit),
+                    crate::surface_usage_attr_view::enforced_hits(&audit),
+                    crate::surface_usage_attr_view::guardrail_scores(&audit),
+                    crate::surface_usage_attr_view::bypass_reason(&audit),
+                );
+            }
+            err.into_response()
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// /v1/audio/speech
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub async fn speech(
+    State(state): State<ProxyState>,
+    auth: AuthenticatedKey,
+    client: ClientContext,
+    // Result-wrapped so an extractor-layer 413 maps to the OpenAI
+    // envelope — see completions.rs.
+    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let started = Instant::now();
+    let Json(body) = match body {
+        Ok(json) => json,
+        // Answer through `reject` — see completions.rs.
+        Err(rej) => {
+            return crate::surface_reject_action::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/audio/speech",
+                &client.request_id,
+                Some(&auth.entry.id),
+                started,
+                crate::surface_reject_action::Envelope::OpenAi,
+                crate::surface_proxy_error_view::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+            );
+        }
+    };
+    let request_id = client.request_id.clone();
+    let api_key_id = auth.entry.id.clone();
+    let model_name = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    // One snapshot for the whole request (#941) — see `embeddings`.
+    let snapshot = state.snapshot.load();
+
+    // See `embeddings`: filled inside `speech_dispatch` so the failure
+    // branch — where a guardrail block lands — stamps the enforced hits
+    // too (AISIX-Cloud#1330 / #1024).
+    let mut audit = crate::surface_usage_attr_view::GuardrailAudit::default();
+    // Every upstream attempt, filled by the dispatch (#655).
+    let mut routing = crate::surface_attempt_controller::RoutingTelemetry::default();
+    match speech_dispatch(
+        &state,
+        &snapshot,
+        &auth,
+        body,
+        &request_id,
+        &client,
+        &mut audit,
+        &mut routing,
+    )
+    .await
+    {
+        Ok(success) => {
+            // One ProviderKey lookup for the metric emit + the usage event
+            // below (#941).
+            let pk = crate::surface_usage_attr_view::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
+            // The audio has not streamed yet — the caller may read it to the
+            // end or walk away, and the upstream may fail part-way. Park the
+            // line for the relay's own emitter to write beside the usage
+            // event (AISIX-Cloud#1571), as the transcription stream does.
+            crate::surface_attribution_view::defer_access_log(
+                crate::surface_attribution_view::PendingAccessLog::new(
+                    "POST",
+                    "/v1/audio/speech",
+                    &request_id,
+                    &api_key_id,
+                    started,
+                )
+                .with_model(&success.provider, &model_name)
+                .with_routing(&routing),
+                crate::surface_request_metrics_view::PendingRequestMetrics::at_stream_end(
+                    &state,
+                    "/v1/audio/speech",
+                    crate::surface_request_metrics_view::Caller::new(&auth),
+                    crate::surface_request_metrics_view::Upstream {
+                        provider: &success.provider,
+                        model: &model_name,
+                        upstream_model: &success.upstream_model,
+                        pk: pk.labels(),
+                        is_fallback: routing.fallback_count() > 0,
+                        ..Default::default()
+                    },
+                    started,
+                ),
+            );
+            // One zero-token event per attempt that failed before the
+            // winner (#655); the relay's own event is the winner's.
+            crate::surface_usage_attr_view::emit_failed_attempts(
+                &state,
+                &snapshot,
+                crate::surface_operation_controller::SPEECH,
+                &request_id,
+                &model_name,
+                &api_key_id,
+                &client,
+                &success.applied_guardrails,
+                &routing.attempts,
+                /* terminal_last */ false,
+                false,
+                Vec::new(),
+                crate::surface_redact_action::RedactionCounts::new(),
+                &audit,
+            );
+            // Issue #406: /v1/audio/speech (TTS) returns binary audio
+            // with no usage block — emit a zero-token UsageEvent so the
+            // request is visible in /logs and attributed to the api_key.
+            // (TTS is billed per input character; that cost basis is the
+            // same cross-repo follow-up as audio duration.) Emitted when
+            // the audio ends, so it records how it ended: a caller that
+            // left is a 499, an upstream failure its own status.
+            let SpeechDispatchSuccess {
+                mut response,
+                body,
+                read_timeout,
+                provider,
+                model_id,
+                provider_key_id,
+                upstream_model,
+                applied_guardrails,
+                redactions,
+                monitor_hits,
+                captured_content,
+                attempt_started,
+            } = success;
+            // The winner's event measures its own attempt, to the end of
+            // the audio — not the attempts that failed before it.
+            let winner = routing.winner().cloned();
+            let state_c = state.clone();
+            let client_c = client.clone();
+            let request_id_c = request_id.clone();
+            let api_key_id_c = api_key_id.clone();
+            let model_name_c = model_name.clone();
+            let expected_len = response
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+            let relayed = speech_relay(body, read_timeout, expected_len, move |outcome| {
+                // A stream can outlive several config generations, so the
+                // emit reads a FRESH snapshot (#941).
+                let snap = state_c.snapshot.load();
+                let pk = crate::surface_usage_attr_view::ResolvedPk::resolve(&snap, &provider_key_id);
+                let winner = winner.map(|mut w| {
+                    w.latency_ms = crate::surface_attempt_controller::ms_since(attempt_started);
+                    w
+                });
+                emit_usage_event(
+                    &state_c,
+                    &snap,
+                    &pk,
+                    &request_id_c,
+                    &model_id,
+                    &model_name_c,
+                    &api_key_id_c,
+                    "/v1/audio/speech",
+                    crate::surface_operation_controller::SPEECH,
+                    &provider,
+                    &upstream_model,
+                    &applied_guardrails,
+                    crate::surface_attempt_controller::stream_status(outcome.reached_end, outcome.failure.as_ref()),
+                    started.elapsed(),
+                    &UsageStats::default(),
+                    // TTS is billed per input character, not by the length
+                    // of the audio it produced — no duration cost basis here.
+                    0.0,
+                    &client_c,
+                    redactions,
+                    monitor_hits,
+                    /* guardrail_blocked */ false,
+                    captured_content.as_ref(),
+                    &audit,
+                    outcome.failure.as_ref(),
+                    winner.as_ref(),
+                );
+            });
+            *response.body_mut() = axum::body::Body::from_stream(relayed);
+            response
+        }
+        Err(err) => {
+            let status = err.status().as_u16();
+            let elapsed = started.elapsed();
+            let attributed = crate::surface_attribution_view::current().unwrap_or_default();
+            let last_target = crate::surface_request_metrics_view::LastTarget::new(&snapshot, &attributed);
+            emit_access_log(
+                "POST",
+                "/v1/audio/speech",
+                &model_name,
+                last_target.provider(),
+                &api_key_id,
+                status,
+                elapsed,
+                &request_id,
+                &routing,
+                Some(&err),
+            );
+            let metric_model = crate::surface_usage_attr_view::metric_model_label(&snapshot, &model_name);
+            // AISIX-Cloud#1325: name the target the request died on. This
+            // branch used to emit `Upstream::default()`, so a 502 from a
+            // real provider landed on `provider="unknown"` while the same
+            // key's successes landed on the real one.
+            crate::surface_request_metrics_view::record(
+                &state,
+                "/v1/audio/speech",
+                crate::surface_request_metrics_view::Caller::new(&auth),
+                last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
+                status,
+                crate::surface_attempt_controller::error_source(&err),
+                elapsed,
+            );
+            // Per #655 parity: surface the failed request in Logs with a
+            // zero-token event (status + error class).
+            // Per #655: one zero-token event per failed upstream attempt,
+            // the last of them terminal when every attempt failed.
+            crate::surface_usage_attr_view::note_client_error(&snapshot, &err);
+            let failed_terminal = crate::surface_usage_attr_view::failed_attempts_are_terminal(&routing);
+            crate::surface_usage_attr_view::emit_failed_attempts(
+                &state,
+                &snapshot,
+                crate::surface_operation_controller::SPEECH,
+                &request_id,
+                &model_name,
+                &api_key_id,
+                &client,
+                &crate::surface_usage_attr_view::applied_guardrails(&audit),
+                &routing.attempts,
+                failed_terminal,
+                err.is_guardrail_block(),
+                Vec::new(),
+                crate::surface_redact_action::RedactionCounts::new(),
+                &audit,
+            );
+            // A failure no attempt answers for — pre-dispatch, or after the
+            // winner — is one zero-token terminal event.
+            if !failed_terminal {
+                crate::surface_usage_attr_view::emit_error_usage_event(
+                    &state,
+                    &snapshot,
+                    crate::surface_operation_controller::SPEECH,
+                    "openai",
+                    &request_id,
+                    &model_name,
+                    &api_key_id,
+                    status,
+                    crate::surface_usage_attr_view::EventError::of(&err),
+                    err.is_guardrail_block(),
+                    &client,
+                    crate::surface_usage_attr_view::applied_guardrails(&audit),
+                    crate::surface_usage_attr_view::enforced_hits(&audit),
+                    crate::surface_usage_attr_view::guardrail_scores(&audit),
+                    crate::surface_usage_attr_view::bypass_reason(&audit),
+                );
+            }
+            err.into_response()
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared dispatch functions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What one upstream audio call handed back.
+///
+/// A transcription is normally read whole — the usage block, the duration,
+/// the output-guardrail scan and the PII mask all need the body in hand.
+/// A `stream=true` request answered with `text/event-stream` is the
+/// exception (#998): its frames are relayed to the caller as they arrive,
+/// so the response is carried live instead of as bytes.
+enum AudioUpstreamBody {
+    Buffered(Bytes),
+    Live(reqwest::Response),
+}
+
+/// Whether an upstream response is an SSE stream.
+fn is_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/event-stream"))
+}
+
+/// What the relayed transcription stream observed by the time it ended.
+#[derive(Default)]
+struct StreamedTranscript {
+    /// The terminal event's `usage` block — `None` when the stream ended
+    /// before one arrived (a client that disconnected, an upstream that
+    /// reports no tokens).
+    usage: Option<UsageStats>,
+    /// Audio length a `usage: {type: "duration"}` block reported — the
+    /// duration-billed counterpart of `usage`.
+    duration_seconds: Option<f64>,
+    /// The transcript assembled from the `transcript.text.delta` events.
+    deltas: String,
+    /// The whole transcript as the terminal `transcript.text.done` event
+    /// reports it. Preferred over the assembled deltas — same precedence
+    /// the `/v1/responses` capture uses — so a provider that answers with
+    /// the terminal event alone still yields a scannable transcript.
+    terminal: Option<String>,
+    /// False when the caller disconnected before the upstream ended.
+    reached_end: bool,
+    /// When the first upstream frame arrived — relayed to the caller at the
+    /// same moment, the frames being forwarded verbatim.
+    first_frame: Option<std::time::Instant>,
+    /// The upstream failure that ended the stream after its `200` went out:
+    /// a transport error, a read timeout, or an in-band error envelope.
+    failure: Option<crate::surface_attempt_controller::StreamFailure>,
+    /// End-of-stream monitor observations (AISIX-Cloud#1010).
+    output_hits: Vec<aisix_core::GuardrailMonitorHit>,
+}
+
+impl StreamedTranscript {
+    /// The transcript the caller received, for the end-of-stream scan and
+    /// the content capture. The capture is capped at its own limit on top
+    /// of this one.
+    fn text(&self) -> &str {
+        self.terminal.as_deref().unwrap_or(&self.deltas)
+    }
+}
+
+/// The longest prefix of `text` that fits in `cap` bytes without splitting
+/// a codepoint.
+fn truncate_on_char_boundary(text: &str, cap: usize) -> &str {
+    let mut end = text.len().min(cap);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Fires `on_complete` exactly once with what the relay saw — at
+/// end-of-stream AND on client-disconnect, where the generator is simply
+/// dropped at its suspension point. Same shape as the `/v1/responses`
+/// and chat.rs stream guards: without it a caller that closes the
+/// connection on the terminal frame takes the whole UsageEvent with it.
+struct TranscriptGuard<F: FnOnce(StreamedTranscript)> {
+    slot: Option<(F, StreamedTranscript)>,
+}
+
+impl<F: FnOnce(StreamedTranscript)> TranscriptGuard<F> {
+    fn observed(&mut self) -> &mut StreamedTranscript {
+        &mut self
+            .slot
+            .as_mut()
+            .expect("TranscriptGuard accessed after take")
+            .1
+    }
+}
+
+impl<F: FnOnce(StreamedTranscript)> Drop for TranscriptGuard<F> {
+    fn drop(&mut self) {
+        if let Some((f, observed)) = self.slot.take() {
+            f(observed);
+        }
+    }
+}
+
+/// Relay synthesized speech verbatim, firing `on_complete` once when the
+/// audio ends or the caller leaves, with how it ended: the upstream's
+/// failure, if one cut it short, and whether it ran to its end.
+fn speech_relay<S, F>(
+    upstream: S,
+    read_timeout: crate::surface_stream_timeout_action::ReadTimeoutSignal,
+    // The `Content-Length` relayed to the caller, if any. The server stops
+    // polling a sized body once that many bytes are written, so the relay
+    // never sees its own end: reaching the length IS the end.
+    expected_len: Option<u64>,
+    on_complete: F,
+) -> impl futures::Stream<Item = reqwest::Result<Bytes>> + Send
+where
+    S: futures::Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+    F: FnOnce(StreamedTranscript) + Send + 'static,
+{
+    use futures::StreamExt as _;
+    // Anchors a timed-out read's reported elapsed time.
+    let started = std::time::Instant::now();
+    crate::surface_request_id_action::in_request_span(async_stream::stream! {
+        // Built on the first poll, like every streaming family's guard: a
+        // body dropped before that is filed by the request's cancel guard
+        // (`crate::surface_cancel_action`), and arming this one earlier would file it twice.
+        let mut guard = TranscriptGuard {
+            slot: Some((on_complete, StreamedTranscript::default())),
+        };
+        futures::pin_mut!(upstream);
+        let mut relayed: u64 = 0;
+        while let Some(item) = upstream.next().await {
+            match &item {
+                Ok(bytes) => {
+                    relayed += bytes.len() as u64;
+                    if expected_len.is_some_and(|len| relayed >= len) {
+                        guard.observed().reached_end = true;
+                    }
+                }
+                Err(e) => crate::surface_attempt_controller::StreamFailure::record(
+                    &mut guard.observed().failure,
+                    &crate::surface_dispatch_router::reqwest_error_to_bridge(e, started),
+                ),
+            }
+            yield item;
+        }
+        if let Some(e) = read_timeout.fired() {
+            crate::surface_attempt_controller::StreamFailure::record(&mut guard.observed().failure, &e);
+        }
+        guard.observed().reached_end = true;
+        if let Some((f, observed)) = guard.slot.take() {
+            f(observed);
+        }
+    })
+}
+
+/// Relay a streamed transcription verbatim while reading its telemetry off
+/// the same bytes (#998).
+///
+/// The caller gets the upstream's exact SSE wire shape — every frame
+/// forwarded unchanged, as it arrives — and a side-channel decoder pulls
+/// the `transcript.text.delta` text and the terminal
+/// `transcript.text.done` usage block out of the copy. `on_complete` fires
+/// once the upstream ends or the caller disconnects, whichever comes
+/// first; it owns the UsageEvent for this request.
+///
+/// `content_cap` bounds the assembled transcript, unless an output chain
+/// needs the end-of-stream scan, which reads all of it.
+fn transcription_relay<S, F>(
+    upstream: S,
+    // Set when `upstream` ended on a read timeout rather than its own end.
+    read_timeout: crate::surface_stream_timeout_action::ReadTimeoutSignal,
+    content_cap: Option<u32>,
+    eos_scan: Option<crate::surface_guardrail_stream_view::EosOutputScan>,
+    on_complete: F,
+) -> impl futures::Stream<Item = reqwest::Result<Bytes>> + Send
+where
+    S: futures::Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+    F: FnOnce(StreamedTranscript) + Send + 'static,
+{
+    use futures::StreamExt as _;
+
+    // Anchors a timed-out read's reported elapsed time.
+    let started = std::time::Instant::now();
+    // The end-of-stream scan reads the whole transcript; the capture
+    // re-truncates to its own cap.
+    let text_cap = if eos_scan.is_some() {
+        usize::MAX
+    } else {
+        content_cap.map_or(0, |cap| cap as usize)
+    };
+    // Re-attach the request span: the body is polled after the request-id
+    // middleware returns, so anything logged from here would otherwise lose
+    // its `request_id` correlation (AISIX-Cloud#1060).
+    crate::surface_request_id_action::in_request_span(async_stream::stream! {
+        let mut guard = TranscriptGuard { slot: Some((on_complete, StreamedTranscript::default())) };
+        // `None` once the side-channel parse has been abandoned; the
+        // relay itself carries on either way.
+        // An upstream that streams without ever ending a frame would grow
+        // the decoder without bound; drop the parse at the cap (losing
+        // telemetry for that pathological case) rather than OOM. Same
+        // bound and same trade as the `/v1/responses` passthrough.
+        let mut decoder = Some(aisix_gateway::SseDecoder::with_max_frame_bytes(
+            MAX_SSE_FRAME_BUF_BYTES,
+        ));
+        futures::pin_mut!(upstream);
+        while let Some(item) = upstream.next().await {
+            if matches!(&item, Ok(bytes) if !bytes.is_empty()) {
+                guard
+                    .observed()
+                    .first_frame
+                    .get_or_insert_with(std::time::Instant::now);
+            }
+            if let (Ok(bytes), Some(d)) = (&item, decoder.as_mut()) {
+                // Side-channel parse over a copy of the frames; `item` is
+                // yielded below untouched.
+                match d.feed(bytes.as_ref()) {
+                    Ok(events) => observe_transcript_events(guard.observed(), &events, text_cap),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "transcription stream: no SSE frame terminator within the buffer cap; \
+                             dropping the parse (usage and capture skipped)"
+                        );
+                        decoder = None;
+                    }
+                }
+            }
+            if let Err(e) = &item {
+                crate::surface_attempt_controller::StreamFailure::record(
+                    &mut guard.observed().failure,
+                    &crate::surface_dispatch_router::reqwest_error_to_bridge(e, started),
+                );
+            }
+            yield item;
+        }
+        if let Some(e) = read_timeout.fired() {
+            crate::surface_attempt_controller::StreamFailure::record(&mut guard.observed().failure, &e);
+        }
+        if let Some(mut d) = decoder.take() {
+            observe_transcript_events(
+                guard.observed(),
+                &d.finish().ok().flatten().into_iter().collect::<Vec<_>>(),
+                text_cap,
+            );
+        }
+        // Upstream EOF — the response was delivered in full. Recorded
+        // before the scan below, which awaits a remote provider and is a
+        // routine drop point for clients that close on the terminal frame.
+        guard.observed().reached_end = true;
+        if let Some(scan) = eos_scan {
+            // The guard stays armed across the await: an SDK that closes
+            // on the terminal frame drops this generator here, and the
+            // Drop emit must still carry the usage it already parsed.
+            let text = guard.observed().text().to_string();
+            // A failed stream with no text is not a response to judge.
+            if !text.is_empty() || guard.observed().failure.is_none() {
+                let hits = scan.observe(&text, None).await;
+                guard.observed().output_hits = hits;
+            }
+        }
+        if let Some((f, observed)) = guard.slot.take() {
+            f(observed);
+        }
+    })
+}
+
+/// Fold one batch of decoded SSE events into the running observation, all
+/// of it bounded by `cap`.
+///
+/// Read by field rather than by event type, so a provider that names its
+/// events differently is still observed: a `usage` block updates the
+/// counts (last one wins, so usage reported after
+/// `transcript.text.done` is read the same way), a whole-transcript
+/// `text` becomes the terminal text, and a `delta` appends to the
+/// assembled one.
+fn observe_transcript_events(
+    observed: &mut StreamedTranscript,
+    events: &[aisix_gateway::SseEvent],
+    cap: usize,
+) {
+    for event in events {
+        let aisix_gateway::SseEvent::Data(payload) = event else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
+        if let Some(err) =
+            aisix_gateway::capture_in_band_error(payload, aisix_gateway::UpstreamWire::OpenAI)
+        {
+            crate::surface_attempt_controller::StreamFailure::record(&mut observed.failure, &err);
+            continue;
+        }
+        if let Some(usage) = extract_token_usage(&value) {
+            observed.usage = Some(usage);
+        }
+        if let Some(seconds) = duration_from_response(&value) {
+            observed.duration_seconds = Some(seconds);
+        }
+        if let Some(full) = value.get("text").and_then(Value::as_str) {
+            observed.terminal = Some(truncate_on_char_boundary(full, cap).to_string());
+            continue;
+        }
+        if observed.deltas.len() >= cap {
+            continue;
+        }
+        if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+            let room = cap - observed.deltas.len();
+            observed
+                .deltas
+                .push_str(truncate_on_char_boundary(delta, room));
+        }
+    }
+}
+
+/// A multipart request as content capture represents it. See the capture site.
+fn captured_transcription_fields(
+    fields: &[(String, Option<String>, Option<String>, Bytes)],
+) -> String {
+    use sha2::Digest;
+    let mut obj = serde_json::Map::new();
+    // Appends on a repeated name (multipart allows repeats and all are
+    // forwarded) so no field disappears from the export. The filename is
+    // deliberately NOT captured — it is user-controlled text that skips
+    // the redaction path; the checksum alone represents the file,
+    // matching LiteLLM.
+    let mut push = |key: String, value: String| match obj.get_mut(&key) {
+        Some(Value::String(existing)) => {
+            existing.push('\n');
+            existing.push_str(&value);
+        }
+        _ => {
+            obj.insert(key, Value::String(value));
+        }
+    };
+    for (name, _, _, data) in fields {
+        match std::str::from_utf8(data) {
+            Ok(text) if name != "file" => {
+                push(name.clone(), text.to_string());
+            }
+            _ => {
+                push(
+                    format!("{name}_sha256"),
+                    format!("{:x}", sha2::Sha256::digest(data)),
+                );
+            }
+        }
+    }
+    serde_json::to_string(&Value::Object(obj)).unwrap_or_default()
+}
+
+/// Collect all multipart fields, resolve the model, swap in the upstream
+/// model id, then rebuild and forward the multipart form.
+#[allow(clippy::too_many_arguments)]
+async fn multipart_dispatch(
+    state: &ProxyState,
+    // Out-param, not an input: the snapshot is loaded HERE, once the
+    // upload has been drained, and handed back so the handler's terminal
+    // emits read the same one. Loading it at handler entry instead would
+    // resolve the model, the client-IP allowlist, the upstream credential
+    // and the rate-limit policies against config captured before a
+    // multi-minute upload began (#941 audit M2).
+    snapshot_out: &mut Option<std::sync::Arc<aisix_core::AisixSnapshot>>,
+    auth: &AuthenticatedKey,
+    mut multipart: Multipart,
+    upstream_path: &str,
+    request_id: &str,
+    client_ctx: &ClientContext,
+    audit_out: &mut crate::surface_usage_attr_view::GuardrailAudit,
+    routing_out: &mut crate::surface_attempt_controller::RoutingTelemetry,
+) -> Result<AudioDispatchSuccess, ProxyError> {
+    // The request clock for the streamed relay's end-of-stream emit
+    // (#998): the handler has long returned by the time it fires, so it
+    // can't read `started` there. Taken before the upload is drained, so
+    // it measures the same span the handler's own clock does.
+    let dispatch_started = Instant::now();
+
+    // Collect all fields first so we can find `model` before building the
+    // outgoing reqwest multipart.
+    let mut fields: Vec<(String, Option<String>, Option<String>, Bytes)> = Vec::new();
+
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        crate::surface_proxy_error_view::proxy_error_from_multipart(
+            e,
+            state.request_body_limit_bytes,
+            "multipart read error",
+        )
+    })? {
+        let name = field.name().unwrap_or("").to_string();
+        let file_name = field.file_name().map(|s| s.to_string());
+        let content_type = field.content_type().map(|s| s.to_string());
+        let data = field.bytes().await.map_err(|e| {
+            crate::surface_proxy_error_view::proxy_error_from_multipart(
+                e,
+                state.request_body_limit_bytes,
+                "multipart field read error",
+            )
+        })?;
+        fields.push((name, file_name, content_type, data));
+    }
+
+    // Extract the `model` field value.
+    let model_name = fields
+        .iter()
+        .find(|(name, ..)| name == "model")
+        .and_then(|(.., data)| std::str::from_utf8(data).ok())
+        .map(|s| s.trim().to_string())
+        .ok_or_else(|| ProxyError::InvalidRequest("`model` field missing from form".into()))?;
+
+    // `stream=true` asks for the transcript incrementally: the transcribe
+    // models answer with `text/event-stream` instead of a JSON object.
+    // Known before the request is built because it decides the timeout
+    // shape — reqwest's request-level timeout bounds the body read too, so
+    // it would cut a relayed stream off mid-transcript (#998).
+    let stream_requested = fields.iter().any(|(name, _, _, data)| {
+        name == "stream" && std::str::from_utf8(data).map(str::trim) == Ok("true")
+    });
+
+    let snapshot = &**snapshot_out.insert(state.snapshot.load());
+    crate::surface_usage_attr_view::note_failure_request(snapshot, || captured_transcription_fields(&fields));
+    let model_entry = crate::surface_model_resolve_action::resolve_model(snapshot, &model_name)
+        .ok_or_else(|| ProxyError::ModelNotFound(model_name.clone()))?;
+
+    if !auth.key().can_access(snapshot, &model_name) {
+        return Err(ProxyError::ModelForbidden(model_name.clone()));
+    }
+
+    // Client-IP allowlist gate (#557): reject before quota / upstream.
+    crate::surface_dispatch_router::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
+
+    // #1016: a `prompt` part that is not valid UTF-8 would be skipped by
+    // the guardrail scan below yet forwarded verbatim — reject it before
+    // the guardrail pass instead of leaving that asymmetry.
+    crate::surface_dispatch_router::require_utf8_prompt_fields(&fields)?;
+
+    // #696: transcriptions/translations run the guardrail chain too. The
+    // audio bytes aren't scannable text, but the optional `prompt` form
+    // field IS caller text forwarded verbatim to the provider — scan it
+    // (input hook, before the reservation per #542) and mask it (#932).
+    // The transcript RESPONSE is scanned/masked after the upstream call.
+    let guardrail_ctx = aisix_guardrails::RequestContext {
+        passthrough_route_id: "",
+        model_id: &model_entry.id,
+        api_key_id: &auth.entry.id,
+        team_id: auth.key().team_id.as_deref(),
+    };
+    let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    let applied_guardrails = resolved_chain.applied().to_vec();
+    *audit_out = resolved_chain.audit_log();
+
+    // #998: relay the upstream SSE live, or hold it back to scan it?
+    // An output guardrail that can block or mask has to see the whole
+    // transcript before any of it reaches the caller — otherwise
+    // `stream=true` is a bypass for the check the non-streaming request
+    // gets — so a hold-back chain keeps the buffered relay, the same
+    // secure default the chat / responses surfaces use (#719). A
+    // monitor-only chain resolves to `EndOfStreamCheck`: it can never
+    // block, so it must NOT change delivery (AISIX-Cloud#1010) and takes
+    // the live path, scanning once at end-of-stream.
+    let live_relay = stream_requested
+        && !(aisix_guardrails::Guardrail::runs_on_output(&resolved_chain)
+            && aisix_guardrails::Guardrail::stream_output_policy(&resolved_chain).holds_back());
+    let mut redactions = crate::surface_redact_action::RedactionCounts::new();
+    let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    if !resolved_chain.is_empty() {
+        // EVERY `prompt` field: multipart allows repeated names and the form
+        // is rebuilt with all of them, so all are scanned — an empty first
+        // field must not skip a later one.
+        let prompt_messages: Vec<ChatMessage> = fields
+            .iter()
+            .filter(|(name, ..)| name == "prompt")
+            .filter_map(|(.., data)| std::str::from_utf8(data).ok())
+            .filter(|s| !s.is_empty())
+            .map(|s| ChatMessage::user(s.to_string()))
+            .collect();
+        // The chain runs whether or not a `prompt` part was supplied.
+        // Gating on "we found text" made the check a text matcher's
+        // privilege: a guardrail that decides about the CALL — a policy
+        // script, an unconditional block scoped to this model — never
+        // fired on the ordinary shape of this endpoint (an upload with no `prompt`),
+        // so an operator's rule silently allowed exactly the requests
+        // that carry nothing to match.
+        {
+            let chat = aisix_gateway::ChatFormat::new(&model_name, prompt_messages);
+            let (verdict, hits) =
+                aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
+            monitor_hits.extend(hits);
+            if let aisix_guardrails::GuardrailVerdict::Block {
+                reason,
+                guardrail_name,
+                unavailable,
+            } = verdict
+            {
+                // Per #153 the matched-pattern detail stays in ops logs only.
+                tracing::warn!(
+                    guardrail_name = crate::surface_guardrail_stream_view::guardrail_name_field(guardrail_name.as_deref()),
+                    guardrail_hook = "input",
+                    model = %model_name,
+                    reason = %reason,
+                    "guardrail blocked audio request (prompt field)",
+                );
+                // A blocked request exports what the success path would have sent.
+                if crate::surface_usage_attr_view::content_cap(snapshot).is_some() {
+                    crate::surface_dispatch_router::mask_prompt_fields(
+                        &resolved_chain.without_audit(),
+                        &mut fields,
+                        &mut crate::surface_redact_action::RedactionCounts::new(),
+                    );
+                    crate::surface_usage_attr_view::note_failure_request(snapshot, || {
+                        captured_transcription_fields(&fields)
+                    });
+                }
+                return Err(crate::surface_proxy_error_view::guardrail_block_error(
+                    "request",
+                    guardrail_name.as_deref(),
+                    unavailable.as_deref(),
+                ));
+            }
+        }
+        crate::surface_dispatch_router::mask_prompt_fields(&resolved_chain, &mut fields, &mut redactions);
+    }
+
+    // Content capture (#700, LiteLLM parity): the audio bytes are NOT
+    // captured — the file is represented by its sha256 (exactly what LiteLLM
+    // logs for transcription input); the text form fields (model, prompt,
+    // language, …) are captured verbatim, POST-redaction so a masked
+    // `prompt` field stays masked in the exported content.
+    let content_cap = content_capture_cap(
+        snapshot
+            .observability_exporters
+            .entries()
+            .iter()
+            .map(|e| &e.value),
+    );
+    let captured_prompt = content_cap.map(|_| captured_transcription_fields(&fields));
+    if let Some(prompt) = &captured_prompt {
+        crate::surface_usage_attr_view::note_failure_request(snapshot, || prompt.clone());
+    }
+
+    let model_rl =
+        crate::surface_quota_action::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
+    let mut reservation = crate::surface_quota_action::enforce(state, snapshot, auth, Some(&model_rl)).await?;
+
+    // Static labels for telemetry — this dispatch serves
+    // both audio sub-routes, and logging translations under the
+    // transcription label would mislead an operator.
+    // Chosen in ONE branch so the endpoint series and the usage event's
+    // operation cannot name different routes on the streaming path, which
+    // is the only emit inside this function.
+    let (retry_endpoint_label, retry_surface): (&'static str, crate::surface_operation_controller::Surface) =
+        if upstream_path == "/audio/translations" {
+            ("/v1/audio/translations", crate::surface_operation_controller::TRANSLATION)
+        } else {
+            ("/v1/audio/transcriptions", crate::surface_operation_controller::TRANSCRIPTION)
+        };
+
+    // A Model Group walks its targets (AISIX-Cloud#1111); every per-target
+    // input — provider, key, URL, upstream id, deadlines — comes from the
+    // target.
+    *routing_out = crate::surface_attempt_controller::RoutingTelemetry::for_request(&model_entry.value.display_name)
+        .with_trace(client_ctx.trace.clone());
+    let dispatched = crate::surface_routing_controller::dispatch_with_failover(
+        state,
+        snapshot,
+        auth,
+        &mut reservation,
+        client_ctx,
+        &model_name,
+        &model_entry,
+        routing_out,
+        |_| true,
+        |_| None,
+        |target, timeouts| {
+            let fields = &fields;
+            async move {
+                let model = &target.model;
+                let provider = crate::surface_dispatch_router::require_provider(model)?;
+                let upstream_model = crate::surface_dispatch_router::require_upstream_model(model)?.to_string();
+                let pk_entry = crate::surface_dispatch_router::resolve_provider_key(snapshot, model)?;
+                let api_key = crate::surface_dispatch_router::require_api_key(&pk_entry.value, model)?;
+
+                let (url, auth) = {
+                    // Cache key must be `'static`; both callers pass fixed literals.
+                    let url_cache_key: &'static str = if upstream_path == "/audio/translations" {
+                        "proxy/audio/translations"
+                    } else {
+                        "proxy/audio/transcriptions"
+                    };
+                    let url = aisix_gateway::surface_url_cache_store::cached_endpoint_url(
+                        &pk_entry.id,
+                        url_cache_key,
+                        // Every resolve_base_url input, via the shared constructor
+                        // (#1017: the resolved URL depends on the vendor too), plus the
+                        // per-call path.
+                        &{
+                            let [base, vendor, adapter] =
+                                crate::surface_dispatch_router::pk_url_fingerprint(&pk_entry.value);
+                            [base, vendor, adapter, upstream_path]
+                        },
+                        || {
+                            let base = crate::surface_dispatch_router::resolve_base_url(&pk_entry.value)?;
+                            Ok::<_, crate::surface_proxy_error_view::ProxyError>(crate::surface_dispatch_router::build_openai_url(
+                                &base,
+                                upstream_path,
+                            ))
+                        },
+                    )?;
+                    let auth_hv = header::HeaderValue::from_str(&format!("Bearer {api_key}"))
+                        .map_err(|e| {
+                            ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+                                "api key contains invalid header chars: {e}"
+                            )))
+                        })?;
+                    (url, (header::AUTHORIZATION, auth_hv))
+                };
+                let provider_label = provider.to_ascii_lowercase();
+
+                // Rebuild the multipart form with `model` rewritten. A `multipart::Form`
+                // is single-use (sending consumes it), so this is a closure rather than a
+                // value: each retry attempt below builds a fresh one. That is only
+                // possible because every part is built over an in-memory `Bytes` — a
+                // streamed part could not be replayed.
+                let build_form = || {
+                    let mut form = multipart::Form::new();
+                    for (name, file_name, content_type, data) in fields {
+                        let field_data = if name == "model" {
+                            Bytes::copy_from_slice(upstream_model.as_bytes())
+                        } else {
+                            data.clone()
+                        };
+
+                        // Over the refcounted `Bytes` itself: `Part::bytes` would
+                        // copy each file into a `Vec` that the form holds for the
+                        // whole upstream wait, next to the request's own copy.
+                        let len = field_data.len() as u64;
+                        let new_part =
+                            || multipart::Part::stream_with_length(field_data.clone(), len);
+                        let mut part = if let Some(ct) = content_type {
+                            new_part().mime_str(ct).unwrap_or_else(|_| new_part())
+                        } else {
+                            new_part()
+                        };
+                        if let Some(fname) = file_name {
+                            part = part.file_name(fname.clone());
+                        }
+                        form = form.part(name.clone(), part);
+                    }
+                    form
+                };
+
+                // Build headers explicitly so the PK's `request.default_headers` and
+                // `request.forward_client_headers` can inject operator/client headers
+                // (AISIX-Cloud#867 follow-up). The body is a multipart form, so the JSON
+                // body-field overrides don't apply here — only headers do. Content-Type
+                // is left to `.multipart()` (it sets the boundary). Reserved auth
+                // headers are protected by `apply_request_headers`.
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert(auth.0, auth.1);
+                let rid_hv = header::HeaderValue::from_str(request_id).map_err(|e| {
+                    ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+                        "request_id contains invalid header chars: {e}"
+                    )))
+                })?;
+                headers.insert(
+                    header::HeaderName::from_static("x-aisix-request-id"),
+                    rid_hv,
+                );
+                aisix_gateway::apply_request_headers(
+                    &mut headers,
+                    &crate::surface_dispatch_router::upstream_header_ctx(
+                        &pk_entry.value,
+                        &pk_entry.id,
+                        model,
+                        &target.id,
+                        client_ctx,
+                    ),
+                );
+
+                let client =
+                    crate::surface_http_client_store::client_for(pk_entry.value.upstream_connection().as_ref());
+                let tracker = &state.runtime_status;
+                let model_id: &str = &target.id;
+                let cooldown_cfg = model.cooldown.as_ref();
+                // Send, check the status, and — unless the answer is a stream being
+                // relayed — read the body as one retryable unit. See the same shape in
+                // rerank.rs for why `note_failure` stays per attempt. A relayed stream
+                // leaves the retryable unit at the status check: once its first frame
+                // is on the wire there is no failing over left to do.
+                let request_budget = timeouts.request;
+                let stream_budget = timeouts.stream;
+                let (upstream_headers, upstream_body) = match {
+                    let mut req = url
+                        .clone()
+                        .post_on(&client)
+                        .headers(headers.clone())
+                        .multipart(build_form());
+                    // #554/#911: a buffered audio call takes the per-model E2E
+                    // request timeout like the other direct-upstream paths
+                    // (count_tokens/rerank/responses), so a slow/blackholed audio
+                    // provider fails over and the model's timeout cooldown can
+                    // engage. A relayed stream must NOT carry it: reqwest's
+                    // request-level timeout bounds the body read too, so it would
+                    // cut the transcript off mid-stream (#998). That path bounds the
+                    // connect phase and each chunk by the stream budget instead —
+                    // the same split `/v1/responses` uses.
+                    if !live_relay {
+                        if let Some(d) = request_budget {
+                            req = req.timeout(d);
+                        }
+                    }
+                    let connect_deadline = if live_relay { stream_budget } else { None };
+                    async move {
+                        // `reqwest_error_to_bridge`, not a bare `Transport`: an
+                        // elapsed `timeout` has to surface as `BridgeError::Timeout`
+                        // or it is indistinguishable from a connection fault. That
+                        // distinction now decides whether the default retry budget
+                        // is spent on it (`RetryBudget::covers`) — classifying a
+                        // timeout as transport made the model's own timeout get
+                        // retried, turning a 400ms budget into ~2s.
+                        let send_started = Instant::now();
+                        let resp = crate::surface_stream_timeout_action::send_with_deadline(
+                            req,
+                            connect_deadline,
+                            send_started,
+                        )
+                        .await
+                        .map_err(|be| {
+                            crate::surface_cooldown_store::note_failure(tracker, model_id, cooldown_cfg, be)
+                        })?;
+
+                        let status = resp.status();
+                        if !status.is_success() {
+                            return Err(crate::surface_cooldown_store::note_failure(
+                                tracker,
+                                model_id,
+                                cooldown_cfg,
+                                aisix_gateway::upstream_error_within(
+                                    connect_deadline,
+                                    resp,
+                                    crate::surface_dispatch_router::held_route_http_error,
+                                )
+                                .await,
+                            ));
+                        }
+
+                        // Relay response headers that matter for the client.
+                        let upstream_headers = resp.headers().clone();
+                        // The caller asked to stream and the upstream answered one:
+                        // hand the live response on so its frames reach the caller
+                        // as they arrive (#998). Everything else — including a
+                        // provider that ignored `stream=true` and replied with a
+                        // JSON transcript — is read whole, so the usage, duration
+                        // and output-guardrail passes below still see a body.
+                        if live_relay && is_event_stream(&upstream_headers) {
+                            return Ok((upstream_headers, AudioUpstreamBody::Live(resp)));
+                        }
+                        let read = async {
+                            match stream_budget.filter(|_| live_relay) {
+                                // No request-level timeout was set on the live path,
+                                // so bound this read rather than leaving it open.
+                                Some(d) => tokio::time::timeout(d, resp.bytes())
+                                    .await
+                                    .map_err(|_| aisix_gateway::BridgeError::Timeout {
+                                        elapsed_ms: d.as_millis() as u64,
+                                        cause: String::new(),
+                                    })?
+                                    .map_err(|e| aisix_gateway::upstream_body_read_error(&e)),
+                                None => resp
+                                    .bytes()
+                                    .await
+                                    .map_err(|e| aisix_gateway::upstream_body_read_error(&e)),
+                            }
+                        };
+                        let body_bytes = read.await.map_err(|be| {
+                            crate::surface_cooldown_store::note_failure(tracker, model_id, cooldown_cfg, be)
+                        })?;
+                        Ok((upstream_headers, AudioUpstreamBody::Buffered(body_bytes)))
+                    }
+                }
+                .await
+                {
+                    Ok(v) => v,
+                    Err(err) => return Err(ProxyError::Bridge(err)),
+                };
+                Ok((
+                    upstream_headers,
+                    upstream_body,
+                    provider_label,
+                    pk_entry.id.to_string(),
+                    upstream_model,
+                    stream_budget,
+                ))
+            }
+        },
+    )
+    .await;
+    let crate::surface_routing_controller::Dispatched {
+        value:
+            (upstream_headers, upstream_body, provider_label, pk_id, upstream_model, stream_budget),
+        target,
+        attempt_started,
+        member_reservation,
+        in_flight,
+    } = match dispatched {
+        Ok(d) => d,
+        Err(e) => {
+            reservation
+                .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+                .await;
+            return Err(e);
+        }
+    };
+    // Fold the target's model-layer reservation in (AISIX-Cloud#1087) so
+    // one commit — or the stream guard — bills the member's TPM/TPD too.
+    let mut reservation = reservation;
+    if let Some(member) = member_reservation {
+        reservation.merge(member);
+    }
+
+    state.health.record_success(&target.model.display_name);
+    state.runtime_status.mark_healthy(&target.id);
+
+    let body_bytes = match upstream_body {
+        AudioUpstreamBody::Buffered(bytes) => bytes,
+        // #998: forward the upstream's SSE frames as they arrive. The
+        // caller sees the same wire bytes it would get straight from the
+        // provider, at the same pace; a side-channel decoder reads the
+        // terminal `transcript.text.done` off the same stream so the
+        // request is still billed and attributed.
+        AudioUpstreamBody::Live(resp) => {
+            // Duration cost basis (#457): what the terminal event's usage
+            // reports, else what the uploaded file says — the buffered
+            // path's precedence. Probed here, while `fields` is still in
+            // scope; the event is read at end-of-stream.
+            let probed_seconds = fields
+                .iter()
+                .find(|(name, ..)| name == "file")
+                .and_then(|(.., data)| probe_audio_duration_seconds(data));
+
+            // #450/#688: the reservation outlives the handler. The
+            // concurrency slot stays held until the stream ends, and the
+            // terminal token cost is applied to TPM/TPD from the guard —
+            // the sync analog of the buffered path's `commit_tokens`.
+            let post_stream_keys = reservation.keys();
+            let stream_hold = reservation.into_stream_hold();
+            let limiter = std::sync::Arc::clone(&state.limiter);
+            // least_busy: the target stays busy until the relay ends.
+            let in_flight_hold = in_flight;
+
+            // Monitor-only output chains still get their end-of-stream
+            // observation (AISIX-Cloud#1010); a block-capable chain never
+            // reaches here — `live_relay` sent it down the buffered path.
+            let eos_scan =
+                aisix_guardrails::Guardrail::runs_on_output(&resolved_chain).then(|| {
+                    crate::surface_guardrail_stream_view::EosOutputScan::new(
+                        std::sync::Arc::new(resolved_chain),
+                        upstream_model.clone(),
+                    )
+                });
+
+            let state_c = state.clone();
+            let request_id_c = request_id.to_string();
+            let model_id_c = target.id.clone();
+            let model_name_c = model_name.clone();
+            let provider_c = provider_label.clone();
+            let upstream_model_c = upstream_model.clone();
+            let pk_id_c = pk_id.clone();
+            let api_key_id_c = auth.entry.id.clone();
+            let applied_c = applied_guardrails.clone();
+            // The chain itself does not survive into the relay closure, so
+            // clone the audit handle here — the same line `applied` is
+            // snapshotted — and read it at end-of-stream. It carries the
+            // INPUT-side hits: this is the live-relay branch, which a
+            // block- or mask-capable chain never reaches (`live_relay`
+            // sends those down the buffered path above), so its end-of-
+            // stream scan is monitor-only by construction and writes no
+            // enforced hit of its own (AISIX-Cloud#1330 / #1024).
+            let audit_c = audit_out.clone();
+            let redactions_c = redactions.clone();
+            let input_monitor_hits = monitor_hits.clone();
+            let client_c = client_ctx.clone();
+            let captured_prompt_c = captured_prompt.clone();
+            // The winner's event measures its own attempt, to the end of the
+            // stream — not the attempts that failed before it (#655).
+            let winner_c = routing_out.winner().cloned();
+
+            let read_timeout = crate::surface_stream_timeout_action::ReadTimeoutSignal::default();
+            let relayed = transcription_relay(
+                crate::surface_stream_timeout_action::with_read_timeout_bytes_signalled(
+                    resp.bytes_stream(),
+                    stream_budget,
+                    read_timeout.clone(),
+                ),
+                read_timeout,
+                content_cap,
+                eos_scan,
+                move |outcome| {
+                    let usage = outcome.usage.clone().unwrap_or_default();
+                    let duration_seconds =
+                        duration_cost_basis(outcome.duration_seconds, || probed_seconds);
+                    let total = u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens);
+                    for key in &post_stream_keys {
+                        limiter.add_tokens_post_stream(
+                            key,
+                            aisix_ratelimit::TokenCharge::reported(total),
+                        );
+                    }
+                    drop(stream_hold);
+                    drop(in_flight_hold);
+                    // A stream can outlive several config generations, so
+                    // the end-of-stream emit reads a FRESH snapshot rather
+                    // than the one the request started on (#941).
+                    let snap = state_c.snapshot.load();
+                    let pk = crate::surface_usage_attr_view::ResolvedPk::resolve(&snap, &pk_id_c);
+                    let captured_content = match (&captured_prompt_c, content_cap) {
+                        (Some(prompt), Some(cap)) => {
+                            Some(CapturedContent::new(prompt, outcome.text(), cap as usize))
+                        }
+                        _ => None,
+                    };
+                    let mut monitor_hits = input_monitor_hits;
+                    monitor_hits.extend(outcome.output_hits);
+                    let winner = winner_c.map(|mut w| {
+                        w.latency_ms = crate::surface_attempt_controller::ms_since(attempt_started);
+                        w
+                    });
+                    let status = crate::surface_attempt_controller::stream_status(
+                        outcome.reached_end,
+                        outcome.failure.as_ref(),
+                    );
+                    if let Some(first_frame) = outcome.first_frame {
+                        let caller =
+                            crate::surface_request_metrics_view::Caller::from_api_key_id(&snap, &api_key_id_c);
+                        crate::surface_request_metrics_view::record_stream_ttft(
+                            &state_c,
+                            retry_endpoint_label,
+                            caller.as_caller(),
+                            crate::surface_request_metrics_view::Upstream {
+                                provider: &provider_c,
+                                model: &model_name_c,
+                                upstream_model: &upstream_model_c,
+                                pk: pk.labels(),
+                                stream: true,
+                                ..Default::default()
+                            },
+                            status,
+                            first_frame.saturating_duration_since(attempt_started),
+                            first_frame.saturating_duration_since(dispatch_started),
+                        );
+                    }
+                    emit_usage_event(
+                        &state_c,
+                        &snap,
+                        &pk,
+                        &request_id_c,
+                        &model_id_c,
+                        &model_name_c,
+                        &api_key_id_c,
+                        retry_endpoint_label,
+                        retry_surface,
+                        &provider_c,
+                        &upstream_model_c,
+                        &applied_c,
+                        // A caller that walked away mid-transcript is
+                        // reported as 499, an upstream failure as that
+                        // failure's status, matching the other streaming
+                        // surfaces — the upstream work still happened, so
+                        // the event is emitted either way.
+                        status,
+                        dispatch_started.elapsed(),
+                        &usage,
+                        duration_seconds,
+                        &client_c,
+                        redactions_c,
+                        monitor_hits,
+                        /* guardrail_blocked */ false,
+                        captured_content.as_ref(),
+                        &audit_c,
+                        outcome.failure.as_ref(),
+                        winner.as_ref(),
+                    );
+                },
+            );
+            let mut out = axum::response::Response::new(axum::body::Body::from_stream(
+                crate::surface_sse_keepalive_view::with_heartbeat(
+                    Box::pin(relayed),
+                    crate::surface_sse_keepalive_view::interval(),
+                ),
+            ));
+            copy_response_header(&upstream_headers, &mut out, header::CONTENT_TYPE);
+            return Ok(AudioDispatchSuccess {
+                usage_handled_by_stream: true,
+                response: out,
+                model_name,
+                provider: provider_label,
+                model_id: target.id.clone(),
+                provider_key_id: pk_id.clone(),
+                upstream_model,
+                // The Drop guard owns the emit; the handler must not
+                // double-emit with the counts it cannot see yet.
+                usage: None,
+                // Not known until the stream ends; the guard's emit owns it.
+                duration_seconds: 0.0,
+                applied_guardrails,
+                redactions,
+                monitor_hits,
+                guardrail_blocked: false,
+                guardrail_block_message: String::new(),
+                // The guard's emit carries the captured content too.
+                captured_content: None,
+            });
+        }
+    };
+
+    // Parse the response body best-effort for a `usage` token block
+    // (gpt-4o-transcribe returns one; whisper-1 returns none, and the
+    // `text`/`srt`/`vtt` response_formats aren't JSON at all). Parse
+    // failure or absence → None → zero-token emit. Done before the
+    // bytes move into the Body.
+    //
+    // A `stream=true` transcription answers with SSE instead of a JSON
+    // object, so the parse above finds nothing — the counts ride the
+    // terminal `transcript.text.done` event. Without the second read the
+    // whole streaming surface bills zero and never moves TPM/TPD.
+    let usage = serde_json::from_slice::<Value>(&body_bytes)
+        .ok()
+        .as_ref()
+        .and_then(extract_token_usage)
+        .or_else(|| extract_sse_token_usage(&upstream_headers, &body_bytes));
+
+    // Duration cost basis (#457): what the upstream reported, else what
+    // the uploaded file says. The probe runs only when the response
+    // carried nothing, so the common `json` path never pays for it. A
+    // buffered stream reports it on its terminal event, like the tokens.
+    let duration_seconds = duration_cost_basis(
+        upstream_duration_seconds(&body_bytes)
+            .or_else(|| last_sse_value(&upstream_headers, &body_bytes, duration_from_response)),
+        || {
+            fields
+                .iter()
+                .find(|(name, ..)| name == "file")
+                .and_then(|(.., data)| probe_audio_duration_seconds(data))
+        },
+    );
+
+    // #911 [21]: commit the actual token cost so TPM/TPD is enforced for the
+    // audio transcription/translation endpoints like chat + embeddings.
+    // Pre-fix the reservation dropped uncommitted and the counter never moved.
+    let total_tokens = usage.as_ref().map_or(0, |u| {
+        u64::from(u.prompt_tokens) + u64::from(u.completion_tokens)
+    });
+    reservation
+        .commit_tokens(aisix_ratelimit::TokenCharge::reported(total_tokens))
+        .await;
+
+    // #696: run the output guardrail chain on the transcript — it is
+    // caller-visible model output, scanned like chat's replies. Pre-fix an
+    // output block/mask enforced on /v1/chat/completions was bypassable by
+    // transcribing audio. The upstream already billed (tokens committed
+    // above), so a block returns the redacted 422 while keeping the billed
+    // usage marked `guardrail_blocked` — same as completions #911 [23].
+    if aisix_guardrails::Guardrail::runs_on_output(&resolved_chain) {
+        let scan = transcription_output_text(&body_bytes);
+        // `(guardrail_name, unavailable)` for the refusal to answer with,
+        // set by either arm below so the two share one exit.
+        let mut refusal: Option<(Option<String>, Option<String>)> = None;
+        // A response the gateway cannot decode is scanned as a lossy copy,
+        // so the bytes `from_utf8_lossy` replaced reach the caller having
+        // been read by nothing. Refuse when a member of the chain both
+        // reads the response AND fails closed on it — the predicate and
+        // tag the tool-result arm uses, and the response-side mirror
+        // of the request-side rule that refuses a body the gateway
+        // cannot parse. Otherwise the transcript is
+        // released unscreened in part, which is a bypass and is recorded
+        // as one; the decodable text is still scanned below, so only the
+        // undecodable bytes go unread.
+        if scan.undecodable {
+            if aisix_guardrails::Guardrail::refuses_unevaluable_output(&resolved_chain) {
+                tracing::warn!(
+                    guardrail_hook = "output",
+                    model = %model_name,
+                    "cannot decode audio transcript response for guardrails; blocking",
+                );
+                refusal = Some((None, Some(crate::surface_proxy_error_view::TAG_UNSCANNABLE_BODY.to_owned())));
+            } else {
+                resolved_chain.record_unevaluable_output_bypass(crate::surface_proxy_error_view::TAG_UNSCANNABLE_BODY);
+            }
+        }
+        if refusal.is_none() {
+            let synth = ChatResponse {
+                logprobs: None,
+                more_choices: Vec::new(),
+                id: String::new(),
+                model: model_name.clone(),
+                message: ChatMessage::assistant(scan.text),
+                finish_reason: FinishReason::Stop,
+                usage: UsageStats::default(),
+                service_tier: None,
+            };
+            let (verdict, hits) =
+                aisix_guardrails::Guardrail::check_output_observed(&resolved_chain, &synth).await;
+            monitor_hits.extend(hits);
+            if let aisix_guardrails::GuardrailVerdict::Block {
+                reason,
+                guardrail_name,
+                unavailable,
+            } = verdict
+            {
+                // Per #153 the matched-pattern detail stays in ops logs only.
+                tracing::warn!(
+                    guardrail_name = crate::surface_guardrail_stream_view::guardrail_name_field(guardrail_name.as_deref()),
+                    guardrail_hook = "output",
+                    model = %model_name,
+                    reason = %reason,
+                    "guardrail blocked audio transcript response",
+                );
+                refusal = Some((guardrail_name, unavailable));
+            }
+        }
+        if let Some((guardrail_name, unavailable)) = refusal {
+            let block = crate::surface_proxy_error_view::guardrail_block_error(
+                "response",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
+            );
+            let guardrail_block_message = crate::surface_attempt_controller::gateway_error_message(&block);
+            return Ok(AudioDispatchSuccess {
+                usage_handled_by_stream: false,
+                response: block.into_response(),
+                model_name,
+                provider: provider_label,
+                model_id: target.id.clone(),
+                provider_key_id: pk_id.clone(),
+                upstream_model: upstream_model.clone(),
+                usage,
+                duration_seconds,
+                applied_guardrails,
+                redactions,
+                monitor_hits: monitor_hits.clone(),
+                guardrail_blocked: true,
+                guardrail_block_message,
+                // The blocked transcript never reached the client — no
+                // content capture, matching the chat surface.
+                captured_content: None,
+            });
+        }
+    }
+
+    // #932/#696: mask-action PII rules rewrite the transcript AFTER the
+    // block check passes, BEFORE it reaches the caller.
+    let body_bytes =
+        match crate::surface_redact_action::redact_transcription_response(&resolved_chain, &body_bytes) {
+            Some((rewritten, counts)) => {
+                crate::surface_redact_action::merge_counts(&mut redactions, counts);
+                Bytes::from(rewritten)
+            }
+            None => body_bytes,
+        };
+
+    // Content capture (#700): the transcript the caller sees — read from
+    // the POST-redaction body so masked PII stays masked in the exported
+    // content.
+    let captured_content = match (&captured_prompt, content_cap) {
+        (Some(prompt), Some(cap)) => Some(CapturedContent::new(
+            prompt,
+            &String::from_utf8_lossy(&body_bytes),
+            cap as usize,
+        )),
+        _ => None,
+    };
+
+    let mut out = axum::response::Response::new(axum::body::Body::from(body_bytes));
+    copy_response_header(&upstream_headers, &mut out, header::CONTENT_TYPE);
+    Ok(AudioDispatchSuccess {
+        usage_handled_by_stream: false,
+        response: out,
+        model_name,
+        provider: provider_label,
+        model_id: target.id.clone(),
+        provider_key_id: pk_id.clone(),
+        upstream_model,
+        usage,
+        duration_seconds,
+        applied_guardrails,
+        redactions,
+        monitor_hits,
+        guardrail_blocked: false,
+        guardrail_block_message: String::new(),
+        captured_content,
+    })
+}
+
+/// What the output guardrail chain gets to read, and whether the
+/// plain-text fallback had to decode lossily to produce it.
+struct TranscriptScan {
+    /// The caller-visible transcript text.
+    text: String,
+    /// The response is not valid UTF-8, so `text` is a lossy rendering:
+    /// the bytes it replaced are relayed to the caller without any scan
+    /// having seen them. The caller of this function decides what that
+    /// costs — see the `refuses_unevaluable_output` gate above.
+    ///
+    /// This is narrower than "the scan covered every byte", and must not
+    /// be read as that invariant. A JSON body carrying neither `text` nor
+    /// `segments[].text` yields an empty transcript and reports `false`,
+    /// because nothing failed to decode — and here that is indistinguishable
+    /// from the empty transcript a silent recording legitimately returns.
+    undecodable: bool,
+}
+
+/// The caller-visible transcript text for output-guardrail scanning (#696):
+/// the JSON `text` field plus `segments[].text` (`json` / `verbose_json`
+/// response formats — segments are scanned too so a response carrying text
+/// only in segments can't bypass the check), or the raw body for the
+/// plain-text formats (`text` / `srt` / `vtt`).
+///
+/// A JSON body is decodable by construction — `serde_json` produced the
+/// strings — so only the plain-text fallback can report otherwise.
+fn transcription_output_text(body: &[u8]) -> TranscriptScan {
+    if let Ok(json) = serde_json::from_slice::<Value>(body) {
+        let mut parts: Vec<&str> = Vec::new();
+        if let Some(t) = json.get("text").and_then(|t| t.as_str()) {
+            parts.push(t);
+        }
+        if let Some(segments) = json.get("segments").and_then(|s| s.as_array()) {
+            parts.extend(
+                segments
+                    .iter()
+                    .filter_map(|s| s.get("text").and_then(|t| t.as_str())),
+            );
+        }
+        return TranscriptScan {
+            text: parts.join("\n"),
+            undecodable: false,
+        };
+    }
+    match std::str::from_utf8(body) {
+        Ok(text) => TranscriptScan {
+            text: text.to_owned(),
+            undecodable: false,
+        },
+        Err(_) => TranscriptScan {
+            text: String::from_utf8_lossy(body).into_owned(),
+            undecodable: true,
+        },
+    }
+}
+
+/// JSON passthrough for `/v1/audio/speech` — returns binary audio bytes.
+/// Returns `(response, provider_label, model_id)`; `model_id` lets the
+/// handler attribute a (zero-token) UsageEvent (#406).
+/// Build a [`ChatFormat`](aisix_gateway::ChatFormat) from the speech `input`
+/// text so the input guardrail chain can scan it (#545). Never sent upstream.
+fn speech_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFormat {
+    let messages = match body.get("input").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => vec![aisix_gateway::ChatMessage::user(s.to_string())],
+        _ => Vec::new(),
+    };
+    aisix_gateway::ChatFormat::new(model, messages)
+}
+
+#[allow(clippy::type_complexity)]
+/// `/v1/audio/speech`'s dispatch result. TTS reports no usage block, so
+/// this carries only what the terminal emit needs — a struct rather than
+/// the tuple it used to be, matching `AudioDispatchSuccess` above.
+struct SpeechDispatchSuccess {
+    /// Headers only: the handler attaches the body through
+    /// [`speech_relay`], which owns the request's usage event.
+    response: Response,
+    /// The upstream audio, bounded by the per-chunk read timeout and
+    /// holding the key's concurrency slot until it ends.
+    body: std::pin::Pin<Box<dyn futures::Stream<Item = reqwest::Result<Bytes>> + Send>>,
+    /// Set when `body` ended on a read timeout rather than its own end.
+    read_timeout: crate::surface_stream_timeout_action::ReadTimeoutSignal,
+    provider: String,
+    model_id: String,
+    provider_key_id: String,
+    /// Provider-side model name, for the `upstream_model` metric label
+    /// (AISIX-Cloud#1234).
+    upstream_model: String,
+    applied_guardrails: Vec<AppliedGuardrail>,
+    redactions: crate::surface_redact_action::RedactionCounts,
+    monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    captured_content: Option<CapturedContent>,
+    /// When the attempt that answered began (#655).
+    attempt_started: Instant,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn speech_dispatch(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    mut body: Value,
+    request_id: &str,
+    client_ctx: &ClientContext,
+    audit_out: &mut crate::surface_usage_attr_view::GuardrailAudit,
+    routing_out: &mut crate::surface_attempt_controller::RoutingTelemetry,
+) -> Result<SpeechDispatchSuccess, ProxyError> {
+    crate::surface_usage_attr_view::note_failure_request(snapshot, || body.to_string());
+    let model_name = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ProxyError::InvalidRequest("missing `model` field".into()))?
+        .to_string();
+
+    let model_entry = crate::surface_model_resolve_action::resolve_model(snapshot, &model_name)
+        .ok_or_else(|| ProxyError::ModelNotFound(model_name.clone()))?;
+
+    if !auth.key().can_access(snapshot, &model_name) {
+        return Err(ProxyError::ModelForbidden(model_name.clone()));
+    }
+
+    // Client-IP allowlist gate (#557): reject before guardrails / upstream.
+    crate::surface_dispatch_router::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
+
+    // #545: /v1/audio/speech must run input guardrails. Before this it
+    // forwarded the user `input` text (synthesized to audio) with no
+    // configured content/DLP check, so a block enforced on
+    // /v1/chat/completions was bypassable by switching surface. Run before
+    // the rate-limit reservation so a content-policy refusal doesn't burn an
+    // RPM slot. (Output is binary audio, not scannable text — no output hook.)
+    let guardrail_ctx = aisix_guardrails::RequestContext {
+        passthrough_route_id: "",
+        model_id: &model_entry.id,
+        api_key_id: &auth.entry.id,
+        team_id: auth.key().team_id.as_deref(),
+    };
+    let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    // Record which guardrails govern this request (#379 parity) for the emitted
+    // UsageEvent. Empty when none attached.
+    let applied_guardrails = resolved_chain.applied().to_vec();
+    *audit_out = resolved_chain.audit_log();
+    let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    if !resolved_chain.is_empty() {
+        let chat = speech_input_to_chat(&model_name, &body);
+        let (verdict, hits) =
+            aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
+        monitor_hits.extend(hits);
+        if let aisix_guardrails::GuardrailVerdict::Block {
+            reason,
+            guardrail_name,
+            unavailable,
+        } = verdict
+        {
+            // Per #153 the matched-pattern detail stays in ops logs only.
+            tracing::warn!(
+                guardrail_name = crate::surface_guardrail_stream_view::guardrail_name_field(guardrail_name.as_deref()),
+                guardrail_hook = "input",
+                model = %model_name,
+                reason = %reason,
+                "guardrail blocked /v1/audio/speech request",
+            );
+            // A blocked request exports what the success path would have sent.
+            if crate::surface_usage_attr_view::content_cap(snapshot).is_some() {
+                crate::surface_redact_action::redact_speech_request(&resolved_chain.without_audit(), &mut body);
+                crate::surface_usage_attr_view::note_failure_request(snapshot, || body.to_string());
+            }
+            return Err(crate::surface_proxy_error_view::guardrail_block_error(
+                "request",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
+            ));
+        }
+    }
+
+    // #932/#696: mask-action PII rules rewrite the `input` text in place
+    // AFTER the block check passes, BEFORE the body is forwarded upstream.
+    // Pre-#696 a mask-action detector was a silent no-op here.
+    let redactions = crate::surface_redact_action::redact_speech_request(&resolved_chain, &mut body);
+    crate::surface_usage_attr_view::note_failure_request(snapshot, || body.to_string());
+
+    // Content capture (#700, LiteLLM parity): the post-redaction request
+    // body (the `input` text to synthesize) is the prompt; the binary audio
+    // response is NOT captured — LiteLLM logs no TTS response either.
+    let captured_content = content_capture_cap(
+        snapshot
+            .observability_exporters
+            .entries()
+            .iter()
+            .map(|e| &e.value),
+    )
+    .map(|cap| {
+        CapturedContent::new(
+            &serde_json::to_string(&body).unwrap_or_default(),
+            "",
+            cap as usize,
+        )
+    });
+
+    let model_rl =
+        crate::surface_quota_action::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
+    let mut reservation = crate::surface_quota_action::enforce(state, snapshot, auth, Some(&model_rl)).await?;
+
+    // A Model Group walks its targets (AISIX-Cloud#1111). Each attempt builds
+    // its own wire body — the `model` field and the PK's `request.*` overrides
+    // belong to the target it is sent to.
+    let base_body = &body;
+    *routing_out = crate::surface_attempt_controller::RoutingTelemetry::for_request(&model_entry.value.display_name)
+        .with_trace(client_ctx.trace.clone());
+    let dispatched = crate::surface_routing_controller::dispatch_with_failover(
+        state,
+        snapshot,
+        auth,
+        &mut reservation,
+        client_ctx,
+        &model_name,
+        &model_entry,
+        routing_out,
+        |_| true,
+        |_| None,
+        |target, timeouts| async move {
+            let model = &target.model;
+            let provider = crate::surface_dispatch_router::require_provider(model)?;
+            let upstream_model = crate::surface_dispatch_router::require_upstream_model(model)?.to_string();
+            let pk_entry = crate::surface_dispatch_router::resolve_provider_key(snapshot, model)?;
+            let api_key = crate::surface_dispatch_router::require_api_key(&pk_entry.value, model)?;
+
+            let provider_label = provider.to_ascii_lowercase();
+
+            // This attempt's body exists only as its wire bytes past this block
+            // (see `crate::surface_proxy_util_component::outbound_json`).
+            let body = if let Some(fields) =
+                crate::surface_proxy_util_component::model_only_fields(base_body, &pk_entry.value, None)
+            {
+                crate::surface_proxy_util_component::outbound_json(&crate::surface_proxy_util_component::ModelRenamed {
+                    fields,
+                    model: &upstream_model,
+                })?
+            } else {
+                let mut attempt_body = base_body.clone();
+                let body = &mut attempt_body;
+                // Rewrite model field.
+                if let Some(m) = body.get_mut("model") {
+                    *m = Value::String(upstream_model.clone());
+                }
+
+                // Apply the PK's `request.*` overrides (body + headers) like the OpenAI
+                // bridge's chat() path — /v1/audio/speech is a JSON passthrough that builds
+                // the request directly (AISIX-Cloud#867 follow-up). No-op when none set.
+                if let Some(r) = pk_entry.value.request.as_ref() {
+                    aisix_provider_openai::surface_overrides_action::apply_param_renames(body, &r.param_renames);
+                    if let Some(constraints) = &r.param_constraints {
+                        aisix_provider_openai::surface_overrides_action::apply_param_constraints(
+                            body,
+                            constraints,
+                        );
+                    }
+                    aisix_provider_openai::surface_overrides_action::apply_default_body_fields(
+                        body,
+                        &r.default_body_fields,
+                    );
+                }
+                crate::surface_proxy_util_component::outbound_json(body)?
+            };
+
+            let (speech_url, auth) = {
+                let speech_url = aisix_gateway::surface_url_cache_store::cached_endpoint_url(
+                    &pk_entry.id,
+                    "proxy/audio/speech",
+                    // Every resolve_base_url input (#1017) via the shared constructor.
+                    &crate::surface_dispatch_router::pk_url_fingerprint(&pk_entry.value),
+                    || {
+                        let base = crate::surface_dispatch_router::resolve_base_url(&pk_entry.value)?;
+                        Ok::<_, crate::surface_proxy_error_view::ProxyError>(crate::surface_dispatch_router::build_openai_url(
+                            &base,
+                            "/audio/speech",
+                        ))
+                    },
+                )?;
+                let auth_hv =
+                    header::HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
+                        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+                            "api key contains invalid header chars: {e}"
+                        )))
+                    })?;
+                (speech_url, (header::AUTHORIZATION, auth_hv))
+            };
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(auth.0, auth.1);
+            headers.insert(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("application/json"),
+            );
+            let rid_hv = header::HeaderValue::from_str(request_id).map_err(|e| {
+                ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+                    "request_id contains invalid header chars: {e}"
+                )))
+            })?;
+            headers.insert(
+                header::HeaderName::from_static("x-aisix-request-id"),
+                rid_hv,
+            );
+            aisix_gateway::apply_request_headers(
+                &mut headers,
+                &crate::surface_dispatch_router::upstream_header_ctx(
+                    &pk_entry.value,
+                    &pk_entry.id,
+                    model,
+                    &target.id,
+                    client_ctx,
+                ),
+            );
+
+            let client =
+                crate::surface_http_client_store::client_for(pk_entry.value.upstream_connection().as_ref());
+            let tracker = &state.runtime_status;
+            let model_id: &str = &target.id;
+            let cooldown_cfg = model.cooldown.as_ref();
+            // Send and check the status as one retryable unit; the audio bytes are
+            // relayed, not read here. See the same shape in rerank.rs for why
+            // `note_failure` stays per attempt.
+            //
+            // #998: the synthesized audio is forwarded chunk by chunk (LiteLLM's
+            // `/v1/audio/speech` does the same, explicitly for latency) — a player
+            // can start on the first bytes instead of waiting for the whole file.
+            // That moves the read out of the retryable unit: once the 200 is on the
+            // wire a failed read truncates the download rather than failing over,
+            // the same trade `/v1/videos`' content proxy makes.
+            let stream_budget = timeouts.stream;
+            let upstream_resp = match {
+                let req = speech_url
+                    .clone()
+                    .post_on(&client)
+                    .headers(headers.clone())
+                    .body(body.clone());
+                // #554/#911: reqwest's request-level timeout would bound the
+                // body read too and cut a long synthesis off mid-file, so the
+                // stream budget bounds the connect phase and each chunk
+                // instead — the split every relayed path uses.
+                async move {
+                    // `reqwest_error_to_bridge`, not a bare `Transport`: an
+                    // elapsed `timeout` has to surface as `BridgeError::Timeout`
+                    // or it is indistinguishable from a connection fault. That
+                    // distinction now decides whether the default retry budget
+                    // is spent on it (`RetryBudget::covers`) — classifying a
+                    // timeout as transport made the model's own timeout get
+                    // retried, turning a 400ms budget into ~2s.
+                    let send_started = Instant::now();
+                    let resp =
+                        crate::surface_stream_timeout_action::send_with_deadline(req, stream_budget, send_started)
+                            .await
+                            .map_err(|be| {
+                                crate::surface_cooldown_store::note_failure(tracker, model_id, cooldown_cfg, be)
+                            })?;
+
+                    let status = resp.status();
+                    if !status.is_success() {
+                        return Err(crate::surface_cooldown_store::note_failure(
+                            tracker,
+                            model_id,
+                            cooldown_cfg,
+                            aisix_gateway::upstream_error_within(stream_budget, resp, |resp| {
+                                crate::surface_dispatch_router::held_route_http_error(resp)
+                            })
+                            .await,
+                        ));
+                    }
+                    Ok(resp)
+                }
+            }
+            .await
+            {
+                Ok(v) => v,
+                Err(err) => return Err(ProxyError::Bridge(err)),
+            };
+            Ok((
+                upstream_resp,
+                provider_label,
+                pk_entry.id.to_string(),
+                upstream_model,
+                stream_budget,
+            ))
+        },
+    )
+    .await;
+    let crate::surface_routing_controller::Dispatched {
+        value: (upstream_resp, provider_label, pk_id, upstream_model, stream_budget),
+        target,
+        attempt_started,
+        member_reservation,
+        in_flight,
+    } = match dispatched {
+        Ok(d) => d,
+        Err(e) => {
+            reservation
+                .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+                .await;
+            return Err(e);
+        }
+    };
+    // Fold the target's model-layer reservation into the hold below
+    // (AISIX-Cloud#1087), so the member's concurrency slot spans the relay too.
+    let mut reservation = reservation;
+    if let Some(member) = member_reservation {
+        reservation.merge(member);
+    }
+
+    state.health.record_success(&target.model.display_name);
+    state.runtime_status.mark_healthy(&target.id);
+
+    // #911 [21]: speech synthesis (TTS) reports no token usage — it is billed
+    // per input character — so there are no tokens to add to TPM/TPD. The
+    // reservation instead becomes a hold that spans the relayed body: the
+    // handler returns once the headers are out, so releasing the concurrency
+    // slot at handler return would let a key run more simultaneous
+    // syntheses than its cap allows (#450).
+    let stream_hold = reservation.into_stream_hold();
+
+    let upstream_headers = upstream_resp.headers().clone();
+    let read_timeout = crate::surface_stream_timeout_action::ReadTimeoutSignal::default();
+    let signal = read_timeout.clone();
+    let body = Box::pin(async_stream::stream! {
+        // least_busy: the target stays busy until the relay ends, with
+        // the concurrency slot.
+        let _hold = (stream_hold, in_flight);
+        let inner = crate::surface_stream_timeout_action::with_read_timeout_bytes_signalled(
+            upstream_resp.bytes_stream(),
+            stream_budget,
+            signal,
+        );
+        futures::pin_mut!(inner);
+        while let Some(item) = futures::StreamExt::next(&mut inner).await {
+            yield item;
+        }
+    });
+    let mut out = axum::response::Response::new(axum::body::Body::empty());
+    copy_response_header(&upstream_headers, &mut out, header::CONTENT_TYPE);
+    // Relayed verbatim when the upstream sent one, like `/v1/videos`'
+    // content proxy: reqwest strips it only when it decompresses, which it
+    // never does for audio. A mid-stream read timeout then shows up as a
+    // short read — the intended signal that the download failed rather than
+    // a silently truncated file.
+    copy_response_header(&upstream_headers, &mut out, header::CONTENT_LENGTH);
+    Ok(SpeechDispatchSuccess {
+        response: out,
+        body,
+        read_timeout,
+        provider: provider_label,
+        model_id: target.id.clone(),
+        provider_key_id: pk_id.clone(),
+        upstream_model,
+        applied_guardrails,
+        redactions,
+        monitor_hits,
+        captured_content,
+        attempt_started,
+    })
+}
+
+/// `(prompt, completion)` from a *streamed* transcription body.
+///
+/// `stream=true` on the transcribe models answers `text/event-stream`:
+/// a run of `transcript.text.delta` events and a terminal
+/// `transcript.text.done` that carries the same `usage` block the
+/// non-streaming response would have returned. The body is already
+/// buffered here, so decode it and take the last event that carries
+/// usage — the shape stays the same whether the provider puts it on
+/// `transcript.text.done` or on a later event.
+///
+/// Gated on the upstream content type so a `text`/`srt`/`vtt` transcript
+/// that happens to contain a `data:` line is never mistaken for a stream.
+fn extract_sse_token_usage(headers: &HeaderMap, body: &[u8]) -> Option<UsageStats> {
+    last_sse_value(headers, body, extract_token_usage)
+}
+
+/// The last event of a buffered SSE body that `read` finds something in.
+fn last_sse_value<T>(
+    headers: &HeaderMap,
+    body: &[u8],
+    read: impl Fn(&Value) -> Option<T>,
+) -> Option<T> {
+    if !is_event_stream(headers) {
+        return None;
+    }
+    // The body is already buffered whole, so no frame is still arriving and
+    // no bound applies to it here.
+    let mut decoder = aisix_gateway::SseDecoder::with_max_frame_bytes(usize::MAX);
+    let mut events = decoder.feed(body).ok()?;
+    events.extend(decoder.finish().ok()?);
+    events.iter().rev().find_map(|event| match event {
+        aisix_gateway::SseEvent::Data(payload) => serde_json::from_str::<Value>(payload)
+            .ok()
+            .as_ref()
+            .and_then(&read),
+        aisix_gateway::SseEvent::Done => None,
+    })
+}
+
+/// Pull `(prompt_tokens, completion_tokens)` from an audio response
+/// `usage` block. gpt-4o-transcribe returns
+/// `usage: {type:"tokens", input_tokens, output_tokens, ...}`;
+/// whisper-1 (and the `text`/`srt`/`vtt` response formats) return no
+/// token block → `None`. An OpenAI-compatible upstream may report the
+/// counts in chat's `prompt_tokens` / `completion_tokens` instead. Spec:
+/// <https://platform.openai.com/docs/api-reference/audio/json-object>
+fn extract_token_usage(body: &Value) -> Option<UsageStats> {
+    let usage = body.get("usage")?;
+    let count = |audio: &str, chat: &str| {
+        usage
+            .get(audio)
+            .and_then(Value::as_u64)
+            .or_else(|| usage.get(chat).and_then(Value::as_u64))
+    };
+    let field = |audio: &str, chat: &str| usage.get(audio).or_else(|| usage.get(chat));
+    let input = count("input_tokens", "prompt_tokens")? as u32;
+    let output = count("output_tokens", "completion_tokens").unwrap_or(0) as u32;
+    // The token-billed transcription usage splits its input side as
+    // `input_token_details: {text_tokens, audio_tokens}`.
+    let modality = aisix_gateway::ModalityTokens::from_openai_details(
+        field("input_token_details", "prompt_tokens_details"),
+        field("output_token_details", "completion_tokens_details"),
+    );
+    Some(UsageStats {
+        modality,
+        upstream_total_tokens: crate::surface_usage_attr_view::reported_total_tokens(Some(usage)).unwrap_or(0),
+        ..UsageStats::new(input, output)
+    })
+}
+
+/// Audio length in seconds as the upstream reported it.
+///
+/// Two shapes, both from OpenAI's transcription object: the default
+/// `json` format carries `usage: {type: "duration", seconds: N}`, and
+/// `verbose_json` carries a top-level `duration`. Neither is present on
+/// the `text` / `srt` / `vtt` formats — those response bodies are not
+/// JSON at all — which is what `probe_audio_duration_seconds` covers.
+/// <https://platform.openai.com/docs/api-reference/audio/json-object>
+fn upstream_duration_seconds(body: &[u8]) -> Option<f64> {
+    duration_from_response(&serde_json::from_slice::<Value>(body).ok()?)
+}
+
+/// [`upstream_duration_seconds`] over an already-parsed object — a JSON
+/// body or one SSE event of a streamed transcription.
+fn duration_from_response(json: &Value) -> Option<f64> {
+    let from_usage = json
+        .get("usage")
+        .and_then(|u| u.get("seconds"))
+        .and_then(Value::as_f64);
+    let seconds = from_usage.or_else(|| json.get("duration").and_then(Value::as_f64))?;
+    (seconds.is_finite() && seconds > 0.0).then_some(seconds)
+}
+
+/// The largest audio length the control plane can store: its column is
+/// `numeric(12,3)`.
+const MAX_AUDIO_DURATION_SECONDS: f64 = 999_999_999.999;
+
+/// The duration a transcription is priced on: what the upstream reported,
+/// else what the uploaded file says, else 0.
+///
+/// Both sources are untrusted — a caller writes the file header, and an
+/// upstream can report anything — so a length the control plane cannot
+/// store is treated as not measured (0) rather than emitted, where it
+/// would fail the whole usage batch on ingest.
+fn duration_cost_basis(reported: Option<f64>, probe: impl FnOnce() -> Option<f64>) -> f64 {
+    let (seconds, source) = match reported {
+        Some(seconds) => (seconds, "upstream"),
+        None => match probe() {
+            Some(seconds) => (seconds, "uploaded file"),
+            None => return 0.0,
+        },
+    };
+    if seconds <= MAX_AUDIO_DURATION_SECONDS {
+        return seconds;
+    }
+    tracing::warn!(
+        source,
+        seconds,
+        "audio duration exceeds what usage can record; treating it as not measured"
+    );
+    0.0
+}
+
+/// Audio length in seconds read off the uploaded file.
+///
+/// The fallback for every response format that carries no duration. Cost
+/// basis must not depend on which `response_format` the caller picked —
+/// otherwise `response_format=text` is an unmetered channel, the same
+/// shape of bypass as an unbilled stream.
+///
+/// Header/metadata parse only: `lofty` reads container and codec
+/// properties without decoding audio, so an arbitrary caller upload
+/// costs microseconds and cannot pull in a decode path. Anything it
+/// cannot identify yields `None` → a zero cost basis, never an error:
+/// the transcript already succeeded and the upstream already billed.
+pub(crate) fn probe_audio_duration_seconds(audio: &[u8]) -> Option<f64> {
+    use lofty::file::AudioFile;
+    use lofty::probe::Probe;
+
+    // WebM/Matroska first: `lofty` does not read EBML, and WebM is what
+    // a browser's MediaRecorder uploads by default — leaving it out
+    // would keep the most common web-app upload unbilled.
+    if audio.starts_with(&crate::surface_ebml_component::EBML_MAGIC) {
+        return crate::surface_ebml_component::duration_seconds(audio);
+    }
+
+    let probed = Probe::new(std::io::Cursor::new(audio))
+        .guess_file_type()
+        .ok()
+        .and_then(|p| p.read().ok())
+        .map(|f| f.properties().duration().as_secs_f64())
+        .filter(|seconds| *seconds > 0.0);
+    // A streamed WAV / FLAC leaves its length unset, which `lofty` reads
+    // as no file or as 0 s — OpenAI's own `/v1/audio/speech` output among
+    // them.
+    probed
+        .or_else(|| crate::surface_unsized_audio_view::wav_duration_seconds(audio))
+        .or_else(|| crate::surface_unsized_audio_view::flac_duration_seconds(audio))
+}
+
+/// Terminal request-metric emit for the two transcription-shaped routes,
+/// which share `AudioDispatchSuccess` and would otherwise repeat the same
+/// label set twice.
+#[allow(clippy::too_many_arguments)]
+fn record_audio_metrics(
+    state: &ProxyState,
+    pk: &crate::surface_usage_attr_view::ResolvedPk<'_>,
+    endpoint: &'static str,
+    auth: &AuthenticatedKey,
+    success: &AudioDispatchSuccess,
+    status: u16,
+    error_source: aisix_obs::ErrorSource,
+    elapsed: Duration,
+    is_fallback: bool,
+    // `Some(request start)` on the live relay, whose samples are returned
+    // to be parked beside its access-log line rather than recorded now.
+    stream_started: Option<std::time::Instant>,
+) -> Option<crate::surface_request_metrics_view::PendingRequestMetrics> {
+    let caller = crate::surface_request_metrics_view::Caller::new(auth);
+    let upstream = crate::surface_request_metrics_view::Upstream {
+        provider: &success.provider,
+        model: &success.model_name,
+        upstream_model: &success.upstream_model,
+        pk: pk.labels(),
+        // True exactly on the live SSE relay (#998) — the flag that
+        // moves the usage emit into the stream is the same condition
+        // that makes this a streamed response.
+        stream: success.usage_handled_by_stream,
+        is_fallback,
+    };
+    match stream_started {
+        Some(started) => Some(
+            crate::surface_request_metrics_view::PendingRequestMetrics::at_stream_end(
+                state, endpoint, caller, upstream, started,
+            ),
+        ),
+        None => {
+            crate::surface_request_metrics_view::record(
+                state,
+                endpoint,
+                caller,
+                upstream,
+                status,
+                error_source,
+                elapsed,
+            );
+            None
+        }
+    }
+}
+
+/// Emit a UsageEvent for a successful transcription/translation. Tokens
+/// come from the upstream `usage` block when present (gpt-4o-transcribe);
+/// zero otherwise (whisper-1) — the request is still visible/attributed.
+#[allow(clippy::too_many_arguments)]
+fn emit_audio_usage(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    pk: &crate::surface_usage_attr_view::ResolvedPk<'_>,
+    request_id: &str,
+    endpoint: &'static str,
+    surface: crate::surface_operation_controller::Surface,
+    success: &AudioDispatchSuccess,
+    api_key_id: &str,
+    status: u16,
+    elapsed: Duration,
+    client: &ClientContext,
+    audit: &crate::surface_usage_attr_view::GuardrailAudit,
+    winner: Option<&crate::surface_attempt_controller::AttemptRecord>,
+) {
+    emit_usage_event(
+        state,
+        snapshot,
+        pk,
+        request_id,
+        &success.model_id,
+        &success.model_name,
+        api_key_id,
+        endpoint,
+        surface,
+        &success.provider,
+        &success.upstream_model,
+        &success.applied_guardrails,
+        status,
+        elapsed,
+        success.usage.as_ref().unwrap_or(&Default::default()),
+        success.duration_seconds,
+        client,
+        success.redactions.clone(),
+        success.monitor_hits.clone(),
+        success.guardrail_blocked,
+        success.captured_content.as_ref(),
+        audit,
+        // An output guardrail's refusal names itself like an input refusal
+        // does, through the same two fields a stream failure fills.
+        success
+            .guardrail_blocked
+            .then(|| crate::surface_attempt_controller::StreamFailure {
+                status,
+                error_class: crate::surface_attempt_controller::GUARDRAIL_BLOCK_CLASS,
+                error_message: success.guardrail_block_message.clone(),
+            })
+            .as_ref(),
+        winner,
+    );
+}
+
+/// Issue #406: push one `UsageEvent` onto cp-api's telemetry sink and
+/// fan it out to per-env OTLP exporters. Mirrors
+/// `surface_embeddings_controller::emit_usage_event` (#402). `inbound_protocol = "openai"`.
+/// Tokens are populated when the upstream returned a `usage` block
+/// (gpt-4o-transcribe); zero otherwise — duration-based cost (whisper-1)
+/// is a documented cross-repo follow-up (needs duration on the wire +
+/// cp-api pricing).
+#[allow(clippy::too_many_arguments)]
+fn emit_usage_event(
+    state: &ProxyState,
+    // The request's snapshot + its one ProviderKey observation, resolved
+    // by the handler (#941).
+    snap: &aisix_core::AisixSnapshot,
+    pk: &crate::surface_usage_attr_view::ResolvedPk<'_>,
+    request_id: &str,
+    model_id: &str,
+    requested_model: &str,
+    api_key_id: &str,
+    // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
+    // follow-up). `endpoint` too: the three audio routes share this emitter
+    // but are three distinct series — and, since they consume and produce
+    // different things, three distinct operations (AISIX-Cloud#1461).
+    endpoint: &'static str,
+    surface: crate::surface_operation_controller::Surface,
+    provider: &str,
+    upstream_model: &str,
+    applied_guardrails: &[AppliedGuardrail],
+    status_code: u16,
+    elapsed: Duration,
+    usage: &UsageStats,
+    // Cost basis for the duration-billed models (#457); 0 when neither
+    // the upstream nor the uploaded file yielded a length.
+    audio_duration_seconds: f64,
+    client: &ClientContext,
+    // Per-detector PII mask counts (#932/#696). Empty = no redaction.
+    redacted_entity_counts: crate::surface_redact_action::RedactionCounts,
+    // Monitor-mode guardrail observations (AISIX-Cloud#562).
+    guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    // #696: transcript blocked by an output guardrail after upstream billing.
+    guardrail_blocked: bool,
+    // Captured request/response content (#700). Forwarded only to `fan_out`,
+    // never to the CP sink.
+    content: Option<&CapturedContent>,
+    // The request's enforced-guardrail audit handle (AISIX-Cloud#1330).
+    // Cloned into the streaming closure at the same point `applied` is,
+    // so the held-back relay's end-of-stream emit reports the output-hook
+    // mask that ran after the handler frame was already gone.
+    audit: &crate::surface_usage_attr_view::GuardrailAudit,
+    // The upstream failure that ended a streamed transcript after its
+    // `200`; its class and message are the event's error fields.
+    failure: Option<&crate::surface_attempt_controller::StreamFailure>,
+    // The attempt that answered (#655).
+    winner: Option<&crate::surface_attempt_controller::AttemptRecord>,
+) {
+    let mut event = UsageEvent {
+        request_id: request_id.to_string(),
+        occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
+        model_id: model_id.to_string(),
+        api_key_id: api_key_id.to_string(),
+        requested_model: requested_model.to_string(),
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        total_tokens: usage.upstream_total_tokens,
+        modality_tokens: usage.modality,
+        audio_duration_seconds,
+        // Narrowed to the winning attempt's own latency below
+        // (`apply_winning_attempt`) once a failover put earlier attempts
+        // in front of it; they emitted their own events.
+        upstream_latency_ms: crate::surface_attempt_controller::measured_ms(elapsed),
+        downstream_latency_ms: crate::surface_attempt_controller::measured_ms(elapsed),
+        status_code,
+        inbound_protocol: "openai".to_string(),
+        applied_guardrails: applied_guardrails.to_vec(),
+        client_source_ip: client.source_ip.clone(),
+        client_user_agent: client.user_agent.value.clone(),
+        request_headers: client.request_headers.clone(),
+        redacted_entity_counts,
+        guardrail_monitor_hits,
+        guardrail_blocked,
+        guardrail_enforced_hits: crate::surface_usage_attr_view::enforced_hits(audit),
+        guardrail_scores: crate::surface_usage_attr_view::guardrail_scores(audit),
+        guardrail_bypassed_reason: crate::surface_usage_attr_view::bypass_reason(audit),
+        error_class: failure
+            .map(|f| f.error_class.to_string())
+            .unwrap_or_default(),
+        error_message: failure.map(|f| f.error_message.clone()).unwrap_or_default(),
+        ..Default::default()
+    };
+    // Per-PK telemetry attribution, same lookup as chat / messages /
+    // responses (AISIX-Cloud#867 parity).
+    crate::surface_usage_attr_view::apply_pk_telemetry(&mut event, pk);
+    crate::surface_usage_attr_view::apply_winning_attempt(&mut event, winner);
+    // Handler label "audio" — bucketed prometheus counter (#408).
+    crate::surface_usage_attr_view::apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
+    let usage_model =
+        crate::surface_usage_attr_view::usage_event_model_label(snap, &event.requested_model).into_owned();
+    crate::surface_usage_attr_view::emit_usage(
+        state,
+        snap,
+        surface,
+        event,
+        crate::surface_usage_attr_view::usage_event_labels(&usage_model, pk),
+        content,
+        client.trace.as_ref(),
+        /* terminal */ true,
+        /* dispatched */ true,
+    );
+    // Speech (TTS) reports no tokens at all, so this is a no-op there; the
+    // transcription routes report them when the model supplies a usage block.
+    let owned_caller = crate::surface_request_metrics_view::Caller::from_api_key_id(snap, api_key_id);
+    crate::surface_request_metrics_view::record_usage(
+        state,
+        endpoint,
+        owned_caller.as_caller(),
+        crate::surface_request_metrics_view::Upstream {
+            provider,
+            model: requested_model,
+            upstream_model,
+            pk: pk.labels(),
+            ..Default::default()
+        },
+        crate::surface_request_metrics_view::Tokens {
+            input: usage.prompt_tokens,
+            output: usage.completion_tokens,
+            total: usage.prompt_tokens.saturating_add(usage.completion_tokens),
+            // No upstream on this surface reports prompt-cache detail.
+            cached: 0,
+            cache_read: 0,
+            cache_creation: 0,
+            client_type: client.client_type(),
+        },
+    );
+}
+
+fn copy_response_header(src: &HeaderMap, dst: &mut Response, name: header::HeaderName) {
+    if let Some(val) = src.get(&name) {
+        dst.headers_mut().insert(name, val.clone());
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_access_log(
+    method: &'static str,
+    path: &'static str,
+    model: &str,
+    provider: &str,
+    api_key_id: &str,
+    status: u16,
+    latency: Duration,
+    request_id: &str,
+    routing: &crate::surface_attempt_controller::RoutingTelemetry,
+    error: Option<&ProxyError>,
+) {
+    let (error_kind, error) = match error {
+        Some(e) => {
+            let (kind, msg) = crate::surface_attempt_controller::access_log_error(e);
+            (Some(kind), Some(msg))
+        }
+        None => (None, None),
+    };
+    let target = crate::surface_attribution_view::AccessLogTarget::current();
+    let summary = routing.access_log_summary();
+    crate::surface_attribution_view::emit_access_log(AccessLog {
+        method,
+        path,
+        status,
+        latency,
+        duration: latency,
+        provider: Some(provider),
+        model: Some(model),
+        upstream_model: target.upstream_model(),
+        provider_key_id: target.provider_key_id(),
+        api_key_id: Some(api_key_id),
+        prompt_tokens: None,
+        completion_tokens: None,
+        total_tokens: None,
+        request_id,
+        // No provider response id: transcription/translation return
+        // `{text, usage}` and speech returns audio bytes — neither carries
+        // one (AISIX-Cloud#1289).
+        provider_request_id: None,
+        served_by_model: summary.served_by_model,
+        routing_attempt_count: summary.attempt_count,
+        routing_fallback_count: summary.fallback_count,
+        error_kind,
+        error: error.as_deref(),
+        cache: None,
+        request_body_bytes: None,
+        response_body_bytes: None,
+    });
+}
+
+// The audio handler reuses the same client as messages.rs. It's exported
+// from there to avoid creating multiple global Clients.
+#[cfg(test)]
+mod tests {
+
+    use aisix_core::taxonomy_resource_vo::ResourceEntry;
+    use aisix_core::taxonomy_snapshot_vo::SnapshotHandle;
+    use aisix_core::{AisixSnapshot, ApiKey, Model, ProxyConfig};
+    use aisix_gateway::Hub;
+    use aisix_provider_openai::OpenAiBridge;
+    use axum::body::to_bytes;
+    use axum::http::{Request, StatusCode};
+    use std::sync::Arc;
+    use wiremock::matchers::{body_partial_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn cfg() -> ProxyConfig {
+        ProxyConfig {
+            addr: "127.0.0.1:0".into(),
+            request_body_limit_bytes: 10_485_760, // 10 MB for audio
+            real_ip: Default::default(),
+            request_id: Default::default(),
+            url_rewrites: Vec::new(),
+            expose_debug_headers: false,
+            tls: None,
+            listeners: Vec::new(),
+            thread_per_core: None,
+            workers: None,
+        }
+    }
+
+    const PK_ID: &str = "11111111-1111-1111-1111-111111111111";
+
+    fn whisper_model(name: &str) -> ResourceEntry<Model> {
+        let json = format!(
+            r#"{{
+                "display_name": "{name}",
+                "provider": "openai",
+                "model_name": "whisper-1",
+                "provider_key_id": "{PK_ID}"
+            }}"#
+        );
+        let m: Model = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("m-1", m, 1)
+    }
+
+    fn tts_model(name: &str) -> ResourceEntry<Model> {
+        let json = format!(
+            r#"{{
+                "display_name": "{name}",
+                "provider": "openai",
+                "model_name": "tts-1",
+                "provider_key_id": "{PK_ID}"
+            }}"#
+        );
+        let m: Model = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("m-2", m, 1)
+    }
+
+    fn provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let json = format!(
+            r#"{{"display_name":"openai-up","api_key":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(PK_ID, pk, 1)
+    }
+
+    fn new_snap(api_base: &str) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(provider_key_entry(api_base));
+        snap
+    }
+
+    /// A PK carrying per-PK telemetry attribution tags (AISIX-Cloud#867
+    /// parity) for asserting they land on the emitted UsageEvent.
+    fn provider_key_entry_tagged(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let json = format!(
+            r#"{{"display_name":"openai-up","api_key":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai","telemetry_tags":{{"kind":"catalog","featured":true,"branded_provider":"openai","pk_label":"prod-audio-key"}}}}"#
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(PK_ID, pk, 1)
+    }
+
+    fn new_snap_tagged(api_base: &str) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(provider_key_entry_tagged(api_base));
+        snap
+    }
+
+    /// A PK carrying `request.*` operator overrides (AISIX-Cloud#867):
+    /// a default body field + a default header that the audio handlers
+    /// must apply to the upstream request.
+    fn provider_key_entry_overrides(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let json = format!(
+            r#"{{"display_name":"openai-up","api_key":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai","request":{{"default_body_fields":{{"safe_flag":true}},"default_headers":{{"x-custom":"trace-on"}}}}}}"#
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(PK_ID, pk, 1)
+    }
+
+    fn new_snap_overrides(api_base: &str) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(provider_key_entry_overrides(api_base));
+        snap
+    }
+
+    fn apikey_entry(allowed: &[&str]) -> ResourceEntry<ApiKey> {
+        let json = format!(
+            r#"{{"key_hash": "8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891", "allowed_models": {}}}"#,
+            serde_json::to_string(&allowed).unwrap()
+        );
+        let k: ApiKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("k-1", k, 1)
+    }
+
+    fn build_app(snap: AisixSnapshot) -> axum::Router {
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache())
+    }
+
+    fn keyword_input_guardrail(literal: &str) -> ResourceEntry<aisix_core::Guardrail> {
+        let json = format!(
+            r#"{{"name":"t","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{{"kind":"literal","value":"{literal}"}}]}}"#
+        );
+        let g: aisix_core::Guardrail = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("g-1", g, 1)
+    }
+
+    fn speech_req(body: &str) -> Request<axum::body::Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/audio/speech")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// #379 parity: a successful /v1/audio/speech whose input passes an attached
+    /// input guardrail records that guardrail's `{kind, hook}` in the emitted
+    /// UsageEvent's `applied_guardrails`.
+    #[tokio::test]
+    async fn speech_applied_guardrails_recorded_on_usage_event() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/speech"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"AUDIO".to_vec()))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(tts_model("my-tts"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        // Benign input (no "BLOCKME") → passes the guardrail.
+        let req = speech_req(r#"{"model":"my-tts","input":"hello","voice":"alloy"}"#);
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The event is emitted when the audio has streamed.
+        to_bytes(resp.into_body(), 65536).await.unwrap();
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert!(
+            !ev.applied_guardrails.is_empty(),
+            "the attached input guardrail must be recorded"
+        );
+        assert_eq!(ev.applied_guardrails[0].kind, "keyword");
+        assert_eq!(ev.applied_guardrails[0].hook, "input");
+    }
+
+    /// #545: a configured input guardrail must fire on /v1/audio/speech — a
+    /// blocked `input` returns 422 content_filter, upstream never contacted.
+    #[tokio::test]
+    async fn input_guardrail_blocks_speech_input_returns_422() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/speech"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "audio/mpeg")
+                    .set_body_bytes(b"ID3".to_vec()),
+            )
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(tts_model("my-tts"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            speech_req(r#"{"model":"my-tts","input":"say BLOCKME aloud","voice":"alloy"}"#),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+        assert!(!v["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("BLOCKME"));
+    }
+
+    /// #545 companion: benign input with a guardrail configured still forwards
+    /// (`expect(1)`) and returns the audio bytes.
+    #[tokio::test]
+    async fn input_guardrail_allows_benign_speech_input() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/speech"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "audio/mpeg")
+                    .set_body_bytes(b"ID3\x03\x00".to_vec()),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(tts_model("my-tts"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            speech_req(r#"{"model":"my-tts","input":"Hello there","voice":"alloy"}"#),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn speech_unauthenticated_returns_401() {
+        let snap = new_snap("http://unused");
+        snap.models.insert(tts_model("my-tts"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/speech")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"model":"my-tts","input":"Hello","voice":"alloy"}"#,
+            ))
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn speech_unknown_model_returns_404() {
+        let snap = new_snap("http://unused");
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/speech")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"model":"nonexistent","input":"Hello","voice":"alloy"}"#,
+            ))
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn speech_happy_path_returns_audio_bytes() {
+        let upstream = MockServer::builder().start().await;
+        // TTS endpoint returns raw MP3 bytes.
+        let fake_mp3 = b"ID3\x03\x00\x00\x00";
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/speech"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "audio/mpeg")
+                    .set_body_bytes(fake_mp3.to_vec()),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(tts_model("my-tts"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/speech")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"model":"my-tts","input":"Hello","voice":"alloy"}"#,
+            ))
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("audio"),
+            "expected audio content-type, got {ct}"
+        );
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert_eq!(&bytes[..3], b"ID3");
+    }
+
+    #[tokio::test]
+    async fn transcriptions_unauthenticated_returns_401() {
+        let snap = new_snap("http://unused");
+        snap.models.insert(whisper_model("my-whisper"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        // A minimal multipart body.
+        let body = "--boundary\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nmy-whisper\r\n--boundary--\r\n";
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("content-type", "multipart/form-data; boundary=boundary")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// #1016: a `prompt` part that is not valid UTF-8 is rejected 400
+    /// BEFORE the guardrail pass — pre-fix the scan silently skipped it
+    /// while the rebuilt form forwarded the bytes verbatim, so an
+    /// invalid-byte prefix smuggled blocked text past a keyword
+    /// guardrail. The upstream must never be contacted.
+    #[tokio::test]
+    async fn non_utf8_prompt_rejected_400_before_guardrail_and_upstream() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"text":"x"})))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-whisper"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
+
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(
+            b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nmy-whisper\r\n",
+        );
+        body.extend_from_slice(b"--b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n");
+        // 0xFF makes the field invalid UTF-8; the blocked keyword rides
+        // behind it, unseen by the scan pre-fix.
+        body.extend_from_slice(&[0xFF]);
+        body.extend_from_slice(b"BLOCKME\r\n");
+        body.extend_from_slice(
+            b"--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.mp3\"\r\n\
+             Content-Type: audio/mpeg\r\n\r\nID3fakeaudio\r\n--b--\r\n",
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "multipart/form-data; boundary=b")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert!(v["error"]["message"].as_str().unwrap().contains("UTF-8"));
+    }
+
+    /// #1016 companion on the second wired route: translations shares
+    /// the dispatch, and the reject is UNCONDITIONAL — no guardrail
+    /// configured here, the invalid prompt still 400s (validity must
+    /// not flip when a guardrail is attached later).
+    #[tokio::test]
+    async fn translations_non_utf8_prompt_rejected_without_guardrail() {
+        let snap = new_snap("http://unused");
+        snap.models.insert(whisper_model("my-whisper"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(
+            b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nmy-whisper\r\n",
+        );
+        body.extend_from_slice(b"--b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n");
+        body.extend_from_slice(&[0xC3, 0x28]);
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(
+            b"--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.mp3\"\r\n\
+             Content-Type: audio/mpeg\r\n\r\nID3fakeaudio\r\n--b--\r\n",
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/translations")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "multipart/form-data; boundary=b")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// #1016 audit LOW-2: the gate sits AFTER model resolution on the
+    /// audio dispatch too — an unknown model with an invalid prompt
+    /// still answers 404, pinning the placement like the edits test.
+    #[tokio::test]
+    async fn non_utf8_prompt_unknown_model_still_404() {
+        let snap = new_snap("http://unused");
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(
+            b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nnope\r\n",
+        );
+        body.extend_from_slice(b"--b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n");
+        body.extend_from_slice(&[0xFF]);
+        body.extend_from_slice(
+            b"x\r\n--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.mp3\"\r\n\
+             Content-Type: audio/mpeg\r\n\r\nID3fakeaudio\r\n--b--\r\n",
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "multipart/form-data; boundary=b")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    fn build_app_with_sink(
+        snap: AisixSnapshot,
+        tx: tokio::sync::mpsc::Sender<aisix_obs::UsageEvent>,
+    ) -> axum::Router {
+        use aisix_obs::UsageSink;
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        crate::build_router(state)
+    }
+
+    /// A minimal multipart body carrying `model` + a tiny fake audio
+    /// `file` field — enough for the gateway to extract the model and
+    /// forward the form.
+    /// `transcription_multipart` plus the `stream=true` field, i.e. what a
+    /// caller that wants the transcript incrementally sends.
+    fn streaming_transcription_multipart(model: &str) -> (String, axum::body::Body) {
+        let body = format!(
+            "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"stream\"\r\n\r\ntrue\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.mp3\"\r\n\
+             Content-Type: audio/mpeg\r\n\r\nID3fakeaudio\r\n--b--\r\n"
+        );
+        (
+            "multipart/form-data; boundary=b".to_string(),
+            axum::body::Body::from(body),
+        )
+    }
+
+    fn transcription_multipart(model: &str) -> (String, axum::body::Body) {
+        let body = format!(
+            "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.mp3\"\r\n\
+             Content-Type: audio/mpeg\r\n\r\nID3fakeaudio\r\n--b--\r\n"
+        );
+        (
+            "multipart/form-data; boundary=b".to_string(),
+            axum::body::Body::from(body),
+        )
+    }
+
+    /// Issue #406: gpt-4o-transcribe returns a `usage` token block —
+    /// a successful transcription must emit a UsageEvent with those
+    /// tokens, attributed to the api_key + model, inbound_protocol
+    /// "openai".
+    #[tokio::test]
+    async fn transcriptions_emit_usage_event_with_tokens() {
+        let upstream = MockServer::builder().start().await;
+        let body = serde_json::json!({
+            "text": "hello world",
+            "usage": {
+                "type": "tokens",
+                "input_tokens": 14,
+                "output_tokens": 4,
+                "total_tokens": 18
+            }
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-transcribe"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, body) = transcription_multipart("my-transcribe");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for /v1/audio/transcriptions 200")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.prompt_tokens, 14);
+        assert_eq!(event.completion_tokens, 4);
+        assert_eq!(event.status_code, 200);
+        assert_eq!(event.api_key_id, "k-1");
+        assert_eq!(event.model_id, "m-1");
+        assert_eq!(event.inbound_protocol, "openai");
+    }
+
+    /// A minimal RIFF/WAVE container holding `seconds` of 8 kHz 16-bit
+    /// mono PCM — a real audio file for the probe path, small enough to
+    /// build inline.
+    fn wav_bytes(seconds: u32) -> Vec<u8> {
+        let samples = 8000usize * 2 * seconds as usize;
+        let mut wav = Vec::with_capacity(44 + samples);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&((36 + samples) as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&8000u32.to_le_bytes());
+        wav.extend_from_slice(&16000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(samples as u32).to_le_bytes());
+        wav.resize(44 + samples, 0);
+        wav
+    }
+
+    /// A multipart body whose `file` part is a real WAV, so the handler's
+    /// fallback probe has something to read.
+    fn transcription_multipart_wav(model: &str, seconds: u32) -> (String, axum::body::Body) {
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n\
+                 --b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\
+                 Content-Type: audio/wav\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(&wav_bytes(seconds));
+        body.extend_from_slice(b"\r\n--b--\r\n");
+        (
+            "multipart/form-data; boundary=b".to_string(),
+            axum::body::Body::from(body),
+        )
+    }
+
+    /// AISIX-Cloud#1138: whisper-1 bills by audio length and reports no
+    /// tokens, so the emitted event must carry the duration or cp-api has
+    /// nothing to price the request with.
+    #[tokio::test]
+    async fn whisper_response_emits_the_duration_cost_basis() {
+        let upstream = MockServer::builder().start().await;
+        let body = serde_json::json!({
+            "text": "hello world",
+            "usage": {"type": "duration", "seconds": 11.0}
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-transcribe"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, body) = transcription_multipart("my-transcribe");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.audio_duration_seconds, 11.0);
+        assert_eq!(
+            (event.prompt_tokens, event.completion_tokens),
+            (0, 0),
+            "whisper-1 reports no tokens — duration is the whole cost basis"
+        );
+    }
+
+    /// AISIX-Cloud#1138: `response_format=text` answers with a body that
+    /// carries no usage at all. The cost basis must not depend on which
+    /// response format the caller asked for, so the handler falls back to
+    /// the uploaded file's own length.
+    #[tokio::test]
+    async fn text_format_falls_back_to_the_uploaded_file_duration() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("hello world", "text/plain"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-transcribe"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, body) = transcription_multipart_wav("my-transcribe", 3);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert!(
+            (event.audio_duration_seconds - 3.0).abs() < 0.05,
+            "3s of uploaded audio must be the cost basis, got {}",
+            event.audio_duration_seconds
+        );
+    }
+
+    /// AISIX-Cloud#1138: `MediaRecorder` uploads `audio/webm`, which
+    /// `lofty` cannot read — so a WebM transcription asked for as `text`
+    /// would have reported no length and billed nothing, which is the
+    /// exact bypass the file probe exists to close. Uses the header of a
+    /// file ffmpeg produced (see `surface_ebml_component::tests`), whose declared length is
+    /// 7.008s.
+    #[test]
+    fn probing_reads_a_webm_upload() {
+        let webm = crate::surface_ebml_component::tests::REAL_FFMPEG_WEBM_HEADER;
+        let probed =
+            super::probe_audio_duration_seconds(webm).expect("a webm upload must be measurable");
+        assert!(
+            (probed - 7.008).abs() < 0.01,
+            "webm should probe as ~7.008s, got {probed}"
+        );
+    }
+
+    /// A length the control plane cannot store is not measured, whichever
+    /// source reported it — and the report wins over the file even then,
+    /// rather than the file standing in for a figure the upstream did give.
+    #[test]
+    fn an_unstorable_duration_is_not_measured() {
+        assert_eq!(super::duration_cost_basis(Some(11.0), || Some(3.0)), 11.0);
+        assert_eq!(super::duration_cost_basis(None, || Some(3.0)), 3.0);
+        assert_eq!(super::duration_cost_basis(Some(4.0e9), || Some(3.0)), 0.0);
+        assert_eq!(super::duration_cost_basis(None, || Some(4.0e9)), 0.0);
+        assert_eq!(super::duration_cost_basis(None, || None), 0.0);
+    }
+
+    /// A FLAC header can declare a 36-bit sample count; at 1 Hz that is
+    /// ~2,000 years of audio, which `lofty` reports as read.
+    #[test]
+    fn a_header_declaring_an_absurd_length_is_not_measured() {
+        let flac = absurd_flac_header();
+        let probed = super::probe_audio_duration_seconds(&flac).expect("lofty reads the header");
+        assert!(probed > super::MAX_AUDIO_DURATION_SECONDS, "got {probed}");
+        assert_eq!(super::duration_cost_basis(None, || Some(probed)), 0.0);
+    }
+
+    /// `fLaC` + a lone STREAMINFO declaring 2^36-1 samples at 1 Hz.
+    fn absurd_flac_header() -> Vec<u8> {
+        let mut flac = b"fLaC".to_vec();
+        flac.extend_from_slice(&[0x80, 0, 0, 34]); // last block, STREAMINFO
+        flac.extend_from_slice(&[0x10, 0x00, 0x10, 0x00]); // block 4096..4096
+        flac.extend_from_slice(&[0; 6]); // frame sizes unknown
+                                         // 1 Hz, mono, 16 bits, total samples 0xF_FFFF_FFFF.
+        flac.extend_from_slice(&[0x00, 0x00, 0x10, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        flac.extend_from_slice(&[0; 16]); // MD5
+        flac.extend_from_slice(&[0xFF, 0xF8, 0x69, 0x08, 0x00, 0x00, 0x00, 0x00]);
+        flac
+    }
+
+    /// The default `json` transcription reports its length under
+    /// `usage.seconds` (the duration variant of OpenAI's usage oneOf),
+    /// which is the cost basis for whisper-1 — a model that reports no
+    /// tokens at all.
+    #[test]
+    fn duration_reads_the_usage_seconds_variant() {
+        let body = br#"{"text":"hi","usage":{"type":"duration","seconds":11.0}}"#;
+        assert_eq!(super::upstream_duration_seconds(body), Some(11.0));
+    }
+
+    /// `verbose_json` puts the same figure at the top level instead.
+    #[test]
+    fn duration_reads_the_verbose_json_field() {
+        let body = br#"{"task":"transcribe","duration":2.66,"text":"hi"}"#;
+        assert_eq!(super::upstream_duration_seconds(body), Some(2.66));
+    }
+
+    /// A token-usage response carries no duration — the caller must fall
+    /// back to the file probe rather than read a zero off `usage`.
+    #[test]
+    fn duration_absent_from_a_token_usage_response() {
+        let body =
+            br#"{"text":"hi","usage":{"type":"tokens","input_tokens":26,"output_tokens":12}}"#;
+        assert_eq!(super::upstream_duration_seconds(body), None);
+    }
+
+    /// AISIX-Cloud#1138: `response_format=text` (and `srt`/`vtt`) answers
+    /// with a body that is not JSON at all, so the cost basis has to come
+    /// off the uploaded audio — otherwise the caller picks whether the
+    /// request is metered by picking a response format.
+    #[test]
+    fn duration_falls_back_to_probing_the_uploaded_file() {
+        // 1 second of 8 kHz 16-bit mono PCM in a minimal RIFF/WAVE container.
+        let samples = 8000usize * 2;
+        let mut wav = Vec::with_capacity(44 + samples);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&((36 + samples) as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes()); // PCM fmt chunk size
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&8000u32.to_le_bytes()); // sample rate
+        wav.extend_from_slice(&16000u32.to_le_bytes()); // byte rate
+        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+        wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(samples as u32).to_le_bytes());
+        wav.resize(44 + samples, 0);
+
+        let probed = super::probe_audio_duration_seconds(&wav)
+            .expect("a well-formed WAV must yield a duration");
+        assert!(
+            (probed - 1.0).abs() < 0.05,
+            "1s of 8kHz mono PCM should probe as ~1s, got {probed}"
+        );
+    }
+
+    /// Caller uploads are arbitrary bytes. An unrecognised file must
+    /// degrade to "no cost basis", never to an error — the transcript
+    /// already succeeded and the upstream already billed for it.
+    #[test]
+    fn probing_unrecognised_bytes_yields_no_duration() {
+        assert_eq!(super::probe_audio_duration_seconds(b"ID3fakeaudio"), None);
+        assert_eq!(super::probe_audio_duration_seconds(&[]), None);
+    }
+
+    /// AISIX-Cloud#1138: a `stream=true` transcription answers
+    /// `text/event-stream`, so the usage block rides the terminal
+    /// `transcript.text.done` event instead of a JSON body. Pre-fix the
+    /// JSON parse found nothing and the whole streaming surface emitted
+    /// zero tokens — unbilled spend that also never moved TPM/TPD, while
+    /// the identical non-streaming request billed normally.
+    /// <https://platform.openai.com/docs/api-reference/audio/create-transcription>
+    #[tokio::test]
+    async fn streamed_transcription_bills_the_terminal_event_usage() {
+        let upstream = MockServer::builder().start().await;
+        let sse = concat!(
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\" world\"}\n\n",
+            "data: {\"type\":\"transcript.text.done\",\"text\":\"hello world\",",
+            "\"usage\":{\"type\":\"tokens\",\"total_tokens\":38,\"input_tokens\":26,",
+            "\"input_token_details\":{\"text_tokens\":0,\"audio_tokens\":26},",
+            "\"output_tokens\":12}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-transcribe"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, body) = transcription_multipart("my-transcribe");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for a streamed transcription")
+            .expect("usage_sink sender dropped");
+        assert_eq!(
+            (event.prompt_tokens, event.completion_tokens),
+            (26, 12),
+            "the terminal transcript.text.done usage must be billed"
+        );
+    }
+
+    /// An SSE answer read whole (the caller did not ask to stream, or an
+    /// output chain holds it back) reports a duration-billed model's length
+    /// on its terminal event, and that figure is the cost basis — not the
+    /// uploaded file, which here would probe as nothing at all.
+    #[tokio::test]
+    async fn buffered_stream_takes_the_terminal_event_duration() {
+        let upstream = MockServer::builder().start().await;
+        let sse = concat!(
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"transcript.text.done\",\"text\":\"hello\",",
+            "\"usage\":{\"type\":\"duration\",\"seconds\":11.5}}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-transcribe"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, body) = transcription_multipart("my-transcribe");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.audio_duration_seconds, 11.5);
+    }
+
+    /// #998: with `stream=true` and an SSE answer the relay is live —
+    /// the frames reach the caller as they arrive rather than being
+    /// buffered — and the UsageEvent comes from the stream's own guard.
+    /// The wire bytes must still be the upstream's, event for event, and
+    /// the request must be billed exactly once.
+    #[tokio::test]
+    async fn streamed_transcription_relays_verbatim_and_bills_once() {
+        let upstream = MockServer::builder().start().await;
+        let sse = concat!(
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\" world\"}\n\n",
+            "data: {\"type\":\"transcript.text.done\",\"text\":\"hello world\",",
+            "\"usage\":{\"type\":\"tokens\",\"total_tokens\":38,\"input_tokens\":26,",
+            "\"input_token_details\":{\"text_tokens\":0,\"audio_tokens\":26},",
+            "\"output_tokens\":12}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-transcribe"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, body) = streaming_transcription_multipart("my-transcribe");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream"),
+            "the caller must keep the upstream's streaming content type"
+        );
+        let relayed = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("the relayed stream must read cleanly");
+        assert_eq!(
+            String::from_utf8_lossy(&relayed),
+            sse,
+            "the relay must forward the upstream SSE verbatim"
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("the stream guard must emit a UsageEvent")
+            .expect("usage_sink sender dropped");
+        assert_eq!(
+            (event.prompt_tokens, event.completion_tokens),
+            (26, 12),
+            "the terminal transcript.text.done usage must be billed"
+        );
+        assert_eq!(event.status_code, 200);
+        assert!(
+            rx.try_recv().is_err(),
+            "the handler must not emit a second, zero-token event for the same request"
+        );
+    }
+
+    /// A provider that ignores `stream=true` and answers with a JSON
+    /// transcript falls back to the buffered path, so its `usage` block
+    /// is still read — a streamed request must not become an unbilled
+    /// channel just because the upstream declined to stream (#998).
+    #[tokio::test]
+    async fn stream_requested_but_json_answered_is_still_billed() {
+        let upstream = MockServer::builder().start().await;
+        let body = serde_json::json!({
+            "text": "hello world",
+            "usage": {"type": "tokens", "input_tokens": 14, "output_tokens": 4},
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-transcribe"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, form) = streaming_transcription_multipart("my-transcribe");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(form)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!((event.prompt_tokens, event.completion_tokens), (14, 4));
+    }
+
+    /// The relay's side-channel observation reads by FIELD, not by event
+    /// name: a provider that answers with the terminal event alone —
+    /// whole transcript in `text`, no incremental deltas — must still
+    /// leave a scannable, capturable transcript behind, or the
+    /// end-of-stream guardrail scan and the content capture both see
+    /// nothing (#998).
+    #[test]
+    fn terminal_text_stands_in_for_missing_deltas() {
+        let decode = |payloads: &[&str]| {
+            let mut observed = super::StreamedTranscript::default();
+            let events: Vec<aisix_gateway::SseEvent> = payloads
+                .iter()
+                .map(|p| aisix_gateway::SseEvent::Data((*p).to_string()))
+                .collect();
+            super::observe_transcript_events(&mut observed, &events, 1024);
+            observed
+        };
+
+        let terminal_only = decode(&[r#"{"type":"transcript.text.done","text":"hello world",
+                "usage":{"type":"tokens","input_tokens":26,"output_tokens":12}}"#]);
+        assert_eq!(terminal_only.text(), "hello world");
+        assert_eq!(
+            terminal_only.usage,
+            Some(aisix_gateway::UsageStats::new(26, 12))
+        );
+
+        let deltas_only = decode(&[
+            r#"{"type":"transcript.text.delta","delta":"hello"}"#,
+            r#"{"type":"transcript.text.delta","delta":" world"}"#,
+        ]);
+        assert_eq!(
+            deltas_only.text(),
+            "hello world",
+            "without a terminal event the assembled deltas are the transcript"
+        );
+
+        // The terminal event wins over the deltas — the two say the same
+        // thing, and counting both would double the captured transcript.
+        let both = decode(&[
+            r#"{"type":"transcript.text.delta","delta":"hello"}"#,
+            r#"{"type":"transcript.text.delta","delta":" world"}"#,
+            r#"{"type":"transcript.text.done","text":"hello world"}"#,
+        ]);
+        assert_eq!(both.text(), "hello world");
+    }
+
+    /// The observation is bounded, and the bound never splits a codepoint
+    /// — the captured text is handed to `CapturedContent` as a `&str`.
+    #[test]
+    fn observation_is_capped_on_a_char_boundary() {
+        let mut observed = super::StreamedTranscript::default();
+        let events: Vec<aisix_gateway::SseEvent> = (0..4)
+            .map(|_| aisix_gateway::SseEvent::Data(r#"{"delta":"日本語"}"#.to_string()))
+            .collect();
+        // 3 bytes per char: a 7-byte cap must stop after two chars.
+        super::observe_transcript_events(&mut observed, &events, 7);
+        assert_eq!(observed.text(), "日本");
+    }
+
+    /// An error envelope inside a transcription stream is the upstream's
+    /// failure, recorded with the status its own code maps to; the
+    /// ordinary transcript events never are one.
+    #[test]
+    fn an_in_band_error_envelope_is_recorded_as_the_stream_s_failure() {
+        let mut observed = super::StreamedTranscript::default();
+        let events = [
+            r#"{"type":"transcript.text.delta","delta":"hel"}"#,
+            r#"{"type":"error","error":{"message":"slow down","type":"rate_limit_error","code":429}}"#,
+        ]
+        .map(|p| aisix_gateway::SseEvent::Data(p.to_string()));
+        super::observe_transcript_events(&mut observed, &events, 1024);
+        let failure = observed
+            .failure
+            .clone()
+            .expect("the error envelope is a failure");
+        assert_eq!(failure.status, 429);
+        assert_eq!(failure.error_class, "upstream_in_band");
+        assert!(failure.error_message.contains("slow down"));
+        assert_eq!(observed.text(), "hel");
+
+        let mut clean = super::StreamedTranscript::default();
+        let events = [
+            r#"{"type":"transcript.text.delta","delta":"hi"}"#,
+            r#"{"type":"transcript.text.done","text":"hi","error":null}"#,
+        ]
+        .map(|p| aisix_gateway::SseEvent::Data(p.to_string()));
+        super::observe_transcript_events(&mut clean, &events, 1024);
+        assert!(clean.failure.is_none());
+    }
+
+    /// The SSE read is content-type gated: a `srt`/`vtt` transcript is
+    /// `text/plain` and may legitimately contain a line starting with
+    /// `data:`, which must never be decoded as a usage-bearing event.
+    #[test]
+    fn plain_text_transcript_is_not_read_as_a_stream() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        let body = concat!(
+            "1\n00:00:00,000 --> 00:00:02,000\n",
+            "data: {\"usage\":{\"input_tokens\":999,\"output_tokens\":999}}\n\n",
+        );
+        assert_eq!(
+            super::extract_sse_token_usage(&headers, body.as_bytes()),
+            None
+        );
+    }
+
+    /// AISIX-Cloud#867 parity: a successful audio request must carry the
+    /// resolved ProviderKey's telemetry attribution tags (provider_kind /
+    /// provider_featured / branded_provider / pk_label) — same lookup as
+    /// chat / messages / responses. Fails before the fix (empty tags).
+    #[tokio::test]
+    async fn emits_provider_telemetry_tags_issue_867() {
+        let upstream = MockServer::builder().start().await;
+        let body = serde_json::json!({
+            "text": "hello world",
+            "usage": {"type": "tokens", "input_tokens": 9, "output_tokens": 2, "total_tokens": 11}
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_tagged(&upstream.uri());
+        snap.models.insert(whisper_model("my-transcribe"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, body) = transcription_multipart("my-transcribe");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for /v1/audio/transcriptions 200")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.provider_kind, "catalog");
+        assert!(event.provider_featured);
+        assert_eq!(event.branded_provider, "openai");
+        assert_eq!(event.pk_label, "prod-audio-key");
+    }
+
+    /// Issue #406: whisper-1 `{"text":"..."}` has no `usage` block —
+    /// the request still emits a zero-token UsageEvent so it's visible
+    /// in /logs and attributed (duration-based cost is a cross-repo
+    /// follow-up).
+    #[tokio::test]
+    async fn transcriptions_emit_zero_token_event_without_usage() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "hi"})),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-whisper"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, body) = transcription_multipart("my-whisper");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("zero-token UsageEvent must still be emitted (visibility)")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.prompt_tokens, 0);
+        assert_eq!(event.completion_tokens, 0);
+        assert_eq!(event.model_id, "m-1");
+        assert_eq!(event.inbound_protocol, "openai");
+    }
+
+    /// Issue #406: TTS speech returns binary audio (no usage). It still
+    /// emits a zero-token UsageEvent so the request is visible +
+    /// attributed.
+    #[tokio::test]
+    async fn speech_emits_zero_token_usage_event() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/speech"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "audio/mpeg")
+                    .set_body_bytes(b"ID3\x03\x00\x00\x00".to_vec()),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(tts_model("my-tts"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/speech")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"model":"my-tts","input":"Hello","voice":"alloy"}"#,
+            ))
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The event is emitted when the audio has streamed.
+        to_bytes(resp.into_body(), 65536).await.unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("speech must emit a zero-token UsageEvent (visibility)")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.prompt_tokens, 0);
+        assert_eq!(event.completion_tokens, 0);
+        assert_eq!(event.model_id, "m-2");
+        assert_eq!(event.inbound_protocol, "openai");
+    }
+
+    /// gpt-4o-transcribe with a non-default `response_format` can return
+    /// the *duration* usage variant — `{"type":"duration","seconds":N}` —
+    /// which carries no `input_tokens`. `extract_token_usage` must degrade
+    /// that to `None` (→ a zero-token emit, never a panic or mis-parse),
+    /// consistent with the duration-cost being a cross-repo follow-up.
+    /// Per OpenAI's `usage` oneOf (TranscriptTextUsageTokens |
+    /// TranscriptTextUsageDuration):
+    /// <https://platform.openai.com/docs/api-reference/audio/json-object>
+    #[test]
+    fn extract_token_usage_ignores_duration_variant() {
+        let v = serde_json::json!({
+            "text": "hello world",
+            "usage": {"type": "duration", "seconds": 42.7}
+        });
+        assert_eq!(super::extract_token_usage(&v), None);
+    }
+
+    #[test]
+    fn extract_token_usage_reads_chat_style_details() {
+        let v = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 31,
+                "completion_tokens": 9,
+                "prompt_tokens_details": {"audio_tokens": 20}
+            }
+        });
+        let usage = super::extract_token_usage(&v).unwrap();
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (31, 9));
+        assert_eq!(usage.modality.prompt_audio_tokens, Some(20));
+    }
+
+    #[test]
+    fn extract_token_usage_skips_a_null_transcription_count() {
+        let v = serde_json::json!({
+            "usage": {
+                "input_tokens": null,
+                "output_tokens": null,
+                "prompt_tokens": 31,
+                "completion_tokens": 9
+            }
+        });
+        let usage = super::extract_token_usage(&v).unwrap();
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (31, 9));
+    }
+
+    /// #655 parity: an upstream 5xx on /v1/audio/speech now emits ONE zero-token
+    /// UsageEvent so the failed request is visible in Logs (status + error
+    /// class) and attributed to the api_key — instead of being dropped. Mirrors
+    /// `completions.rs::upstream_5xx_emits_zero_token_error_event`.
+    #[tokio::test]
+    async fn speech_5xx_emits_zero_token_error_event() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/speech"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(tts_model("my-tts"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let req = speech_req(r#"{"model":"my-tts","input":"hi","voice":"alloy"}"#);
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("a failed /v1/audio/speech must emit a zero-token UsageEvent")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.status_code, 502, "upstream 5xx maps to 502");
+        assert_eq!(ev.prompt_tokens, 0);
+        assert_eq!(ev.api_key_id, "k-1");
+        assert_eq!(ev.requested_model, "my-tts");
+        assert!(
+            !ev.error_class.is_empty(),
+            "error_class must classify the failure"
+        );
+        // One event per upstream attempt (#655): each of the direct
+        // model's own retries fails the same way and leaves its own row,
+        // none of them billed.
+        let mut events = vec![ev];
+        while let Ok(more) = rx.try_recv() {
+            events.push(more);
+        }
+        let hits = upstream.received_requests().await.unwrap_or_default().len();
+        assert!(
+            hits > 1,
+            "the direct model's retry budget should replay a 5xx"
+        );
+        assert_eq!(events.len(), hits, "exactly one event per upstream attempt");
+        for (i, ev) in events.iter().enumerate() {
+            assert_eq!(ev.attempt_index, i as u32);
+            assert_eq!(ev.attempt_kind, if i == 0 { "initial" } else { "retry" });
+            assert_eq!(ev.status_code, events[0].status_code);
+            assert_eq!((ev.prompt_tokens, ev.completion_tokens), (0, 0));
+        }
+    }
+
+    /// AISIX-Cloud#867: `/v1/audio/speech` (JSON body) must apply the PK's
+    /// `request.*` overrides to BOTH the request body
+    /// (`default_body_fields`) and the request headers (`default_headers`).
+    /// The Mock matches only when the upstream request carries the injected
+    /// body field AND header, so a 200 proves both were applied.
+    #[tokio::test]
+    async fn speech_applies_pk_request_overrides_issue_867() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/speech"))
+            .and(body_partial_json(serde_json::json!({"safe_flag": true})))
+            .and(header("x-custom", "trace-on"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"AUDIO".to_vec()))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_overrides(&upstream.uri());
+        snap.models.insert(tts_model("my-tts"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/speech")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"model":"my-tts","input":"hi","voice":"alloy"}"#,
+            ))
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// AISIX-Cloud#867: `/v1/audio/transcriptions` (multipart body) must
+    /// apply the PK's `request.default_headers` to the upstream request.
+    /// Body `request.*` overrides do NOT apply (the body is a multipart
+    /// form, not JSON). The Mock matches only on the injected header, so a
+    /// 200 proves the operator header was applied.
+    #[tokio::test]
+    async fn transcriptions_applies_default_headers_issue_867() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .and(header("x-custom", "trace-on"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "hi"})),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_overrides(&upstream.uri());
+        snap.models.insert(whisper_model("my-transcribe"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let (ct, body) = transcription_multipart("my-transcribe");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    fn pii_guardrail(hook: &str) -> ResourceEntry<aisix_core::Guardrail> {
+        let json = format!(
+            r#"{{"name":"pii","enabled":true,"hook_point":"{hook}","kind":"pii","detectors":[{{"type":"email","action":"mask"}}]}}"#
+        );
+        let g: aisix_core::Guardrail = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("g-pii", g, 1)
+    }
+
+    fn keyword_output_guardrail(literal: &str) -> ResourceEntry<aisix_core::Guardrail> {
+        let json = format!(
+            r#"{{"name":"t-out","enabled":true,"hook_point":"output","fail_open":false,"kind":"keyword","patterns":[{{"kind":"literal","value":"{literal}"}}]}}"#
+        );
+        let g: aisix_core::Guardrail = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("g-out", g, 1)
+    }
+
+    /// Multipart body carrying `model` + an optional text `prompt` field +
+    /// a tiny fake audio `file` — for the #696 prompt-field guardrail tests.
+    fn transcription_multipart_with_prompt(
+        model: &str,
+        prompt: &str,
+    ) -> (String, axum::body::Body) {
+        let body = format!(
+            "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n{prompt}\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.mp3\"\r\n\
+             Content-Type: audio/mpeg\r\n\r\nID3fakeaudio\r\n--b--\r\n"
+        );
+        (
+            "multipart/form-data; boundary=b".to_string(),
+            axum::body::Body::from(body),
+        )
+    }
+
+    /// #696: a mask-action PII detector must rewrite the TTS `input` text
+    /// before the body reaches the upstream. Pre-#696 the mask action was a
+    /// silent no-op on /v1/audio/speech.
+    #[tokio::test]
+    async fn speech_pii_mask_rewrites_input_before_upstream_issue_696() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/speech"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fakeaudio".to_vec()))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(tts_model("my-tts"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, pii_guardrail("input"));
+
+        let app = build_app(snap);
+        let body = serde_json::json!({
+            "model": "my-tts",
+            "input": "read out a@x.com please",
+            "voice": "alloy"
+        });
+        let resp = tower::ServiceExt::oneshot(app, speech_req(&body.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let reqs = upstream.received_requests().await.unwrap();
+        let sent = String::from_utf8_lossy(&reqs[0].body).into_owned();
+        assert!(sent.contains("[EMAIL_REDACTED]"), "sent: {sent}");
+        assert!(
+            !sent.contains("a@x.com"),
+            "raw PII forwarded upstream: {sent}"
+        );
+    }
+
+    /// #696: the transcription `prompt` form field is caller text forwarded
+    /// verbatim — an input guardrail must scan it. A blocked literal returns
+    /// 422 and the upstream is never contacted.
+    #[tokio::test]
+    async fn transcription_prompt_field_input_guardrail_blocks_issue_696() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"text":"x"})))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-whisper"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
+
+        let app = build_app(snap);
+        let (ct, body) = transcription_multipart_with_prompt("my-whisper", "please BLOCKME now");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// #696: a mask-action PII detector must rewrite the transcription
+    /// `prompt` form field before the form is forwarded upstream.
+    #[tokio::test]
+    async fn transcription_prompt_field_pii_masked_before_upstream_issue_696() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"text":"x"})))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-whisper"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, pii_guardrail("input"));
+
+        let app = build_app(snap);
+        let (ct, body) =
+            transcription_multipart_with_prompt("my-whisper", "the speaker is a@x.com");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let reqs = upstream.received_requests().await.unwrap();
+        let sent = String::from_utf8_lossy(&reqs[0].body).into_owned();
+        assert!(sent.contains("[EMAIL_REDACTED]"), "sent: {sent}");
+        assert!(
+            !sent.contains("a@x.com"),
+            "raw PII forwarded upstream: {sent}"
+        );
+    }
+
+    /// #696: a mask-action PII detector on the OUTPUT hook must rewrite the
+    /// transcript text before it reaches the caller. Pre-#696 the transcript
+    /// was returned raw. Counts must land on the emitted UsageEvent.
+    #[tokio::test]
+    async fn transcription_output_pii_masked_issue_696() {
+        let upstream = MockServer::builder().start().await;
+        let body = serde_json::json!({
+            "text": "my address is a@x.com thanks",
+            "usage": {"type": "tokens", "input_tokens": 9, "output_tokens": 6, "total_tokens": 15}
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-whisper"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, pii_guardrail("output"));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, body) = transcription_multipart("my-whisper");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let text = v["text"].as_str().unwrap();
+        assert!(text.contains("[EMAIL_REDACTED]"), "client got: {text}");
+        assert!(
+            !text.contains("a@x.com"),
+            "raw PII reached the caller: {text}"
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.redacted_entity_counts.get("email"), Some(&1));
+    }
+
+    /// #696: an OUTPUT keyword guardrail must block a transcript carrying a
+    /// blocked literal — the caller gets the 422 content_filter envelope,
+    /// but the UsageEvent keeps the billed tokens marked guardrail_blocked
+    /// (the upstream already charged for the transcription) — same
+    /// convention as completions #911 [23].
+    #[tokio::test]
+    async fn transcription_output_guardrail_blocks_with_billed_usage_issue_696() {
+        let upstream = MockServer::builder().start().await;
+        let body = serde_json::json!({
+            "text": "the secret word is BLOCKME",
+            "usage": {"type": "tokens", "input_tokens": 21, "output_tokens": 7, "total_tokens": 28}
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-whisper"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, body) = transcription_multipart("my-whisper");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+        assert!(!v["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("BLOCKME"));
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for the billed-then-blocked transcript")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.status_code, 422);
+        assert!(event.guardrail_blocked, "event must be marked blocked");
+        assert_eq!(event.prompt_tokens, 21, "billed tokens must be kept");
+        assert_eq!(event.completion_tokens, 7);
+    }
+
+    fn keyword_output_guardrail_fail_open(literal: &str) -> ResourceEntry<aisix_core::Guardrail> {
+        let json = format!(
+            r#"{{"name":"t-out-open","enabled":true,"hook_point":"output","fail_open":true,"kind":"keyword","patterns":[{{"kind":"literal","value":"{literal}"}}]}}"#
+        );
+        let g: aisix_core::Guardrail = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("g-out-open", g, 1)
+    }
+
+    /// `response_format=text`, i.e. the transcription shape whose response
+    /// is a bare transcript rather than JSON.
+    fn transcription_multipart_text_format(model: &str) -> (String, axum::body::Body) {
+        let body = format!(
+            "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\ntext\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.mp3\"\r\n\
+             Content-Type: audio/mpeg\r\n\r\nID3fakeaudio\r\n--b--\r\n"
+        );
+        (
+            "multipart/form-data; boundary=b".to_string(),
+            axum::body::Body::from(body),
+        )
+    }
+
+    /// Drive one `response_format=text` transcription whose upstream answers
+    /// with `body`, under `guardrail`. Returns the response status, the
+    /// relayed bytes and the UsageEvent.
+    async fn plain_text_transcript_case(
+        body: Vec<u8>,
+        guardrail: ResourceEntry<aisix_core::Guardrail>,
+    ) -> (StatusCode, axum::body::Bytes, aisix_obs::UsageEvent) {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/plain")
+                    .set_body_bytes(body),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-whisper"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, guardrail);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, form) = transcription_multipart_text_format("my-whisper");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(form)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("a transcription always emits a UsageEvent")
+            .expect("usage_sink sender dropped");
+        (status, bytes, event)
+    }
+
+    /// A transcript the gateway cannot decode is scanned as a lossy copy,
+    /// so the bytes `from_utf8_lossy` replaced would reach the caller read
+    /// by nothing. With a guardrail on the response side that fails closed,
+    /// that is a refusal, under the tool-result predicate and the same
+    /// `unscannable_body` tag.
+    #[tokio::test]
+    async fn undecodable_transcript_is_refused_under_a_fail_closed_output_row() {
+        let mut body = b"the transcript ends here: ".to_vec();
+        body.extend_from_slice(&[0xff, 0xfe, 0xfd]);
+        let (status, bytes, event) =
+            plain_text_transcript_case(body.clone(), keyword_output_guardrail("NOMATCH")).await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+        assert_eq!(v["error"]["code"], "guardrail_unavailable");
+        assert_eq!(
+            v["error"]["message"],
+            format!(
+                "response rejected: a guardrail could not evaluate it ({})",
+                crate::surface_proxy_error_view::TAG_UNSCANNABLE_BODY
+            )
+        );
+        assert!(
+            !bytes.starts_with(b"the transcript ends here"),
+            "the unscanned transcript must not be relayed"
+        );
+        assert!(event.guardrail_blocked, "the refusal is a guardrail block");
+        assert_eq!(
+            event.guardrail_bypassed_reason, "",
+            "a refusal is not a bypass"
+        );
+    }
+
+    /// The same body under a row that fails OPEN on the response side: the
+    /// operator asked to be served rather than screened, so the transcript
+    /// is relayed byte-for-byte — and the fact that part of it went unread
+    /// is recorded, under the tag the fail-closed direction refuses with.
+    #[tokio::test]
+    async fn undecodable_transcript_under_a_fail_open_output_row_records_the_bypass() {
+        let mut body = b"the transcript ends here: ".to_vec();
+        body.extend_from_slice(&[0xff, 0xfe, 0xfd]);
+        let (status, bytes, event) =
+            plain_text_transcript_case(body.clone(), keyword_output_guardrail_fail_open("NOMATCH"))
+                .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            bytes.as_ref(),
+            body.as_slice(),
+            "a fail-open row relays the upstream bytes unchanged"
+        );
+        assert!(!event.guardrail_blocked);
+        assert_eq!(
+            event.guardrail_bypassed_reason,
+            crate::surface_proxy_error_view::TAG_UNSCANNABLE_BODY,
+            "releasing a partly unread transcript is a bypass and must say so"
+        );
+    }
+
+    /// A `response_format=text` transcript that IS valid UTF-8 is fully
+    /// scannable, so the gate must not fire on it: it is scanned, allowed
+    /// and relayed with nothing recorded as bypassed, even under the
+    /// fail-closed row that refuses the undecodable one.
+    #[tokio::test]
+    async fn decodable_plain_text_transcript_is_scanned_and_relayed() {
+        let body = b"the transcript ends here, in full".to_vec();
+        let (status, bytes, event) =
+            plain_text_transcript_case(body.clone(), keyword_output_guardrail("NOMATCH")).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bytes.as_ref(), body.as_slice());
+        assert!(!event.guardrail_blocked);
+        assert_eq!(
+            event.guardrail_bypassed_reason, "",
+            "a body the guardrail could read is not a bypass"
+        );
+    }
+
+    /// Failing open on what could not be read is not failing open on what
+    /// could: the lossy text is still scanned, so a fail-open row blocks on
+    /// a literal in the decodable part rather than releasing it. The bypass
+    /// is recorded alongside the block, because the undecodable tail went
+    /// unread either way.
+    #[tokio::test]
+    async fn fail_open_row_still_blocks_on_the_decodable_part() {
+        let mut body = b"the secret word is BLOCKME".to_vec();
+        body.extend_from_slice(&[0xff, 0xfe, 0xfd]);
+        let (status, bytes, event) =
+            plain_text_transcript_case(body, keyword_output_guardrail_fail_open("BLOCKME")).await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+        assert!(event.guardrail_blocked);
+        assert_eq!(
+            event.guardrail_bypassed_reason,
+            crate::surface_proxy_error_view::TAG_UNSCANNABLE_BODY,
+            "the undecodable tail went unread even though the rest blocked"
+        );
+    }
+
+    /// #998: `stream=true` must not become a way around the output
+    /// guardrail the same transcript gets when it is not streamed. A
+    /// block-capable chain keeps the buffered relay — the whole
+    /// transcript is scanned before any of it reaches the caller — so the
+    /// streamed request is blocked exactly like the non-streamed one.
+    #[tokio::test]
+    async fn streamed_transcription_is_not_an_output_guardrail_bypass() {
+        let upstream = MockServer::builder().start().await;
+        let sse = concat!(
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\"the secret word is \"}\n\n",
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\"BLOCKME\"}\n\n",
+            "data: {\"type\":\"transcript.text.done\",\"text\":\"the secret word is BLOCKME\",",
+            "\"usage\":{\"type\":\"tokens\",\"input_tokens\":21,\"output_tokens\":7}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-whisper"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, body) = streaming_transcription_multipart("my-whisper");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a blocked transcript must not be released just because it streamed"
+        );
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("BLOCKME"),
+            "the blocked transcript must not reach the caller"
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for the billed-then-blocked transcript")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.status_code, 422);
+        assert!(event.guardrail_blocked, "event must be marked blocked");
+        assert_eq!((event.prompt_tokens, event.completion_tokens), (21, 7));
+    }
+
+    /// AISIX-Cloud#1330 / #1024: a guardrail BLOCK leaves this handler
+    /// through `Err`, so the terminal usage event is the shared
+    /// zero-token error event. That branch is the one an auditor reads —
+    /// "which policy refused this request" — and a drain wired only into
+    /// the success path misses it silently.
+    #[tokio::test]
+    async fn blocked_request_names_the_policy_on_the_usage_event() {
+        let upstream = MockServer::builder().start().await;
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(tts_model("my-tts"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            speech_req(r#"{"model":"my-tts","input":"say BLOCKME aloud","voice":"alloy"}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for the refusal")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
+        assert_eq!(ev.guardrail_enforced_hits[0].guardrail_name, "t");
+        assert_eq!(ev.guardrail_enforced_hits[0].hook, "input");
+        assert_eq!(ev.guardrail_enforced_hits[0].action, "blocked");
+        let wire = serde_json::to_string(&ev).unwrap();
+        assert!(!wire.contains("BLOCKME"), "{wire}");
+    }
+
+    /// [`transcription_multipart_with_prompt`] plus `stream=true`, i.e.
+    /// what a caller that wants the transcript incrementally AND supplies
+    /// prompt text sends — the shape that reaches the relay closure.
+    fn streaming_transcription_multipart_with_prompt(
+        model: &str,
+        prompt: &str,
+    ) -> (String, axum::body::Body) {
+        let body = format!(
+            "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"stream\"\r\n\r\ntrue\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n{prompt}\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.mp3\"\r\n\
+             Content-Type: audio/mpeg\r\n\r\nID3fakeaudio\r\n--b--\r\n"
+        );
+        (
+            "multipart/form-data; boundary=b".to_string(),
+            axum::body::Body::from(body),
+        )
+    }
+
+    /// A `kind: "pii"` row masking a version string on the INPUT hook —
+    /// what an audio `prompt` actually gets, as opposed to the keyword
+    /// BLOCK the sibling tests drive.
+    fn masking_input_guardrail() -> ResourceEntry<aisix_core::Guardrail> {
+        let g: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"eda-mask","enabled":true,"hook_point":"input","kind":"pii","detectors":[],"custom_patterns":[{"name":"eda_version","regex":"version\\s*:\\s*(\\d+(?:\\.\\d+)+)","action":"mask","replacement":"***"}]}"#,
+        )
+        .unwrap();
+        ResourceEntry::new("g-mask", g, 1)
+    }
+
+    /// AISIX-Cloud#1330 / #1024: the NON-streaming transcription's own
+    /// emitter (`emit_audio_usage`) drains too. The sibling refusal test
+    /// drives `/v1/audio/speech`, which is a different dispatch entirely,
+    /// so without this the whole multipart surface's success path is
+    /// unasserted.
+    #[tokio::test]
+    async fn transcription_mask_names_the_policy_on_the_usage_event() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "hello world",
+                "usage": {"type": "tokens", "input_tokens": 4, "output_tokens": 2, "total_tokens": 6}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-transcribe"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, masking_input_guardrail());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, body) =
+            transcription_multipart_with_prompt("my-transcribe", "build version: 9.9.9 ok");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The masked prompt is what actually reached the provider.
+        let seen = upstream.received_requests().await.unwrap();
+        let forwarded = String::from_utf8_lossy(&seen[0].body).into_owned();
+        assert!(forwarded.contains("***"), "{forwarded}");
+        assert!(!forwarded.contains("9.9.9"), "{forwarded}");
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
+        assert_eq!(ev.guardrail_enforced_hits[0].guardrail_name, "eda-mask");
+        assert_eq!(ev.guardrail_enforced_hits[0].hook, "input");
+        assert_eq!(ev.guardrail_enforced_hits[0].action, "masked");
+        let wire = serde_json::to_string(&ev).unwrap();
+        assert!(!wire.contains("9.9.9"), "{wire}");
+    }
+
+    /// The STREAMED transcription relay's end-of-stream emit — the one
+    /// emitter on this surface that runs from a `move` closure after the
+    /// handler frame is gone, and the reason the audit handle is cloned
+    /// beside `applied_guardrails` rather than read from the chain.
+    /// Nothing else in the suite reaches it.
+    #[tokio::test]
+    async fn streamed_transcription_mask_names_the_policy_on_the_usage_event() {
+        let upstream = MockServer::builder().start().await;
+        let sse = "\
+data: {\"type\":\"transcript.text.delta\",\"delta\":\"hello\"}\n\n\
+data: {\"type\":\"transcript.text.done\",\"text\":\"hello world\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-transcribe"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, masking_input_guardrail());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, body) = streaming_transcription_multipart_with_prompt(
+            "my-transcribe",
+            "build version: 9.9.9 ok",
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Drain the body so the relay's end-of-stream emit runs.
+        let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(1000), rx.recv())
+            .await
+            .expect("the streamed relay must emit a UsageEvent")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
+        assert_eq!(ev.guardrail_enforced_hits[0].guardrail_name, "eda-mask");
+        assert_eq!(ev.guardrail_enforced_hits[0].hook, "input");
+        assert_eq!(ev.guardrail_enforced_hits[0].action, "masked");
+        let wire = serde_json::to_string(&ev).unwrap();
+        assert!(!wire.contains("9.9.9"), "{wire}");
+    }
+
+    /// A streamed transcription relay writes ONE access-log line, at the
+    /// relay's end rather than when the head went out, so each of the three
+    /// endings reports its own outcome (AISIX-Cloud#1571).
+    ///
+    /// `downstream_latency_ms` is deliberately NOT asserted to be a time-to-first-frame
+    /// here: this relay's usage event reports the WHOLE relay as what the
+    /// caller waited for, and the line reports the same figure the event
+    /// does. Changing that would be a change to the usage event's meaning,
+    /// not to this line.
+    #[tokio::test]
+    async fn a_streamed_transcription_writes_one_line_per_stream_ending() {
+        let upstream = crate::surface_test_log_component::spawn_sse_upstream(vec![
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\"hello\"}\n\n".to_string(),
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\" world\"}\n\n".to_string(),
+            "data: {\"type\":\"transcript.text.done\",\"text\":\"hello world\",\
+             \"usage\":{\"type\":\"tokens\",\"total_tokens\":38,\"input_tokens\":26,\
+             \"output_tokens\":12}}\n\n"
+                .to_string(),
+            "data: [DONE]\n\n".to_string(),
+        ])
+        .await;
+
+        let snap = new_snap(&upstream);
+        snap.models.insert(whisper_model("my-transcribe"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
+        let metrics = state.metrics.clone();
+        let app = crate::build_router(state);
+
+        let endings = crate::surface_test_log_component::three_stream_endings(app, || {
+            let (ct, body) = streaming_transcription_multipart("my-transcribe");
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", ct)
+                .body(body)
+                .unwrap()
+        })
+        .await;
+        crate::surface_test_log_component::assert_one_line_per_ending(&endings, "/v1/audio/transcriptions", "k-1");
+        crate::surface_test_log_component::assert_request_families_follow_the_endings(
+            &metrics,
+            "/v1/audio/transcriptions",
+            true,
+        );
+        assert_eq!(
+            endings.delivered.num("total_tokens"),
+            Some(38),
+            "the terminal frame's counts belong on the line that reports the relay's end",
+        );
+    }
+}

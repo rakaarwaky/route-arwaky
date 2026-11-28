@@ -18,27 +18,27 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
-mod audit;
+mod surface_guardrail_audit_view;
 mod build;
-mod call_error;
-mod chain;
-mod custom;
-mod index;
-mod keyword;
+mod taxonomy_guardrail_call_error_vo;
+mod surface_guardrail_chain_router;
+mod surface_custom_guardrail_action;
+mod surface_guardrail_index_store;
+mod surface_keyword_guardrail_action;
 #[cfg(feature = "lakera")]
-mod lakera;
+mod surface_lakera_guardrail_action;
 #[cfg(feature = "openai-moderation")]
-mod openai_moderation;
-mod pii;
+mod surface_openai_moderation_action;
+mod surface_pii_guard_action;
 #[cfg(feature = "presidio")]
-mod presidio;
-mod semantic;
+mod surface_presidio_guardrail_action;
+mod surface_semantic_guardrail_action;
 #[cfg(any(
     feature = "lakera",
     feature = "openai-moderation",
     feature = "presidio",
 ))]
-mod too_large;
+mod surface_too_large_guardrail_action;
 
 use aisix_core::models::GuardrailMonitorHit;
 use aisix_gateway::{ChatFormat, ChatMessage, ChatResponse, Role};
@@ -112,8 +112,8 @@ pub(crate) async fn read_body_capped(
                 tracing::warn!(
                     guardrail_name = %row,
                     http_status = resp.status().as_u16(),
-                    error = call_error::error_chain(&e).as_str(),
-                    error_kind = %call_error::error_kind(&e),
+                    error = taxonomy_guardrail_call_error_vo::error_chain(&e).as_str(),
+                    error_kind = %taxonomy_guardrail_call_error_vo::error_kind(&e),
                     bytes_read = buf.len(),
                     "guardrail response body read failed",
                 );
@@ -148,7 +148,7 @@ pub(crate) async fn read_body_capped(
 ///     is a different question and stays out of the output scope — this
 ///     helper only ever sees REQUEST messages (`check_input`); the output
 ///     collectors read `ChatResponse::guardrail_output_text`.
-///   * reasoning content parts (`aisix_gateway::chat::reasoning_part_slots`)
+///   * reasoning content parts (`aisix_gateway::taxonomy_chat_vo::reasoning_part_slots`)
 ///     — the same replayed reasoning written into `content` instead of the
 ///     slot, read IN ADDITION to the slot so a benign one cannot hide the
 ///     other.
@@ -177,7 +177,7 @@ pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
     }
     if let Some(tool_calls) = m.extra.get("tool_calls") {
         if !tool_calls.is_null() {
-            parts.push(aisix_gateway::tool_calls::tool_calls_scan_text(tool_calls));
+            parts.push(aisix_gateway::surface_tool_calls_action::tool_calls_scan_text(tool_calls));
         }
     }
     if let Some(reasoning) = m.extra.get("reasoning_content").and_then(|v| v.as_str()) {
@@ -189,7 +189,7 @@ pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
         m.content_blocks
             .iter()
             .flatten()
-            .flat_map(aisix_gateway::chat::reasoning_part_slots)
+            .flat_map(aisix_gateway::taxonomy_chat_vo::reasoning_part_slots)
             .filter(|slot| !slot.text.is_empty())
             .map(|slot| slot.text.to_string()),
     );
@@ -353,7 +353,7 @@ impl EmbedFailure {
 /// `kind: "semantic"`.
 ///
 /// The dispatch this needs is the one semantic ROUTING already performs
-/// (`aisix_proxy::semantic::embed_texts`), but that lives a layer up: it
+/// (`aisix_proxy::surface_semantic_router::embed_texts`), but that lives a layer up: it
 /// needs the provider hub and the model snapshot, and holding a
 /// `ProxyState` from here would close a reference cycle through the
 /// chain cache `ProxyState` itself owns. So the proxy injects an
@@ -437,24 +437,24 @@ impl std::fmt::Debug for GuardrailEmbedderSlot {
     }
 }
 
-pub use audit::GuardrailAuditLog;
+pub use surface_guardrail_audit_view::GuardrailAuditLog;
 pub use build::{
     build_chain_from_snapshot, build_index_from_snapshot, sweep_unattached_guardrails,
     unattached_guardrail_names, unbuildable_guardrail_rows, LiveGuardrailChain, LiveGuardrailIndex,
     UnbuildableGuardrailRow, UNATTACHED_SWEEP_INTERVAL,
 };
-pub use call_error::error_chain;
-pub use chain::GuardrailChain;
-pub use index::{GuardrailIndex, RequestContext};
-pub use keyword::{KeywordBlocklist, KeywordRule};
+pub use taxonomy_guardrail_call_error_vo::error_chain;
+pub use surface_guardrail_chain_router::GuardrailChain;
+pub use surface_guardrail_index_store::{GuardrailIndex, RequestContext};
+pub use surface_keyword_guardrail_action::{KeywordBlocklist, KeywordRule};
 #[cfg(feature = "lakera")]
-pub use lakera::LakeraGuardrail;
+pub use surface_lakera_guardrail_action::LakeraGuardrail;
 #[cfg(feature = "openai-moderation")]
-pub use openai_moderation::OpenaiModerationGuardrail;
-pub use pii::{builtin_rule, PiiAction, PiiGuardrail, PiiRule, BUILTIN_DETECTORS};
+pub use surface_openai_moderation_action::OpenaiModerationGuardrail;
+pub use surface_pii_guard_action::{builtin_rule, PiiAction, PiiGuardrail, PiiRule, BUILTIN_DETECTORS};
 #[cfg(feature = "presidio")]
-pub use presidio::PresidioGuardrail;
-pub use semantic::SemanticGuardrail;
+pub use surface_presidio_guardrail_action::PresidioGuardrail;
+pub use surface_semantic_guardrail_action::SemanticGuardrail;
 
 /// What a guardrail decided about a request or response.
 ///
@@ -1299,13 +1299,13 @@ mod tests {
             sock.write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 100\r\n\r\npartial")
                 .unwrap();
         });
-        let logged = crate::call_error::testing::capture_logs(|| async {
+        let logged = crate::taxonomy_guardrail_call_error_vo::testing::capture_logs(|| async {
             let mut resp = reqwest::get(format!("http://{addr}/")).await.unwrap();
             assert_eq!(read_body_capped(&mut resp, 1024, "row-x").await, "partial");
         })
         .await;
         server.join().unwrap();
-        let line = crate::call_error::testing::failure_line(
+        let line = crate::taxonomy_guardrail_call_error_vo::testing::failure_line(
             &logged,
             "guardrail response body read failed",
         );
@@ -1589,7 +1589,7 @@ mod tests {
     /// a kind (such as `literal`/`regex` keyword patterns) live under
     /// `definitions` and are not selectable provider kinds.
     fn schema_kind_vocabulary() -> BTreeSet<String> {
-        aisix_core::models::schema::guardrail_root_schema(true)["oneOf"]
+        aisix_core::models::taxonomy_schema_vo::guardrail_root_schema(true)["oneOf"]
             .as_array()
             .expect("the guardrail root schema is a `oneOf` over the kinds")
             .iter()

@@ -8,6 +8,10 @@ repository.workspace = true
 authors.workspace = true
 description = "aisix: Admin API + Playground + OpenAPI"
 
+[[bin]]
+name = "dump-openapi"
+path = "src/bin/root_dump_openapi_entry.rs"
+
 [dependencies]
 aisix-core = { path = "../aisix-core" }
 aisix-etcd = { path = "../aisix-etcd" }

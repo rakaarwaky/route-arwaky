@@ -25,14 +25,14 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
-mod cache;
-mod key;
-mod memory;
+mod taxonomy_cache_vo;
+mod taxonomy_cache_key_vo;
+mod surface_memory_store;
 #[cfg(feature = "redis")]
-mod redis;
-mod semantic;
+mod surface_redis_store;
+mod surface_semantic_cache_store;
 #[cfg(feature = "redis")]
-mod semantic_redis;
+mod surface_semantic_redis_store;
 
 /// Re-exported so the bootstrap can build ONE policy for the whole cache
 /// subsystem without taking a direct dependency on the connection crate.
@@ -40,15 +40,15 @@ mod semantic_redis;
 /// [`RedisCache::connect_with`].
 #[cfg(feature = "redis")]
 pub use aisix_redis::FailurePolicy;
-pub use cache::{Cache, CacheError, CacheOutcome};
-pub use key::{semantic_prompt_text, CacheKey};
-pub use memory::{MemoryCache, DEFAULT_CAPACITY, DEFAULT_TTL};
+pub use taxonomy_cache_vo::{Cache, CacheError, CacheOutcome};
+pub use taxonomy_cache_key_vo::{semantic_prompt_text, CacheKey};
+pub use surface_memory_store::{MemoryCache, DEFAULT_CAPACITY, DEFAULT_TTL};
 #[cfg(feature = "redis")]
-pub use redis::{
+pub use surface_redis_store::{
     RedisCache, DEFAULT_PREFIX as REDIS_DEFAULT_PREFIX, DEFAULT_TTL as REDIS_DEFAULT_TTL,
 };
-pub use semantic::{MemorySemanticCache, SemanticCacheStore, SemanticHit};
+pub use surface_semantic_cache_store::{MemorySemanticCache, SemanticCacheStore, SemanticHit};
 #[cfg(feature = "redis")]
-pub use semantic_redis::{
+pub use surface_semantic_redis_store::{
     ProbeOutcome, RedisSemanticCache, DEFAULT_PREFIX as SEMANTIC_REDIS_DEFAULT_PREFIX,
 };

@@ -17,101 +17,103 @@
 //! {"error":{"message":"…","type":"…"}}
 //! ```
 //!
-//! Status codes follow [`crate::error::ProxyError::status`] — spec §3 auth
+//! Status codes follow [`crate::surface_proxy_error_view::ProxyError::status`] — spec §3 auth
 //! rules (401/403), `Bridge` mapping preserves upstream 4xx and collapses
 //! upstream 5xx to 502.
 
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
-mod attempt;
-mod attribution;
-mod audio;
-mod auth;
-pub mod background;
-pub mod budget;
-mod cancel;
-mod chat;
-mod client_ip;
-mod completions;
-pub(crate) mod cooldown;
-mod dispatch;
-mod dispatch_plan;
-mod ebml;
-mod effort_mapping;
-mod embeddings;
-mod ensemble;
-mod error;
-mod error_translate;
-mod estimate_pool;
-pub use estimate_pool::configure as configure_estimate_pool;
+mod surface_attempt_controller;
+mod surface_attribution_view;
+mod surface_audio_controller;
+mod surface_auth_controller;
+pub mod surface_background_action;
+pub mod surface_budget_action;
+mod surface_cancel_action;
+mod surface_chat_controller;
+mod surface_client_ip_controller;
+mod surface_completions_controller;
+pub(crate) mod surface_cooldown_store;
+mod surface_dispatch_router;
+mod surface_dispatch_plan_action;
+mod surface_ebml_component;
+mod surface_effort_mapping_action;
+mod surface_embeddings_controller;
+mod surface_ensemble_controller;
+mod surface_proxy_error_view;
+mod surface_error_translate_view;
+mod surface_estimate_pool_component;
+mod surface_json_len_component;
+pub use surface_estimate_pool_component::configure as configure_estimate_pool;
 #[cfg(test)]
-mod guardrail_blocked_telemetry;
+mod surface_guardrail_blocked_telemetry_view;
 #[cfg(test)]
-mod guardrail_coverage;
-mod guardrail_embedder;
-mod guardrail_stream;
-pub mod health;
-mod held_content;
-mod host;
-mod http_client;
-mod images;
-mod images_edits;
-mod jobs;
-mod json_splice;
-mod jwt;
-mod jwt_index;
-mod model_echo;
-mod model_resolve;
-mod models;
-mod operation;
-mod passthrough_route;
-mod policy_index;
-mod quota;
-mod realtime;
-mod redact;
-mod reject;
-mod render;
-mod request_body_account;
-mod request_id;
-mod request_metrics;
-mod rerank;
-mod responses;
-mod responses_affinity;
-mod responses_bridge;
-mod rewrite;
-mod routing;
-mod semantic;
-mod session_affinity;
-mod session_id;
-pub mod shared_store;
-mod span_facts;
-pub mod sse_keepalive;
-mod state;
-mod stream_timeout;
+mod surface_guardrail_coverage_view;
+mod surface_guardrail_embedder_action;
+mod surface_guardrail_stream_view;
+pub mod surface_health_controller;
+mod surface_held_content_store;
+mod surface_host_match_component;
+mod surface_http_client_store;
+mod surface_images_controller;
+mod surface_images_edits_controller;
+mod surface_jobs_controller;
+mod surface_json_splice_action;
+mod surface_jwt_controller;
+mod surface_jwt_index_store;
+mod surface_model_echo_action;
+mod surface_model_resolve_action;
+mod surface_models_controller;
+mod surface_operation_controller;
+mod surface_passthrough_route_controller;
+mod surface_policy_index_store;
+mod surface_quota_action;
+mod surface_realtime_controller;
+mod surface_fun_asr_component;
+mod surface_redact_action;
+mod surface_reject_action;
+mod surface_render_view;
+mod surface_request_body_account_component;
+mod surface_request_id_action;
+mod surface_request_metrics_view;
+mod surface_rerank_controller;
+mod surface_responses_controller;
+mod surface_responses_affinity_store;
+mod surface_responses_bridge_controller;
+mod surface_rewrite_action;
+mod surface_routing_controller;
+mod surface_semantic_router;
+mod surface_session_affinity_store;
+pub(crate) use aisix_core::utility_session_id;
+pub mod surface_shared_store;
+mod surface_span_facts_view;
+pub mod surface_sse_keepalive_view;
+mod surface_proxy_state_store;
+mod surface_stream_timeout_action;
 #[cfg(test)]
-mod test_log;
-mod token_estimate;
-mod unsized_audio;
-mod usage_attr;
+mod surface_test_log_component;
+mod surface_token_estimate_action;
+mod surface_unsized_audio_view;
+mod surface_usage_attr_view;
 /// The `model` metric label for a request that resolved no model. Exported
 /// because the retirement sweep's liveness predicate lives in the server
 /// crate and must recognise it as a placeholder — spelling it there as a
 /// literal would let this constant change underneath it and start retiring
 /// live series.
-pub use usage_attr::UNRESOLVED_MODEL_LABEL;
-mod util;
-mod videos;
+pub use surface_usage_attr_view::UNRESOLVED_MODEL_LABEL;
+mod surface_proxy_util_component;
+mod surface_videos_controller;
 
-pub use auth::AuthenticatedKey;
-pub use error::{ErrorEnvelope, ProxyError};
-pub use health::{
+pub use surface_auth_controller::AuthenticatedKey;
+pub use surface_proxy_error_view::{ErrorEnvelope, ProxyError};
+pub use surface_health_controller::{
     HealthTracker, LivezState, ModelRuntimeStatusTracker, RuntimeStatus, RuntimeStatusSnapshot,
 };
-pub use held_content::holdback_bytes;
-pub use request_body_account::in_flight_request_bodies;
-pub use request_id::DownstreamScheme;
-pub use state::{CacheBackends, ProxyState, SemanticRedisCell};
+pub use surface_held_content_store::holdback_bytes;
+pub use surface_request_body_account_component::in_flight_request_bodies;
+pub use surface_request_id_action::DownstreamScheme;
+pub use surface_proxy_state_store::{CacheBackends, ProxyState, SemanticRedisCell};
 
 use aisix_obs::{AccessLog, CancelledLabels};
 use axum::extract::State;
@@ -139,53 +141,53 @@ pub fn build_router(state: ProxyState) -> Router {
     let router = Router::new()
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
-        .route("/v1/models", get(models::list_models))
-        .route("/v1/chat/completions", post(chat::chat_completions))
-        .route("/v1/completions", post(completions::completions))
-        .route("/v1/embeddings", post(embeddings::embeddings))
-        .route("/v1/images/generations", post(images::image_generations))
-        .route("/v1/images/edits", post(images_edits::image_edits))
-        .route("/v1/rerank", post(rerank::rerank))
-        .route("/v1/responses", post(responses::responses))
-        .route("/v1/audio/transcriptions", post(audio::transcriptions))
-        .route("/v1/audio/translations", post(audio::translations))
-        .route("/v1/audio/speech", post(audio::speech))
+        .route("/v1/models", get(surface_models_controller::list_models))
+        .route("/v1/chat/completions", post(surface_chat_controller::chat_completions))
+        .route("/v1/completions", post(surface_completions_controller::completions))
+        .route("/v1/embeddings", post(surface_embeddings_controller::embeddings))
+        .route("/v1/images/generations", post(surface_images_controller::image_generations))
+        .route("/v1/images/edits", post(surface_images_edits_controller::image_edits))
+        .route("/v1/rerank", post(surface_rerank_controller::rerank))
+        .route("/v1/responses", post(surface_responses_controller::responses))
+        .route("/v1/audio/transcriptions", post(surface_audio_controller::transcriptions))
+        .route("/v1/audio/translations", post(surface_audio_controller::translations))
+        .route("/v1/audio/speech", post(surface_audio_controller::speech))
         // Unified video-generation surface (AISIX-Cloud#1118 Phase 1):
         // submit → poll → fetch. Auth/ACL/quota enforced inside the
         // handlers; the GET routes are exempt from model-level rate
         // limits by design (see videos.rs).
-        .route("/v1/videos", post(videos::create_video))
-        .route("/v1/videos/:id", get(videos::get_video))
-        .route("/v1/videos/:id/content", get(videos::video_content))
+        .route("/v1/videos", post(surface_videos_controller::create_video))
+        .route("/v1/videos/:id", get(surface_videos_controller::get_video))
+        .route("/v1/videos/:id/content", get(surface_videos_controller::video_content))
         // OpenAI Realtime WebSocket relay (#721). Auth/ACL/quota are
         // enforced pre-upgrade inside the handler.
-        .route("/v1/realtime", get(realtime::realtime))
-        .route("/api-ws/v1/inference", get(realtime::fun_asr::inference))
+        .route("/v1/realtime", get(surface_realtime_controller::realtime))
+        .route("/api-ws/v1/inference", get(surface_fun_asr_component::inference))
         // Files / Batches / Fine-tuning jobs surface (#720). Provider
         // routing rides the gateway-encoded resource ids; see jobs.rs.
         .route(
             "/v1/files",
-            post(jobs::create_file).get(jobs::list_files),
+            post(surface_jobs_controller::create_file).get(surface_jobs_controller::list_files),
         )
         .route(
             "/v1/files/:id",
-            get(jobs::get_file).delete(jobs::delete_file),
+            get(surface_jobs_controller::get_file).delete(surface_jobs_controller::delete_file),
         )
-        .route("/v1/files/:id/content", get(jobs::file_content))
+        .route("/v1/files/:id/content", get(surface_jobs_controller::file_content))
         .route(
             "/v1/batches",
-            post(jobs::create_batch).get(jobs::list_batches),
+            post(surface_jobs_controller::create_batch).get(surface_jobs_controller::list_batches),
         )
-        .route("/v1/batches/:id", get(jobs::get_batch))
-        .route("/v1/batches/:id/cancel", post(jobs::cancel_batch))
+        .route("/v1/batches/:id", get(surface_jobs_controller::get_batch))
+        .route("/v1/batches/:id/cancel", post(surface_jobs_controller::cancel_batch))
         .route(
             "/v1/fine_tuning/jobs",
-            post(jobs::create_ft_job).get(jobs::list_ft_jobs),
+            post(surface_jobs_controller::create_ft_job).get(surface_jobs_controller::list_ft_jobs),
         )
-        .route("/v1/fine_tuning/jobs/:id", get(jobs::get_ft_job))
+        .route("/v1/fine_tuning/jobs/:id", get(surface_jobs_controller::get_ft_job))
         .route(
             "/v1/fine_tuning/jobs/:id/cancel",
-            post(jobs::cancel_ft_job),
+            post(surface_jobs_controller::cancel_ft_job),
         )
         // Path-prefix passthrough routes match here, AFTER every typed
         // route has had its chance — a route can never shadow the
@@ -193,10 +195,10 @@ pub fn build_router(state: ProxyState) -> Router {
         // the handler.
         // Registered before the layers so fallback traffic gets the same
         // body-limit / telemetry / Server-header treatment as the routes.
-        .fallback(passthrough_route::entry)
+        .fallback(surface_passthrough_route_controller::entry)
         // After every route is added: it applies only to the routes that
         // exist when it is called.
-        .method_not_allowed_fallback(reject::method_not_allowed);
+        .method_not_allowed_fallback(surface_reject_action::method_not_allowed);
     let router = apply_shared_proxy_layers(router, &state, body_limit).with_state(state.clone());
 
     // The host-dispatch target: the same fallback handler behind the SAME
@@ -205,7 +207,7 @@ pub fn build_router(state: ProxyState) -> Router {
     // override — dispatching to the bare handler would silently shed all
     // three (and let an upstream Server header leak through).
     let host_entry_stack = apply_shared_proxy_layers(
-        Router::new().fallback(passthrough_route::entry),
+        Router::new().fallback(surface_passthrough_route_controller::entry),
         &state,
         body_limit,
     )
@@ -226,7 +228,7 @@ pub fn build_router(state: ProxyState) -> Router {
         .fallback_service(router)
         .layer(middleware::from_fn_with_state(
             (state.clone(), host_entry_stack),
-            passthrough_route::host_dispatch,
+            surface_passthrough_route_controller::host_dispatch,
         ));
 
     // Pre-routing URL rewriting (`proxy.url_rewrites`). `Router::layer`
@@ -244,7 +246,7 @@ pub fn build_router(state: ProxyState) -> Router {
             .fallback_service(router)
             .layer(middleware::from_fn_with_state(
                 state.clone(),
-                rewrite::rewrite_request_uri,
+                surface_rewrite_action::rewrite_request_uri,
             ))
     };
 
@@ -257,7 +259,7 @@ pub fn build_router(state: ProxyState) -> Router {
     // request_id.rs.
     router.layer(middleware::from_fn_with_state(
         state,
-        request_id::ensure_request_id,
+        surface_request_id_action::ensure_request_id,
     ))
 }
 
@@ -408,11 +410,11 @@ impl InFlightGuard {
 /// let the shutdown coordinator close the listener under exactly the
 /// traffic the drain window exists to protect.
 pub(crate) struct DrainGuard {
-    livez: std::sync::Arc<health::LivezState>,
+    livez: std::sync::Arc<surface_health_controller::LivezState>,
 }
 
 impl DrainGuard {
-    pub(crate) fn new(livez: std::sync::Arc<health::LivezState>) -> Self {
+    pub(crate) fn new(livez: std::sync::Arc<surface_health_controller::LivezState>) -> Self {
         livez.enter();
         Self { livez }
     }
@@ -460,7 +462,7 @@ const CLIENT_DISCONNECTED_KIND: &str = "client_disconnected";
 /// usual reason a caller gives up is a long time-to-first-token.
 ///
 /// So the guard writes all three: the line, the metric, and the
-/// request's usage events (`crate::cancel`) — the attempts that had
+/// request's usage events (`crate::surface_cancel_action`) — the attempts that had
 /// already failed, then a terminal `499`. Everything it needs comes off
 /// the request's attribution cell, which the handlers fill at
 /// chokepoints they already pass through. The LINE is written only when
@@ -479,7 +481,7 @@ const CLIENT_DISCONNECTED_KIND: &str = "client_disconnected";
 /// This is NOT the streaming-disconnect path: once SSE bytes flow the
 /// response head is already committed, so the handler has logged and the
 /// per-stream `Drop` guard emits the usage event (see
-/// `chat::build_sse_stream`). Response bodies are polled after this
+/// `surface_chat_controller::build_sse_stream`). Response bodies are polled after this
 /// middleware has returned, so a mid-stream hang-up finds the guard in
 /// its body phase, sees the body was polled, and is not double-counted
 /// here.
@@ -494,14 +496,14 @@ const CLIENT_DISCONNECTED_KIND: &str = "client_disconnected";
 /// "client_disconnected"`; only the message says where the caller left.
 /// The LINE says the same, because a streaming handler does not write it
 /// at all: it parks it on the request's cell
-/// (`attribution::PendingAccessLog`) and whichever terminal emitter ends
+/// (`surface_attribution_view::PendingAccessLog`) and whichever terminal emitter ends
 /// the request completes it, with that emitter's status and message. One
 /// line per request, in every ending.
 ///
 /// The layer also counts the request and response body bytes the access
 /// log reports (`RequestBodyCounter`, `TelemetryBody::poll_frame`), and the
 /// guard is what WRITES the request's line: every emitter leaves it on the
-/// cell (`attribution::emit_access_log`), and the guard writes it when it
+/// cell (`surface_attribution_view::emit_access_log`), and the guard writes it when it
 /// drops — the body fully handed to the server or dropped, or no head at
 /// all — which is the first moment both sizes are final.
 async fn record_request_telemetry(
@@ -522,17 +524,17 @@ async fn record_request_telemetry(
     // (AISIX-Cloud#1317). Installed here because a cancelled handler
     // future never gets to hand anything back.
     let snapshot = state.snapshot.load();
-    let user_agent = std::sync::Arc::new(client_ip::InboundUserAgent::from_headers(
+    let user_agent = std::sync::Arc::new(surface_client_ip_controller::InboundUserAgent::from_headers(
         request.headers(),
         &state.client_classifier,
     ));
-    let attribution = std::sync::Arc::new(attribution::RequestAttribution::new(
+    let attribution = std::sync::Arc::new(surface_attribution_view::RequestAttribution::new(
         user_agent,
-        client_ip::exported_header_names(&snapshot, true),
-        usage_attr::content_cap(&snapshot).is_some(),
+        surface_client_ip_controller::exported_header_names(&snapshot, true),
+        surface_usage_attr_view::content_cap(&snapshot).is_some(),
         request
             .extensions()
-            .get::<request_id::RequestId>()
+            .get::<surface_request_id_action::RequestId>()
             .map(|r| r.0.clone())
             .unwrap_or_default(),
     ));
@@ -556,7 +558,7 @@ async fn record_request_telemetry(
         uri: request.uri().clone(),
         request_id: request
             .extensions()
-            .get::<request_id::RequestId>()
+            .get::<surface_request_id_action::RequestId>()
             .map(|id| id.0.clone())
             .unwrap_or_default(),
         // Read here rather than off the `ClientContext`, so a cancelled
@@ -599,7 +601,7 @@ async fn record_request_telemetry(
             "request arrived while draining"
         );
     }
-    let mut response = attribution::scope(attribution, next.run(request)).await;
+    let mut response = surface_attribution_view::scope(attribution, next.run(request)).await;
     // The head exists; from here the guard rides the body (see `GuardPhase`).
     guard.attribution.note_head_written();
     capture_streamed_output(&state, endpoint, &response, &guard.attribution);
@@ -620,16 +622,16 @@ async fn record_request_telemetry(
 }
 
 /// Arm the structured output capture of a streamed model response (see
-/// `aisix_obs::output`): the frames are read as the caller receives them,
+/// `aisix_obs::surface_output_view`): the frames are read as the caller receives them,
 /// which is after every output guardrail has masked them, and the request's
-/// terminal usage event takes the result (`usage_attr::emit_usage`). Keyed
+/// terminal usage event takes the result (`surface_usage_attr_view::emit_usage`). Keyed
 /// on the route rather than on each handler, so the native and the bridged
 /// branches of a family cannot differ in what they capture.
 fn capture_streamed_output(
     state: &ProxyState,
     endpoint: &str,
     response: &Response,
-    cell: &attribution::RequestAttribution,
+    cell: &surface_attribution_view::RequestAttribution,
 ) {
     let wire = match endpoint {
         "/v1/chat/completions" => aisix_obs::OutputWire::OpenAiChat,
@@ -698,11 +700,11 @@ impl Drop for TelemetryBody {
         // attribution cell. Two families (streaming routes, passthrough)
         // build their stream's terminal emitter outside the generator, so
         // it fires even on a body nobody polled — and running that drop in
-        // scope is what lets it say so (`attribution::note_usage_emitted`),
+        // scope is what lets it say so (`surface_attribution_view::note_usage_emitted`),
         // which the guard below reads before deciding it owes a row. The
         // guard is a field, so it drops after this runs.
         if let Some(inner) = self.inner.take() {
-            attribution::sync_scope(&self.guard.attribution, move || drop(inner));
+            surface_attribution_view::sync_scope(&self.guard.attribution, move || drop(inner));
         }
     }
 }
@@ -730,7 +732,7 @@ impl axum::body::HttpBody for TelemetryBody {
         let cell = &this.guard.attribution;
         let polled = match this.inner.as_mut() {
             Some(inner) => {
-                attribution::sync_scope(cell, || std::pin::Pin::new(inner).poll_frame(cx))
+                surface_attribution_view::sync_scope(cell, || std::pin::Pin::new(inner).poll_frame(cx))
             }
             None => std::task::Poll::Ready(None),
         };
@@ -766,7 +768,7 @@ impl axum::body::HttpBody for TelemetryBody {
 /// upstream, or a drain.
 struct RequestBodyCounter {
     inner: axum::body::Body,
-    cell: std::sync::Arc<attribution::RequestAttribution>,
+    cell: std::sync::Arc<surface_attribution_view::RequestAttribution>,
 }
 
 impl axum::body::HttpBody for RequestBodyCounter {
@@ -880,7 +882,7 @@ struct ClientCancelGuard {
     /// are resolved against at drop time.
     state: ProxyState,
     /// What the cancelled request had resolved before the caller hung up.
-    attribution: std::sync::Arc<attribution::RequestAttribution>,
+    attribution: std::sync::Arc<surface_attribution_view::RequestAttribution>,
     /// Bounded route template — safe as a metric label (#451).
     endpoint: &'static str,
     method: axum::http::Method,
@@ -922,7 +924,7 @@ impl ClientCancelGuard {
     /// [`GuardPhase`].
     fn record_cancel(&mut self) {
         let phase = match self.phase {
-            GuardPhase::Head => cancel::Phase::BeforeHead,
+            GuardPhase::Head => surface_cancel_action::Phase::BeforeHead,
             // The body was read: whatever the response owed, its own
             // stream guard owns (the mid-stream shape). Not this guard's.
             GuardPhase::Body { polled: true, .. } => return,
@@ -944,23 +946,23 @@ impl ClientCancelGuard {
             // (`/v1/videos/:id/content` is the live case: it relays an
             // open-ended body and was metered by the submission.)
             GuardPhase::Body { .. }
-                if crate::operation::surface_for_endpoint(self.endpoint).is_none() =>
+                if crate::surface_operation_controller::surface_for_endpoint(self.endpoint).is_none() =>
             {
                 return
             }
-            GuardPhase::Body { .. } => cancel::Phase::BeforeBody,
+            GuardPhase::Body { .. } => surface_cancel_action::Phase::BeforeBody,
         };
         let latency = self.started.elapsed();
         let resolved = self.attribution.get();
         let cancel_ctx = self.attribution.take_cancel_context();
         // A response whose handler already wrote the request's terminal
         // event is complete; a caller that never reads it has not made it
-        // any less complete. `cancel::emit` refuses to double the EVENT on
+        // any less complete. `surface_cancel_action::emit` refuses to double the EVENT on
         // its own, but the line and the counter below have no such check —
         // and an open-ended body does not tell the two apart, because a
         // family may relay one while metering at its own tail, before the
         // bytes flow.
-        if matches!(phase, cancel::Phase::BeforeBody) && cancel_ctx.emitted_terminal {
+        if matches!(phase, surface_cancel_action::Phase::BeforeBody) && cancel_ctx.emitted_terminal {
             return;
         }
         // The head phase builds its OWN line, because the handler normally
@@ -975,14 +977,14 @@ impl ClientCancelGuard {
         // await — chat peeks the rate limiter there, to fill the
         // `x-ratelimit-*` headers — which lands here with the line already
         // parked. That line is the fuller one (it names the model, the
-        // target and the routing counts) and `cancel::emit` below writes it
+        // target and the routing counts) and `surface_cancel_action::emit` below writes it
         // under this same `499`, so this one stands down. It cannot fall
         // between the two: a parked line means the request authenticated on
-        // a metering surface, which is exactly the gate `cancel::emit`
+        // a metering surface, which is exactly the gate `surface_cancel_action::emit`
         // applies before it emits the terminal event that carries the line.
-        if matches!(phase, cancel::Phase::BeforeHead) && !self.attribution.has_pending_access_log()
+        if matches!(phase, surface_cancel_action::Phase::BeforeHead) && !self.attribution.has_pending_access_log()
         {
-            let target = attribution::AccessLogTarget::from_resolved(resolved.clone());
+            let target = surface_attribution_view::AccessLogTarget::from_resolved(resolved.clone());
             let line = AccessLog {
                 method: self.method.as_str(),
                 path: self.uri.path(),
@@ -1026,8 +1028,8 @@ impl ClientCancelGuard {
         // terminal event so the two agree on the outcome. `Drop` runs
         // outside every scope, so the cell has to be installed for the call
         // or the chokepoint has nothing to take the line from.
-        attribution::sync_scope(&self.attribution, || {
-            cancel::emit(
+        surface_attribution_view::sync_scope(&self.attribution, || {
+            surface_cancel_action::emit(
                 &self.state,
                 self.endpoint,
                 &self.request_id,
@@ -1046,11 +1048,11 @@ impl ClientCancelGuard {
         let model = if resolved.requested_model.is_empty() {
             std::borrow::Cow::Borrowed("unknown")
         } else {
-            usage_attr::metric_model_label(&snap, &resolved.requested_model)
+            surface_usage_attr_view::metric_model_label(&snap, &resolved.requested_model)
         };
-        let resolved_pk = usage_attr::ResolvedPk::resolve(&snap, &resolved.provider_key_id);
+        let resolved_pk = surface_usage_attr_view::ResolvedPk::resolve(&snap, &resolved.provider_key_id);
         let pk = if resolved.provider_key_id.is_empty() {
-            usage_attr::PkLabels::default()
+            surface_usage_attr_view::PkLabels::default()
         } else {
             resolved_pk.labels()
         };
@@ -1080,7 +1082,7 @@ impl ClientCancelGuard {
 /// without this middleware they see ECONNRESET (indistinguishable
 /// from a network failure or a gateway crash) instead of 413.
 ///
-/// Both short-circuits answer through [`crate::reject`], so a request
+/// Both short-circuits answer through [`crate::surface_reject_action`], so a request
 /// refused here still produces the access-log line and request metrics
 /// every other terminal path emits — the handler it never reached can't
 /// do it. The logged latency spans the body drain below, which is what
@@ -1091,7 +1093,7 @@ async fn enforce_request_body_limit(
     next: Next,
 ) -> Response {
     let started = std::time::Instant::now();
-    let envelope = reject::Envelope::OpenAi;
+    let envelope = surface_reject_action::Envelope::OpenAi;
     // RFC 9110 §8.6 — a server SHOULD reject a request that carries
     // duplicate or conflicting `Content-Length` values rather than
     // act on the first one (which is a request-smuggling vector).
@@ -1107,7 +1109,7 @@ async fn enforce_request_body_limit(
     let endpoint = normalize_endpoint_label(request.uri().path());
     let first = content_lengths.next();
     if content_lengths.next().is_some() {
-        return reject::reject_before_dispatch(
+        return surface_reject_action::reject_before_dispatch(
             &state,
             request.method().as_str(),
             endpoint,
@@ -1137,7 +1139,7 @@ async fn enforce_request_body_limit(
             //
             // The refusal was decided before the body was read, so the line
             // reports no request size even though the drain reads it.
-            attribution::note_request_body_discarded();
+            surface_attribution_view::note_request_body_discarded();
             let drain = drain_body(request.into_body()).await;
             record_body_limit_rejection(
                 &state,
@@ -1148,7 +1150,7 @@ async fn enforce_request_body_limit(
                 &drain,
                 started,
             );
-            return reject::reject_before_dispatch(
+            return surface_reject_action::reject_before_dispatch(
                 &state,
                 method.as_str(),
                 endpoint,
@@ -1163,7 +1165,7 @@ async fn enforce_request_body_limit(
         }
     }
     let (mut parts, body) = request.into_parts();
-    let (body, account) = request_body_account::counted(body);
+    let (body, account) = surface_request_body_account_component::counted(body);
     parts.extensions.insert(account);
     next.run(Request::from_parts(parts, body)).await
 }
@@ -1175,9 +1177,9 @@ async fn enforce_request_body_limit(
 fn request_id_of(request: &Request<axum::body::Body>) -> String {
     request
         .extensions()
-        .get::<request_id::RequestId>()
+        .get::<surface_request_id_action::RequestId>()
         .map(|r| r.0.clone())
-        .unwrap_or_else(request_id::new_request_id)
+        .unwrap_or_else(surface_request_id_action::new_request_id)
 }
 
 /// How the drain of a refused body ended. A fixed vocabulary: it is both
@@ -1353,11 +1355,11 @@ fn warn_allowed(outcome: DrainOutcome) -> bool {
 
 /// Takes no [`ProxyState`]: liveness answers whether the process should
 /// be restarted, and nothing about the gateway's state changes that
-/// answer. See [`crate::health::livez_response`].
+/// answer. See [`crate::surface_health_controller::livez_response`].
 async fn livez(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    crate::health::livez_response(params.contains_key("verbose"))
+    crate::surface_health_controller::livez_response(params.contains_key("verbose"))
 }
 
 async fn readyz(
@@ -1367,8 +1369,8 @@ async fn readyz(
     let config_block = state
         .config_apply_age
         .as_ref()
-        .and_then(|probe| crate::health::config_readiness_block(probe()));
-    crate::health::readyz_response(&state.livez, config_block, params.contains_key("verbose"))
+        .and_then(|probe| crate::surface_health_controller::config_readiness_block(probe()));
+    crate::surface_health_controller::readyz_response(&state.livez, config_block, params.contains_key("verbose"))
 }
 
 /// Inserts a guardrail together with the env-scoped attachment that puts it
@@ -1429,8 +1431,8 @@ mod tests {
         assert_eq!(normalize_endpoint_label("/a2a"), "other");
     }
 
-    use aisix_core::resource::ResourceEntry;
-    use aisix_core::snapshot::SnapshotHandle;
+    use aisix_core::taxonomy_resource_vo::ResourceEntry;
+    use aisix_core::taxonomy_snapshot_vo::SnapshotHandle;
     use aisix_core::{AisixSnapshot, ApiKey, Model, ProxyConfig};
     use aisix_gateway::{Hub, SseDecoder, SseEvent};
     use aisix_provider_openai::OpenAiBridge;
@@ -1607,7 +1609,7 @@ mod tests {
     }
 
     /// Insert a default-enabled cache policy on the snapshot so the
-    /// proxy's cache gate (chat::dispatch) opens the lookup path.
+    /// proxy's cache gate (surface_chat_controller::dispatch) opens the lookup path.
     /// Stage 2 honors existence + `enabled`; Stage 3 honors
     /// `applies_to`. The default `applies_to=all` (set by serde
     /// when omitted) matches every request, so existing tests that
@@ -3770,7 +3772,7 @@ data: [DONE]\n\n"
     // pins /v1/embeddings — representative of the class — to ensure
     // the gate fires after this PR. Adding the same coverage to every
     // endpoint would multiply the test surface without buying signal,
-    // since the gate is centralised in `crate::quota::enforce`. If
+    // since the gate is centralised in `crate::surface_quota_action::enforce`. If
     // any individual handler ever stops calling it, that handler's
     // own tests would still catch the breakage on the budget path
     // (BudgetExceeded surfaces as a 4xx the existing tests assert on).
@@ -3815,7 +3817,7 @@ data: [DONE]\n\n"
 
         // Pre-fix: this would also return 200 (the gate didn't run on
         // /v1/embeddings). Post-fix: 429 because the rpm=1 cap is now
-        // enforced uniformly via crate::quota::enforce.
+        // enforced uniformly via crate::surface_quota_action::enforce.
         let resp = run(build_router(state.clone()), make_req()).await;
         assert_eq!(
             resp.status(),
@@ -3828,7 +3830,7 @@ data: [DONE]\n\n"
     }
 
     // ---- regression coverage for api7/AISIX-Cloud#1116 --------------
-    // Pre-fix the passthrough tunnel passed `None` to quota::enforce, so
+    // Pre-fix the passthrough tunnel passed `None` to surface_quota_action::enforce, so
     // a Model's inline rate_limit (and model-scope policies) never
     // applied to passthrough traffic — for provider endpoints with no
     // typed surface (e.g. video generation) the model limit was
@@ -4296,7 +4298,7 @@ data: [DONE]\n\n"
         // (pre_commit counts stick even when the reservation drops
         // uncommitted) — both succeed because nothing is reserved.
         for _ in 0..2 {
-            let r = quota::reserve_model_only(
+            let r = surface_quota_action::reserve_model_only(
                 &state,
                 &state.snapshot.load(),
                 &auth,
@@ -4319,7 +4321,7 @@ data: [DONE]\n\n"
                 2,
             ));
 
-        assert!(quota::reserve_model_only(
+        assert!(surface_quota_action::reserve_model_only(
             &state,
             &state.snapshot.load(),
             &auth,
@@ -4331,7 +4333,7 @@ data: [DONE]\n\n"
         .await
         .is_ok());
         assert!(
-            quota::reserve_model_only(
+            surface_quota_action::reserve_model_only(
                 &state,
                 &state.snapshot.load(),
                 &auth,
@@ -4849,7 +4851,7 @@ data: [DONE]\n\n";
         };
 
         // About 5000 prompt tokens, past the 16 KiB counted inline.
-        let held = crate::estimate_pool::hold_every_slot().await;
+        let held = crate::surface_estimate_pool_component::hold_every_slot().await;
         let abandoned = tokio::time::timeout(
             std::time::Duration::from_millis(500),
             run(
@@ -7777,7 +7779,7 @@ data: [DONE]\n\n";
         // could not filter for by class. The message is what distinguishes
         // it from the head-phase shape.
         assert_eq!(event.error_class, CLIENT_DISCONNECTED_KIND);
-        assert_eq!(event.error_message, cancel::CANCELLED_MID_STREAM);
+        assert_eq!(event.error_message, surface_cancel_action::CANCELLED_MID_STREAM);
         assert!(!event.guardrail_blocked);
         // And exactly one row. The request-level guard rides the response
         // body to cover the window BEFORE its first poll, where this
@@ -8010,7 +8012,7 @@ data: [DONE]\n\n";
         assert_eq!(event.error_class, CLIENT_DISCONNECTED_KIND, "{event:?}");
         assert_eq!(
             event.error_message,
-            cancel::CANCELLED_BEFORE_HEAD,
+            surface_cancel_action::CANCELLED_BEFORE_HEAD,
             "{event:?}"
         );
         assert_eq!(event.prompt_tokens, 0);
@@ -8444,7 +8446,7 @@ data: [DONE]\n\n";
         assert_eq!(event.error_class, CLIENT_DISCONNECTED_KIND, "{event:?}");
         assert_eq!(
             event.error_message,
-            cancel::CANCELLED_BEFORE_BODY,
+            surface_cancel_action::CANCELLED_BEFORE_BODY,
             "{event:?}"
         );
         assert_eq!(event.prompt_tokens, 0, "nothing was delivered");
@@ -8778,7 +8780,7 @@ data: [DONE]\n\n",
                 polled: false,
             },
             state: state.clone(),
-            attribution: std::sync::Arc::new(attribution::RequestAttribution::default()),
+            attribution: std::sync::Arc::new(surface_attribution_view::RequestAttribution::default()),
             endpoint,
             method,
             uri: endpoint.parse().unwrap(),
@@ -8889,10 +8891,10 @@ data: [DONE]\n\n",
             req
         };
 
-        let endings = crate::test_log::three_stream_endings(app.clone(), streaming_request).await;
-        crate::test_log::assert_one_line_per_ending(&endings, "/v1/chat/completions", "key-id-1");
-        crate::test_log::assert_latency_is_time_to_first_token(&endings);
-        crate::test_log::assert_request_families_follow_the_endings(
+        let endings = crate::surface_test_log_component::three_stream_endings(app.clone(), streaming_request).await;
+        crate::surface_test_log_component::assert_one_line_per_ending(&endings, "/v1/chat/completions", "key-id-1");
+        crate::surface_test_log_component::assert_latency_is_time_to_first_token(&endings);
+        crate::surface_test_log_component::assert_request_families_follow_the_endings(
             &metrics,
             "/v1/chat/completions",
             true,
@@ -8930,11 +8932,11 @@ data: [DONE]\n\n",
         // streaming" from "never read a byte of it" apart.
         assert_eq!(
             endings.abandoned.field("error").as_deref(),
-            Some(cancel::CANCELLED_MID_STREAM),
+            Some(surface_cancel_action::CANCELLED_MID_STREAM),
         );
         assert_eq!(
             endings.unread.field("error").as_deref(),
-            Some(cancel::CANCELLED_BEFORE_BODY),
+            Some(surface_cancel_action::CANCELLED_BEFORE_BODY),
         );
 
         // The delivered line carries what only the stream's END knows: the
@@ -9026,7 +9028,7 @@ data: [DONE]\n\n",
         let rendered = metrics.render();
         for family in ["aisix_proxy_requests_total", "aisix_llm_requests_total"] {
             assert_eq!(
-                crate::test_log::samples_by_status(&rendered, family, "/v1/audio/speech"),
+                crate::surface_test_log_component::samples_by_status(&rendered, family, "/v1/audio/speech"),
                 std::collections::BTreeMap::from([(CLIENT_CLOSED_REQUEST, 1.0)]),
                 "{family}\n{rendered}",
             );
@@ -9138,13 +9140,13 @@ data: [DONE]\n\n",
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://127.0.0.1:1");
         let state = build_state(snap, Arc::new(Hub::new())).with_usage_sink(UsageSink::new(tx));
 
-        cancel::emit(
+        surface_cancel_action::emit(
             &state,
             "/v1/chat/completions",
             "req-anon",
-            &attribution::Resolved::default(),
-            attribution::CancelContext::default(),
-            cancel::Phase::BeforeHead,
+            &surface_attribution_view::Resolved::default(),
+            surface_attribution_view::CancelContext::default(),
+            surface_cancel_action::Phase::BeforeHead,
             None,
         );
 
@@ -9330,17 +9332,17 @@ data: [DONE]\n\n",
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let state = build_state(snap, Arc::new(Hub::new())).with_usage_sink(UsageSink::new(tx));
-        let cell = std::sync::Arc::new(attribution::RequestAttribution::default());
+        let cell = std::sync::Arc::new(surface_attribution_view::RequestAttribution::default());
         // Tracked, as the telemetry middleware tracks every request: only a
         // tracked cell knows whether its response head went out.
         cell.track(tracing::Span::none());
 
         // What a streaming handler leaves behind on its way out: the caller
         // it authenticated, its line, and its request-metric samples.
-        attribution::sync_scope(&cell, || {
-            attribution::note_client(&crate::client_ip::ClientContext::default(), "key-id-1");
-            attribution::defer_access_log(
-                attribution::PendingAccessLog::new(
+        surface_attribution_view::sync_scope(&cell, || {
+            surface_attribution_view::note_client(&crate::surface_client_ip_controller::ClientContext::default(), "key-id-1");
+            surface_attribution_view::defer_access_log(
+                surface_attribution_view::PendingAccessLog::new(
                     "POST",
                     "/v1/chat/completions",
                     "req-parked",
@@ -9348,17 +9350,17 @@ data: [DONE]\n\n",
                     std::time::Instant::now(),
                 )
                 .with_model("openai", "my-gpt4"),
-                crate::request_metrics::PendingRequestMetrics::at_stream_end(
+                crate::surface_request_metrics_view::PendingRequestMetrics::at_stream_end(
                     &state,
                     "/v1/chat/completions",
-                    crate::request_metrics::Caller::unattributed(Some("key-id-1")),
-                    crate::request_metrics::Upstream::default(),
+                    crate::surface_request_metrics_view::Caller::unattributed(Some("key-id-1")),
+                    crate::surface_request_metrics_view::Upstream::default(),
                     std::time::Instant::now(),
                 ),
             );
         });
 
-        let capture = crate::test_log::Capture::install();
+        let capture = crate::surface_test_log_component::Capture::install();
         drop(ClientCancelGuard {
             phase: GuardPhase::Head,
             state: state.clone(),
@@ -9418,7 +9420,7 @@ data: [DONE]\n\n",
             let _guard = ClientCancelGuard {
                 phase: GuardPhase::Head,
                 state: state.clone(),
-                attribution: std::sync::Arc::new(attribution::RequestAttribution::default()),
+                attribution: std::sync::Arc::new(surface_attribution_view::RequestAttribution::default()),
                 endpoint: "/v1/chat/completions",
                 method: axum::http::Method::POST,
                 uri: "/v1/chat/completions".parse().unwrap(),
@@ -10918,7 +10920,7 @@ data: [DONE]\n\n";
             "{events:?}"
         );
         assert_eq!(events[2].status_code, CLIENT_CLOSED_REQUEST, "{events:?}");
-        assert_eq!(events[2].error_message, cancel::CANCELLED_BEFORE_BODY);
+        assert_eq!(events[2].error_message, surface_cancel_action::CANCELLED_BEFORE_BODY);
         assert_eq!(events[2].attempt_kind, "", "{events:?}");
         assert_attempt_indices_increase(&events);
         assert_council_charged(&state, app, 32).await;
@@ -10996,7 +10998,7 @@ data: [DONE]\n\n";
             "{events:?}"
         );
         assert_eq!(events[2].status_code, CLIENT_CLOSED_REQUEST, "{events:?}");
-        assert_eq!(events[2].error_message, cancel::CANCELLED_BEFORE_HEAD);
+        assert_eq!(events[2].error_message, surface_cancel_action::CANCELLED_BEFORE_HEAD);
         assert_eq!(events[2].attempt_kind, "", "{events:?}");
         assert_attempt_indices_increase(&events);
         assert_council_charged(&state, app, 32).await;
@@ -11133,7 +11135,7 @@ data: [DONE]\n\n";
             "{events:?}"
         );
         assert_eq!(events[2].status_code, CLIENT_CLOSED_REQUEST, "{events:?}");
-        assert_eq!(events[2].error_message, cancel::CANCELLED_BEFORE_HEAD);
+        assert_eq!(events[2].error_message, surface_cancel_action::CANCELLED_BEFORE_HEAD);
         assert_attempt_indices_increase(&events);
         assert_council_charged(&state, app, 32).await;
     }
@@ -11163,7 +11165,7 @@ data: [DONE]\n\n";
         assert_eq!(events[0].attempt_model, "panel-a", "{events:?}");
         assert_eq!(events[0].prompt_tokens, 5, "{events:?}");
         assert_eq!(events[1].status_code, CLIENT_CLOSED_REQUEST, "{events:?}");
-        assert_eq!(events[1].error_message, cancel::CANCELLED_BEFORE_HEAD);
+        assert_eq!(events[1].error_message, surface_cancel_action::CANCELLED_BEFORE_HEAD);
         assert_attempt_indices_increase(&events);
         assert_council_charged(&state, app, 16).await;
     }
@@ -11311,7 +11313,7 @@ data: [DONE]\n\n";
         assert_eq!(events[0].attempt_kind, "panel", "{events:?}");
         assert_eq!(events[0].attempt_model, "panel-a", "{events:?}");
         assert_eq!(events[1].status_code, CLIENT_CLOSED_REQUEST, "{events:?}");
-        assert_eq!(events[1].error_message, cancel::CANCELLED_BEFORE_HEAD);
+        assert_eq!(events[1].error_message, surface_cancel_action::CANCELLED_BEFORE_HEAD);
         assert_attempt_indices_increase(&events);
         assert_council_charged(&state, app, 16).await;
     }

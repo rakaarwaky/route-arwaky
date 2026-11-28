@@ -12,27 +12,26 @@
 //! trait + capability matrix + idempotency types. The shared pipeline (F2)
 //! and the concrete sinks (SLS, …) build on it.
 
-mod capabilities;
-mod datadog;
-mod manager;
-mod object_store;
-mod pipeline;
-mod record;
-mod redact;
-mod sls;
-mod truncate;
+mod surface_sink_capabilities_component;
+mod surface_datadog_component;
+mod surface_sink_manager_controller;
+mod surface_object_store_component;
+mod surface_sink_pipeline_controller;
+mod surface_sink_record_view;
+mod surface_sink_redact_action;
+mod surface_sls_component;
 
-pub use capabilities::{
+pub use surface_sink_capabilities_component::{
     BatchUnit, ChannelKey, IdempotencyMarker, IdempotencyScheme, OrderingScope, SinkCapabilities,
 };
-pub use datadog::{resolve_datadog_credential, DatadogSink};
-pub use manager::ExporterPipelines;
-pub use object_store::{build_object_store_sink, ObjectStoreSink};
-pub use pipeline::{PipelineConfig, SinkHandle, SinkPipeline, SinkStatsSnapshot};
-pub use record::{CapturedContent, EventBatch, SinkContent, SinkRecord, SCHEMA_VERSION};
-pub use redact::ErrorRedactor;
-pub use sls::{resolve_sls_credential, AliyunSlsSink};
-pub use truncate::{omit_base64_media, omit_base64_media_in_json};
+pub use surface_datadog_component::{resolve_datadog_credential, DatadogSink};
+pub use surface_sink_manager_controller::ExporterPipelines;
+pub use surface_object_store_component::{build_object_store_sink, ObjectStoreSink};
+pub use surface_sink_pipeline_controller::{PipelineConfig, SinkHandle, SinkPipeline, SinkStatsSnapshot};
+pub use surface_sink_record_view::{CapturedContent, EventBatch, SinkContent, SinkRecord, SCHEMA_VERSION};
+pub use surface_sink_redact_action::ErrorRedactor;
+pub use surface_sls_component::{resolve_sls_credential, AliyunSlsSink};
+pub use aisix_core::utility_sink_truncate::{omit_base64_media, omit_base64_media_in_json};
 
 use std::time::Duration;
 
@@ -243,7 +242,7 @@ pub trait ObservabilitySink: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::usage::UsageEvent;
+    use crate::surface_usage_controller::UsageEvent;
     use std::sync::Arc;
 
     #[test]

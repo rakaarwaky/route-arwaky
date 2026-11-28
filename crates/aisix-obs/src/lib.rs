@@ -3,9 +3,9 @@
 //!
 //! Scope for PR #14:
 //! - [`init_tracing`] installs the process-wide tracing subscriber.
-//! - [`access_log::AccessLog`] — one-line structured request log, called
+//! - [`surface_access_log_view::AccessLog`] — one-line structured request log, called
 //!   by the proxy handler at end-of-request.
-//! - [`metrics::Metrics`] — Prometheus counters + histogram for
+//! - [`surface_metrics_controller::Metrics`] — Prometheus counters + histogram for
 //!   requests/duration/rate-limits/tokens.
 //! - [`sink`] — pluggable observability-sink framework: the
 //!   capability-typed [`sink::ObservabilitySink`] adapter contract
@@ -13,21 +13,21 @@
 
 #![deny(rust_2018_idioms)]
 
-pub mod access_log;
-pub mod genai;
-pub mod heap_profile;
-mod log_writer;
-pub mod memory;
-pub mod metric_labels;
-pub mod metrics;
-pub mod otlp_http_sink;
-pub mod output;
-mod prometheus;
-mod scrape;
+pub mod surface_access_log_view;
+pub mod surface_genai_view;
+pub mod surface_heap_profile_action;
+mod surface_log_writer_component;
+pub mod surface_memory_view;
+pub mod surface_metric_labels_view;
+pub mod surface_metrics_controller;
+pub mod surface_otlp_http_sink_component;
+pub mod surface_output_view;
+mod surface_prometheus_view;
+mod surface_scrape_controller;
 pub mod sink;
-pub mod trace;
-pub mod usage;
-pub mod usage_delivery;
+pub mod surface_trace_component;
+pub mod surface_usage_controller;
+pub mod surface_usage_delivery_action;
 
 use std::io::IsTerminal as _;
 use std::sync::OnceLock;
@@ -36,21 +36,21 @@ use std::time::Duration;
 use aisix_core::ObservabilityConfig;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-pub use access_log::{
+pub use surface_access_log_view::{
     request_failed_message, AccessLog, AccessLogRecord, CacheAccessLog, SemanticAccessLog,
     SemanticFallback,
 };
-pub use genai::{
+pub use surface_genai_view::{
     genai_provider_name, GenAiRequestParams, HttpServerFacts, SpanFacts, UpstreamFacts,
 };
-pub use metrics::{
+pub use surface_metrics_controller::{
     client_type_from_user_agent, BudgetGauges, BudgetLabels, CancelledLabels, ClientTypeClassifier,
     DeploymentLabels, DeploymentState, ErrorSource, GaugeFamily, GaugeLiveness, HistogramBuckets,
     LatencyLabels, LatencySide, LiveGaugeSeries, LlmUsage, Metrics, RequestLabels, RequestOutcome,
     UsageEventLabels, UsageLabels,
 };
-pub use otlp_http_sink::{content_capture_cap, OtlpHttpFanOut, OtlpSink};
-pub use output::{
+pub use surface_otlp_http_sink_component::{content_capture_cap, OtlpHttpFanOut, OtlpSink};
+pub use surface_output_view::{
     responses_finish_reason, OutputCapture, OutputCollector, OutputWire, ResponsesFinishObserver,
 };
 pub use sink::{
@@ -59,12 +59,12 @@ pub use sink::{
     PipelineConfig, SinkAck, SinkCapabilities, SinkContent, SinkError, SinkHandle, SinkHealth,
     SinkPipeline, SinkRecord, SinkResult, SinkStatsSnapshot, SCHEMA_VERSION,
 };
-pub use trace::{
+pub use surface_trace_component::{
     parse_traceparent, screen_tracestate, RemoteTraceContext, RequestTraceBundle, SpanEmit,
     SpanRole, TraceEmission, TRACEPARENT_HEADER, TRACESTATE_HEADER,
 };
-pub use usage::{EstimatedCounts, InternalCallPurpose, UsageEvent, UsageSink};
-pub use usage_delivery::UsageDeliveryHealth;
+pub use surface_usage_controller::{EstimatedCounts, InternalCallPurpose, UsageEvent, UsageSink};
+pub use surface_usage_delivery_action::UsageDeliveryHealth;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ObsError {
@@ -97,7 +97,7 @@ const QUIET_TARGETS: &[&str] = &["lofty=error"];
 /// The access log's own target, which [`build_filter`] keeps at `info` while
 /// `observability.access_log` is on: that switch decides whether the lines are
 /// written, and the log level decides about everything else.
-const ACCESS_LOG_DIRECTIVE: &str = "aisix_obs::access_log=info";
+const ACCESS_LOG_DIRECTIVE: &str = "aisix_obs::surface_access_log_view=info";
 
 /// The subscriber's level filter: `RUST_LOG` when set, else the
 /// configured level, with [`QUIET_TARGETS`] and, when the access log is on,
@@ -135,7 +135,7 @@ pub fn init_tracing(cfg: &ObservabilityConfig) -> Result<(), ObsError> {
     // structured fields are only searchable by bare value
     // (AISIX-Cloud#1060). tracing-subscriber's `ansi` default feature is on
     // and it does not probe the writer itself.
-    let (queue, writer) = log_writer::LogWriter::start(std::io::stderr(), log_writer::CAPACITY);
+    let (queue, writer) = surface_log_writer_component::LogWriter::start(std::io::stderr(), surface_log_writer_component::CAPACITY);
     let fmt_layer = fmt::layer()
         .with_target(true)
         .with_ansi(std::io::stderr().is_terminal())
@@ -153,7 +153,7 @@ pub fn init_tracing(cfg: &ObservabilityConfig) -> Result<(), ObsError> {
         return Err(ObsError::AlreadyInitialised);
     }
     let _ = LOG_WRITER.set(writer);
-    access_log::set_enabled(cfg.access_log);
+    surface_access_log_view::set_enabled(cfg.access_log);
 
     tracing::info!(
         service = %cfg.service_name,
@@ -164,14 +164,14 @@ pub fn init_tracing(cfg: &ObservabilityConfig) -> Result<(), ObsError> {
 }
 
 /// The process-wide writer thread, once [`init_tracing`] has installed one.
-static LOG_WRITER: OnceLock<log_writer::LogWriter> = OnceLock::new();
+static LOG_WRITER: OnceLock<surface_log_writer_component::LogWriter> = OnceLock::new();
 
 /// Log lines waiting for the writer thread, and their bytes; zero before
 /// [`init_tracing`] has run.
 pub fn log_queue_depth() -> (u64, u64) {
     LOG_WRITER
         .get()
-        .map_or((0, 0), log_writer::LogWriter::depth)
+        .map_or((0, 0), surface_log_writer_component::LogWriter::depth)
 }
 
 /// Drain the log queue and retire the writer thread.
@@ -235,7 +235,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             tracing::warn!(target: "lofty::mpeg::properties", "MPEG: Using bitrate to estimate duration");
             tracing::error!(target: "lofty::iff::chunk", "unreadable");
-            tracing::warn!(target: "aisix_proxy::audio", "transcription failed");
+            tracing::warn!(target: "aisix_proxy::surface_audio_controller", "transcription failed");
         });
         let logged = String::from_utf8_lossy(&writer.buf.lock().unwrap()).into_owned();
         assert!(
@@ -266,9 +266,9 @@ mod tests {
                 .with(apply_fixed_directives(EnvFilter::new(base), &cfg))
                 .with(fmt::layer().with_ansi(false).with_writer(writer.clone()));
             tracing::subscriber::with_default(subscriber, || {
-                tracing::info!(target: "aisix_obs::access_log", "the access-log line");
-                tracing::info!(target: "aisix_obs::usage", "an info line");
-                tracing::warn!(target: "aisix_obs::usage", "a warn line");
+                tracing::info!(target: "aisix_obs::surface_access_log_view", "the access-log line");
+                tracing::info!(target: "aisix_obs::surface_usage_controller", "an info line");
+                tracing::warn!(target: "aisix_obs::surface_usage_controller", "a warn line");
             });
             let logged = String::from_utf8_lossy(&writer.buf.lock().unwrap()).into_owned();
             logged
@@ -282,7 +282,7 @@ mod tests {
         assert!(!off.contains("the access-log line"), "{off}");
         assert!(off.contains("a warn line"), "{off}");
         // A filter that names the access log's target doesn't outrank the switch.
-        let named_off = logged_at("info,aisix_obs::access_log=off", true);
+        let named_off = logged_at("info,aisix_obs::surface_access_log_view=off", true);
         assert!(named_off.contains("the access-log line"), "{named_off}");
     }
 

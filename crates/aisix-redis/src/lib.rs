@@ -1693,7 +1693,7 @@ pub use redis::RedisError as ConnectError;
 #[cfg(test)]
 mod tls_tests {
     use super::*;
-    use aisix_core::config::OutboundTlsConfig;
+    use aisix_core::taxonomy_config_vo::OutboundTlsConfig;
 
     fn cfg_with(url: &str, verify: bool) -> RedisConnConfig {
         RedisConnConfig {
