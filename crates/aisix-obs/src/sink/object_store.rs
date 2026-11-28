@@ -25,7 +25,9 @@ use async_trait::async_trait;
 use object_store::path::Path as ObjectPath;
 // `put` / `get` are on the `ObjectStoreExt` extension trait in object_store
 // 0.13; `ObjectStore` itself must also be in scope for `dyn ObjectStore`.
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
+use object_store::PutPayload;
 use sha2::{Digest, Sha256};
 
 use aisix_core::models::observability_exporter::{
@@ -692,20 +694,20 @@ fn partition(occurred_at: &str) -> (String, String) {
 /// failures, 5xx, 408 and 429 are transient. The detail is length-capped; the
 /// crate does not echo secrets in error text.
 fn map_object_store_err(e: object_store::Error) -> SinkError {
-    use object_store::Error as E;
+    use object_store::Error;
     // The full source chain, not just the outer Display: object_store's
     // retry error stops at "Error performing PUT <url>" and keeps the
     // connect/DNS/TLS cause — and the response status — in `source()`.
     let chain = super::error_chain(&e);
     let detail = truncate(&chain);
     match e {
-        E::PermissionDenied { .. }
-        | E::Unauthenticated { .. }
-        | E::NotFound { .. }
-        | E::NotSupported { .. }
-        | E::NotImplemented { .. }
-        | E::InvalidPath { .. }
-        | E::UnknownConfigurationKey { .. } => SinkError::Permanent(detail),
+        Error::PermissionDenied { .. }
+        | Error::Unauthenticated { .. }
+        | Error::NotFound { .. }
+        | Error::NotSupported { .. }
+        | Error::NotImplemented { .. }
+        | Error::InvalidPath { .. }
+        | Error::UnknownConfigurationKey { .. } => SinkError::Permanent(detail),
         _ => match response_status(&chain) {
             Some(status)
                 if status.is_client_error()

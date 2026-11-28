@@ -361,26 +361,26 @@ mod tests {
         EtcdConfigStore::new(client, prefix, None)
     }
 
-    fn dummy_store() -> EtcdConfigStore {
+    fn test_store() -> EtcdConfigStore {
         store_for("/aisix")
     }
 
     #[test]
     fn key_for_matches_spec_layout() {
-        let store = dummy_store();
+        let store = test_store();
         assert_eq!(store.key_for("models", "abc-1"), "/aisix/models/abc-1");
         assert_eq!(store.key_for("api_keys", "xyz"), "/aisix/api_keys/xyz");
     }
 
     #[test]
     fn range_prefix_includes_trailing_slash() {
-        let store = dummy_store();
+        let store = test_store();
         assert_eq!(store.range_prefix("models"), "/aisix/models/");
     }
 
     #[test]
     fn id_from_key_extracts_id_segment() {
-        let store = dummy_store();
+        let store = test_store();
         assert_eq!(
             store.id_from_key("/aisix/models/abc-1", "models"),
             Some("abc-1"),
