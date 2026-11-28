@@ -63,58 +63,17 @@ pub struct JwtIdentity {
     pub subject: String,
     /// Name of the OIDC provider that verified the token.
     pub provider: String,
-    /// That provider's configured issuer, which keys this caller's stored
-    /// upstream credentials. `None` on a provider that pins none.
-    pub(crate) issuer: Option<String>,
-    /// That provider's identity claim, which keys them too: `subject` means
-    /// someone else under another claim.
-    pub(crate) identity_claim: String,
     /// Name of the claim mapping that selected the API key, or `None`
     /// when the subject was bound to the key directly via `jwt_subject`.
     pub claim_mapping: Option<String>,
-    /// The bearer token itself, exactly as the trust provider verified it —
-    /// what an `oauth2_token_exchange` upstream exchanges on the caller's
-    /// behalf, on a passthrough route configured that way. Never printed.
-    /// `None` for a session token: the gateway's own
-    /// credential, which means nothing to anyone else and never leaves here.
-    pub(crate) token: Option<Arc<str>>,
 }
 
 impl JwtIdentity {
-    pub fn new(
-        subject: String,
-        provider: String,
-        issuer: Option<String>,
-        identity_claim: String,
-        claim_mapping: Option<String>,
-        token: Arc<str>,
-    ) -> Self {
+    pub fn new(subject: String, provider: String, claim_mapping: Option<String>) -> Self {
         Self {
             subject,
             provider,
-            issuer,
-            identity_claim,
             claim_mapping,
-            token: Some(token),
-        }
-    }
-
-    /// The identity of a session token, which a trust provider verified at
-    /// sign-in rather than on this request.
-    pub(crate) fn for_session(
-        subject: String,
-        provider: String,
-        issuer: Option<String>,
-        identity_claim: String,
-        claim_mapping: Option<String>,
-    ) -> Self {
-        Self {
-            subject,
-            provider,
-            issuer,
-            identity_claim,
-            claim_mapping,
-            token: None,
         }
     }
 }
@@ -530,24 +489,6 @@ pub(crate) const GATEWAY_KEY_HEADER: &str =
 pub(crate) const AUTHORIZATION_LABEL: &str = "Authorization";
 pub(crate) const X_API_KEY_HEADER: &str = "x-api-key";
 
-/// Whether the request OFFERS an inbound gateway credential at all.
-///
-/// Deliberately wider than [`header_credential`]: a present-but-unusable
-/// credential header — wrong scheme, empty value, bytes that are not
-/// ASCII — counts as offered. Anonymous entry (AISIX-Cloud#1313) is the
-/// no-credential path, so a caller that tried to authenticate and got
-/// it wrong must be rejected rather than quietly succeed as the
-/// anonymous principal with a different grant than it asked for.
-pub(crate) fn credential_offered(parts: &Parts) -> bool {
-    [
-        GATEWAY_KEY_HEADER,
-        axum::http::header::AUTHORIZATION.as_str(),
-        X_API_KEY_HEADER,
-    ]
-    .iter()
-    .any(|name| parts.headers.contains_key(*name))
-}
-
 /// Whether the caller's gateway credential came from [`GATEWAY_KEY_HEADER`]
 /// rather than `Authorization` / `x-api-key` — i.e. whether an
 /// `Authorization` on the request was NOT what the gateway admitted it with.
@@ -889,10 +830,6 @@ mod tests {
             extract_bearer(&parts_with(empty.clone())),
             Err(ProxyError::MissingAuth(_))
         ));
-        assert!(credential_offered(&parts_with(headers(&[(
-            "x-aisix-api-key",
-            "sk-gateway"
-        )]))));
         // Without it, Authorization still precedes x-api-key.
         let legacy = headers(&[
             ("authorization", "Bearer sk-auth"),
@@ -922,29 +859,6 @@ mod tests {
             extract_bearer(&parts),
             Err(ProxyError::MissingAuth(_))
         ));
-    }
-
-    #[test]
-    fn credential_offered_covers_unusable_credentials() {
-        // Absent → not offered: the anonymous path may serve these.
-        assert!(!credential_offered(&parts_with(HeaderMap::new())));
-
-        // Present but unusable → offered: must fail, never downgrade. An
-        // empty or whitespace-only value is one of those.
-        for name in [
-            GATEWAY_KEY_HEADER,
-            axum::http::header::AUTHORIZATION.as_str(),
-            X_API_KEY_HEADER,
-        ] {
-            for value in ["", "   ", "Bearer   ", "Basic dXNlcjpwdw==", "sk-abc"] {
-                let mut h = HeaderMap::new();
-                h.insert(name, HeaderValue::from_str(value).unwrap());
-                assert!(
-                    credential_offered(&parts_with(h)),
-                    "{name}: {value:?} must count as an offered credential"
-                );
-            }
-        }
     }
 
     #[test]

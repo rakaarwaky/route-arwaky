@@ -1751,38 +1751,62 @@ mod tests {
     }
 
     /// A 501 emits a zero-token event, and one reached after a mask carries
-    /// that attribution (#1083). Triggers the path
-    /// by routing /v1/completions at an Anthropic-backed model;
-    /// `AnthropicBridge` doesn't override `Bridge::complete()`, so the trait
-    /// default returns `UnsupportedCapability(TextCompletions)`, which maps to
-    /// 501.
+    /// that attribution (#1083). Triggers the path by routing /v1/completions
+    /// at a chat-only bridge. The bridge leaves `/v1/completions` to fall
+    /// through to the trait default's `UnsupportedCapability(TextCompletions)`,
+    /// which maps to 501.
+    struct CompletionsLessBridge;
+
+    #[async_trait::async_trait]
+    impl aisix_gateway::Bridge for CompletionsLessBridge {
+        fn name(&self) -> &'static str {
+            "completions-less"
+        }
+        async fn chat(
+            &self,
+            _req: &aisix_gateway::ChatFormat,
+            _ctx: &aisix_gateway::BridgeContext,
+        ) -> Result<aisix_gateway::ChatResponse, aisix_gateway::BridgeError> {
+            unreachable!("not exercised")
+        }
+        async fn chat_stream(
+            &self,
+            _req: &aisix_gateway::ChatFormat,
+            _ctx: &aisix_gateway::BridgeContext,
+        ) -> Result<aisix_gateway::ChatChunkStream, aisix_gateway::BridgeError> {
+            unreachable!("not exercised")
+        }
+    }
+
+    /// A ProviderKey/Model pair naming the completions-less bridge via its
+    /// specialized registration (no adapter family behind it).
+    fn unsupported_capability_snapshot() -> AisixSnapshot {
+        let pk: aisix_core::ProviderKey = serde_json::from_str(
+            r#"{"display_name":"chat-only-up","api_key":"sk-x-test","provider":"chat-only"}"#,
+        )
+        .unwrap();
+        let model: Model = serde_json::from_str(
+            r#"{"display_name":"claude-instruct","provider":"chat-only","model_name":"x-1","provider_key_id":"22222222-2222-2222-2222-222222222222"}"#,
+        )
+        .unwrap();
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(ResourceEntry::new("22222222-2222-2222-2222-222222222222", pk, 1));
+        snap.models.insert(ResourceEntry::new("m-chat-only", model, 1));
+        snap
+    }
+
     #[tokio::test]
     async fn provider_lacking_complete_emits_a_zero_token_event() {
         use aisix_obs::UsageSink;
-        use aisix_provider_anthropic::AnthropicBridge;
 
-        const ANTHROPIC_PK_ID: &str = "22222222-2222-2222-2222-222222222222";
-
-        let anthropic_pk_json = r#"{"display_name":"anthropic-up","api_key":"sk-ant-test","provider":"anthropic","adapter":"anthropic"}"#;
-        let anthropic_pk: aisix_core::ProviderKey =
-            serde_json::from_str(anthropic_pk_json).unwrap();
-        let anthropic_pk_entry = ResourceEntry::new(ANTHROPIC_PK_ID, anthropic_pk, 1);
-
-        let anthropic_model_json = format!(
-            r#"{{"display_name":"claude-instruct","provider":"anthropic","model_name":"claude-3-haiku-20240307","provider_key_id":"{ANTHROPIC_PK_ID}"}}"#
-        );
-        let anthropic_model: Model = serde_json::from_str(&anthropic_model_json).unwrap();
-        let anthropic_model_entry = ResourceEntry::new("m-anthropic", anthropic_model, 1);
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys.insert(anthropic_pk_entry);
-        snap.models.insert(anthropic_model_entry);
+        let snap = unsupported_capability_snapshot();
         snap.apikeys.insert(apikey_entry(&["*"]));
         crate::seed_env_scoped_guardrail(&snap, masking_input_guardrail());
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
-        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        hub.register_specialized("chat-only", Arc::new(CompletionsLessBridge));
         let handle = SnapshotHandle::new(snap);
         let state = crate::ProxyState::new(handle, hub, &cfg())
             .without_cache()
@@ -1796,7 +1820,7 @@ mod tests {
         assert_eq!(
             resp.status(),
             StatusCode::NOT_IMPLEMENTED,
-            "Anthropic-backed /v1/completions must surface as 501 \
+            "chat-only /v1/completions must surface as 501 \
              (default Bridge::complete returns BridgeError::Config)",
         );
 
@@ -1835,24 +1859,8 @@ mod tests {
     #[tokio::test]
     async fn a_fail_open_bypass_alone_keeps_the_unbilled_event_alive() {
         use aisix_obs::UsageSink;
-        use aisix_provider_anthropic::AnthropicBridge;
 
-        const ANTHROPIC_PK_ID: &str = "22222222-2222-2222-2222-222222222222";
-
-        let anthropic_pk: aisix_core::ProviderKey = serde_json::from_str(
-            r#"{"display_name":"anthropic-up","api_key":"sk-ant-test","provider":"anthropic","adapter":"anthropic"}"#,
-        )
-        .unwrap();
-        let anthropic_model: Model = serde_json::from_str(&format!(
-            r#"{{"display_name":"claude-instruct","provider":"anthropic","model_name":"claude-3-haiku-20240307","provider_key_id":"{ANTHROPIC_PK_ID}"}}"#
-        ))
-        .unwrap();
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys
-            .insert(ResourceEntry::new(ANTHROPIC_PK_ID, anthropic_pk, 1));
-        snap.models
-            .insert(ResourceEntry::new("m-anthropic", anthropic_model, 1));
+        let snap = unsupported_capability_snapshot();
         snap.apikeys.insert(apikey_entry(&["*"]));
         // Faults instead of deciding, input hook only.
         let row: aisix_core::Guardrail = serde_json::from_value(serde_json::json!({
@@ -1869,7 +1877,7 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
-        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        hub.register_specialized("chat-only", Arc::new(CompletionsLessBridge));
         let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
             .without_cache()
             .with_usage_sink(UsageSink::new(tx));

@@ -66,13 +66,6 @@ pub struct BudgetReason {
 }
 
 impl BudgetReason {
-    #[cfg(test)]
-    pub(crate) fn message_only(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            ..Default::default()
-        }
-    }
 
     fn gauges(&self) -> aisix_obs::BudgetGauges {
         let amount = |v: &Option<String>| v.as_deref().and_then(|s| s.parse::<f64>().ok());

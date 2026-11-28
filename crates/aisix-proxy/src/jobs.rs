@@ -28,11 +28,8 @@
 //! ## Provider coverage
 //!
 //! v1 targets adapter `openai` (any OpenAI-compatible `api_base`,
-//! including DeepSeek/xAI-style vendors) and `azure-openai`
-//! (resource-scoped `/openai/*` routes + `api-key` header). Vertex
-//! (GCS-staged) / Bedrock (S3-staged) / Anthropic native
-//! `/v1/messages/batches` are different wire+storage flows — tracked
-//! separately, rejected here with a clear 400.
+//! including DeepSeek/xAI-style vendors). Other adapters are different
+//! wire+storage flows — rejected here with a clear 400.
 //!
 //! ## Usage / cost attribution
 //!
@@ -71,14 +68,6 @@ use crate::state::ProxyState;
 
 /// Marker prefix for gateway-minted routed ids.
 const ROUTED_ID_PREFIX: &str = "aisix-";
-
-/// Azure OpenAI data-plane API version used for the resource-scoped
-/// jobs routes (`/openai/files`, `/openai/batches`,
-/// `/openai/fine_tuning/jobs`) when the Provider Key sets no
-/// `api_version`; callers can override per request via an explicit
-/// `api-version` query parameter. On the v1 route none is sent, a
-/// caller's own included.
-const AZURE_JOBS_API_VERSION: &str = "2024-10-21";
 
 /// Timeout for the background output-file download of the batch cost
 /// attribution task. Deliberately generous — completed batch output
@@ -168,7 +157,6 @@ impl JobTarget {
 fn supported_adapter(pk: &ProviderKey) -> Option<Adapter> {
     match pk.adapter {
         Some(Adapter::Openai) => Some(Adapter::Openai),
-        Some(Adapter::AzureOpenai) => Some(Adapter::AzureOpenai),
         _ => None,
     }
 }
@@ -246,8 +234,8 @@ pub(crate) fn resolve_target(
     let adapter = supported_adapter(&pk_entry.value).ok_or_else(|| {
         ProxyError::InvalidRequest(format!(
             "model {:?} uses provider {:?} which is not supported on the \
-             files/batches/fine-tuning surface yet (supported: OpenAI-compatible, \
-             Azure OpenAI)",
+             files/batches/fine-tuning surface yet (supported: \
+             OpenAI-compatible)",
             model.display_name, pk_entry.value.provider
         ))
     })?;
@@ -290,64 +278,9 @@ fn upstream_url(target: &JobTarget, path: &str, query: &str) -> Result<String, P
                 Ok(format!("{url}?{query}"))
             }
         }
-        Adapter::AzureOpenai => {
-            // Resource-scoped Azure route: {base}/openai{path}?api-version=…
-            // (files/batches/fine-tuning are not deployment-scoped).
-            let base = aisix_provider_azure_openai::AzureUpstreamRef::api_base_url(
-                target.pk_entry.value.api_base.as_deref(),
-            )
-            .map_err(ProxyError::Bridge)?;
-            let has_api_version = query
-                .split('&')
-                .any(|pair| pair.split('=').next() == Some("api-version"));
-            let mut url = azure_jobs_url(
-                &base,
-                target.pk_entry.value.api_version.as_deref(),
-                path,
-                has_api_version,
-            );
-            // The v1 route takes no api-version, the caller's included.
-            let query = if aisix_provider_azure_openai::dated_api_version(
-                target.pk_entry.value.api_version.as_deref(),
-                "",
-            )
-            .is_none()
-            {
-                query
-                    .split('&')
-                    .filter(|pair| pair.split('=').next() != Some("api-version"))
-                    .collect::<Vec<_>>()
-                    .join("&")
-            } else {
-                query.to_string()
-            };
-            if !query.is_empty() {
-                url.push(if url.contains('?') { '&' } else { '?' });
-                url.push_str(&query);
-            }
-            Ok(url)
-        }
-        // resolve_target only admits the two adapters above.
-        _ => unreachable!("unsupported adapter reached upstream_url"),
     }
 }
 
-/// The Azure jobs URL for `path`, before the client's query: the dated
-/// route `{base}/openai{path}?api-version=…` (the key's `api_version`, else
-/// [`AZURE_JOBS_API_VERSION`]; left off when the client sent its own), or
-/// the v1 route `{base}/openai/v1{path}` with none.
-fn azure_jobs_url(
-    base: &str,
-    api_version: Option<&str>,
-    path: &str,
-    client_sent_api_version: bool,
-) -> String {
-    match aisix_provider_azure_openai::dated_api_version(api_version, AZURE_JOBS_API_VERSION) {
-        Some(_) if client_sent_api_version => format!("{base}/openai{path}"),
-        Some(version) => format!("{base}/openai{path}?api-version={version}"),
-        None => format!("{base}/openai/v1{path}"),
-    }
-}
 
 /// Client query pairs forwarded upstream — routing hints are gateway-only.
 fn forwardable_query(raw_query: Option<&str>) -> String {
@@ -393,23 +326,8 @@ async fn send_upstream(
     // is what keeps a colliding operator header from putting two values of
     // e.g. `x-aisix-request-id` on the wire.
     let mut headers = HeaderMap::new();
-    match target.adapter {
-        // An Entra ID client-credentials secret is exchanged for a bearer
-        // token, as on every other Azure route; a resource key goes out as
-        // `api-key`.
-        Adapter::AzureOpenai => {
-            let credential = aisix_provider_azure_openai::resolve_credential(&target.secret)
-                .await
-                .map_err(ProxyError::Bridge)?;
-            let (name, value) = aisix_provider_azure_openai::auth_header(&credential)
-                .map_err(ProxyError::Bridge)?;
-            headers.insert(name, value);
-        }
-        _ => {
-            if let Ok(v) = axum::http::HeaderValue::from_str(&format!("Bearer {}", target.secret)) {
-                headers.insert(header::AUTHORIZATION, v);
-            }
-        }
+    if let Ok(v) = axum::http::HeaderValue::from_str(&format!("Bearer {}", target.secret)) {
+        headers.insert(header::AUTHORIZATION, v);
     }
     if let Ok(v) = axum::http::HeaderValue::from_str(request_id) {
         headers.insert(axum::http::HeaderName::from_static("x-aisix-request-id"), v);
@@ -2074,7 +1992,6 @@ fn maybe_attribute_batch(
     let display_name = target.display_name().to_string();
     let pk_id = target.pk_entry.id.to_string();
     let secret = target.secret.clone();
-    let adapter = target.adapter;
     let pk_entry = target.pk_entry.clone();
     let pk_conn = target.pk_entry.value.upstream_connection();
     let raw_batch_id = raw_batch_id.to_string();
@@ -2091,7 +2008,6 @@ fn maybe_attribute_batch(
             &display_name,
             &pk_id,
             &secret,
-            adapter,
             &pk_entry.value,
             pk_conn.as_ref(),
             &raw_batch_id,
@@ -2125,45 +2041,19 @@ async fn attribute_batch_usage(
     display_name: &str,
     pk_id: &str,
     secret: &str,
-    adapter: Adapter,
     provider_key: &ProviderKey,
     conn: Option<&aisix_core::models::provider_key::UpstreamConnection>,
     raw_batch_id: &str,
     output_file_id: &str,
 ) -> Result<(), String> {
-    let url = match adapter {
-        Adapter::AzureOpenai => {
-            let base = aisix_provider_azure_openai::AzureUpstreamRef::api_base_url(
-                provider_key.api_base.as_deref(),
-            )
-            .map_err(|e| e.to_string())?;
-            azure_jobs_url(
-                &base,
-                provider_key.api_version.as_deref(),
-                &format!("/files/{output_file_id}/content"),
-                false,
-            )
-        }
-        _ => {
-            let base =
-                crate::dispatch::resolve_base_url(provider_key).map_err(|e| e.to_string())?;
-            crate::dispatch::build_openai_url(&base, &format!("/files/{output_file_id}/content"))
-        }
+    let url = {
+        let base = crate::dispatch::resolve_base_url(provider_key).map_err(|e| e.to_string())?;
+        crate::dispatch::build_openai_url(&base, &format!("/files/{output_file_id}/content"))
     };
 
     let client = crate::http_client::client_for(conn);
     let mut builder = client.get(&url).timeout(BATCH_ATTRIBUTION_TIMEOUT);
-    builder = match adapter {
-        Adapter::AzureOpenai => {
-            let credential = aisix_provider_azure_openai::resolve_credential(secret)
-                .await
-                .map_err(|e| e.to_string())?;
-            let (name, value) =
-                aisix_provider_azure_openai::auth_header(&credential).map_err(|e| e.to_string())?;
-            builder.header(name, value)
-        }
-        _ => builder.header(header::AUTHORIZATION, format!("Bearer {secret}")),
-    };
+    builder = builder.header(header::AUTHORIZATION, format!("Bearer {secret}"));
     let resp = builder
         .send()
         .await
@@ -2322,7 +2212,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use std::sync::Arc;
     use tower::ServiceExt;
-    use wiremock::matchers::{method as wm_method, path, query_param};
+    use wiremock::matchers::{method as wm_method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn cfg() -> ProxyConfig {
@@ -2351,17 +2241,10 @@ mod tests {
         ResourceEntry::new(id, pk, 1)
     }
 
-    fn azure_pk(id: &str, api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+    /// A ProviderKey with no `adapter` cannot serve the jobs surface.
+    fn unsupported_pk(id: &str, api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"pk-az","api_key":"az-secret","api_base":"{api_base}","provider":"azure-openai","adapter":"azure-openai"}}"#
-        );
-        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
-        ResourceEntry::new(id, pk, 1)
-    }
-
-    fn anthropic_pk(id: &str, api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
-        let json = format!(
-            r#"{{"display_name":"pk-ant","api_key":"sk-ant","api_base":"{api_base}","provider":"anthropic","adapter":"anthropic"}}"#
+            r#"{{"display_name":"pk-{id}","api_key":"sk-x","api_base":"{api_base}","provider":"other"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(id, pk, 1)
@@ -2688,102 +2571,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn azure_jobs_url_follows_the_key_api_version() {
-        let b = "https://acme.openai.azure.com";
-        assert_eq!(
-            azure_jobs_url(b, None, "/files", false),
-            format!("{b}/openai/files?api-version={AZURE_JOBS_API_VERSION}")
-        );
-        assert_eq!(
-            azure_jobs_url(b, Some("2025-03-01-preview"), "/batches", false),
-            format!("{b}/openai/batches?api-version=2025-03-01-preview")
-        );
-        // The client's own api-version is the one sent.
-        assert_eq!(
-            azure_jobs_url(b, Some("2025-03-01-preview"), "/batches", true),
-            format!("{b}/openai/batches")
-        );
-        for v in ["v1", "preview", "latest"] {
-            assert_eq!(
-                azure_jobs_url(b, Some(v), "/fine_tuning/jobs", false),
-                format!("{b}/openai/v1/fine_tuning/jobs")
-            );
-        }
-    }
-
-    /// The detached output download for cost attribution takes the same
-    /// route as the request that observed the batch complete.
-    #[tokio::test]
-    async fn azure_v1_batch_attribution_downloads_on_the_v1_route() {
-        let upstream = MockServer::builder().start().await;
-        Mock::given(wm_method("GET"))
-            .and(path("/openai/v1/batches/batch_1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "batch_1",
-                "object": "batch",
-                "status": "completed",
-                "input_file_id": "file-in",
-                "output_file_id": "file-out"
-            })))
-            .mount(&upstream)
-            .await;
-        let line = serde_json::json!({
-            "id": "batch_req_1",
-            "custom_id": "r1",
-            "response": {"status_code": 200, "body": {
-                "model": "gpt-4o",
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5}
-            }}
-        });
-        Mock::given(wm_method("GET"))
-            .and(path("/openai/v1/files/file-out/content"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_raw(format!("{line}\n"), "application/jsonl"),
-            )
-            .mount(&upstream)
-            .await;
-
-        let snap = AisixSnapshot::new();
-        let mut pk = azure_pk(PK_A, &upstream.uri());
-        pk.value.api_version = Some("v1".into());
-        snap.provider_keys.insert(pk);
-        snap.models.insert(model("m-a", "jobs-az", PK_A));
-        snap.apikeys.insert(apikey_entry(&["*"]));
-        let (app, mut rx) = build_app_with_sink(snap);
-
-        let encoded = encode_routed_id("batch_1", "jobs-az");
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri(format!("/v1/batches/{encoded}"))
-                    .header("authorization", "Bearer sk-caller")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let mut batch_event = false;
-        for _ in 0..2 {
-            let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-                .await
-                .expect("expected a usage event")
-                .expect("sink closed");
-            batch_event |= ev.inbound_protocol == "batch";
-        }
-        assert!(
-            batch_event,
-            "the attribution download must reach the v1 route"
-        );
-        for req in upstream.received_requests().await.unwrap() {
-            assert_eq!(req.url.query(), None, "v1 route carries no api-version");
-            assert_eq!(req.headers.get("api-key").unwrap(), "az-secret");
-        }
-    }
-
     #[tokio::test]
     async fn batch_attribution_downloads_from_the_base_the_retrieve_used() {
         let upstream = MockServer::builder().start().await;
@@ -3034,90 +2821,6 @@ mod tests {
         );
     }
 
-    // ---- azure ----
-
-    #[tokio::test]
-    async fn azure_adapter_uses_api_key_header_and_resource_scoped_path() {
-        let upstream = MockServer::builder().start().await;
-        Mock::given(wm_method("GET"))
-            .and(path("/openai/batches/batch_az"))
-            .and(query_param("api-version", AZURE_JOBS_API_VERSION))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "batch_az",
-                "object": "batch",
-                "status": "in_progress"
-            })))
-            .mount(&upstream)
-            .await;
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys.insert(azure_pk(PK_A, &upstream.uri()));
-        let m_json = format!(
-            r#"{{"display_name":"jobs-az","provider":"azure-openai","model_name":"gpt-4o","provider_key_id":"{PK_A}"}}"#
-        );
-        let m: Model = serde_json::from_str(&m_json).unwrap();
-        snap.models.insert(ResourceEntry::new("m-az", m, 1));
-        snap.apikeys.insert(apikey_entry(&["*"]));
-        let app = build_app(snap);
-
-        let encoded = encode_routed_id("batch_az", "jobs-az");
-        let req = Request::builder()
-            .method("GET")
-            .uri(format!("/v1/batches/{encoded}"))
-            .header("authorization", "Bearer sk-caller")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let received = upstream.received_requests().await.unwrap();
-        assert_eq!(received.len(), 1);
-        assert_eq!(
-            received[0]
-                .headers
-                .get("api-key")
-                .and_then(|v| v.to_str().ok()),
-            Some("az-secret"),
-            "azure auth is the api-key header"
-        );
-        assert!(
-            !received[0].headers.contains_key("authorization"),
-            "no Bearer header on the azure wire"
-        );
-    }
-
-    #[tokio::test]
-    async fn azure_v1_key_sends_no_api_version_not_even_the_callers() {
-        let upstream = MockServer::builder().start().await;
-        Mock::given(wm_method("GET"))
-            .and(path("/openai/v1/files"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"object": "list", "data": []})),
-            )
-            .mount(&upstream)
-            .await;
-
-        let snap = AisixSnapshot::new();
-        let mut pk = azure_pk(PK_A, &upstream.uri());
-        pk.value.api_version = Some("v1".into());
-        snap.provider_keys.insert(pk);
-        snap.models.insert(model("m-az", "jobs-az", PK_A));
-        snap.apikeys.insert(apikey_entry(&["*"]));
-        let app = build_app(snap);
-
-        let req = Request::builder()
-            .method("GET")
-            .uri("/v1/files?model=jobs-az&api-version=2024-10-21&limit=2")
-            .header("authorization", "Bearer sk-caller")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let received = upstream.received_requests().await.unwrap();
-        assert_eq!(received.len(), 1);
-        assert_eq!(received[0].url.query(), Some("limit=2"));
-    }
 
     // ---- guards ----
 
@@ -3125,7 +2828,7 @@ mod tests {
     async fn unsupported_adapter_is_rejected_with_400() {
         let snap = AisixSnapshot::new();
         snap.provider_keys
-            .insert(anthropic_pk(PK_A, "http://unused"));
+            .insert(unsupported_pk(PK_A, "http://unused"));
         let m_json = format!(
             r#"{{"display_name":"claude","provider":"anthropic","model_name":"claude-3-5-haiku-20241022","provider_key_id":"{PK_A}"}}"#
         );
@@ -3177,7 +2880,7 @@ mod tests {
         // fail with the actionable message, not a panic or 404.
         let snap = AisixSnapshot::new();
         snap.provider_keys
-            .insert(anthropic_pk(PK_A, "http://unused"));
+            .insert(unsupported_pk(PK_A, "http://unused"));
         let m_json = format!(
             r#"{{"display_name":"claude","provider":"anthropic","model_name":"claude-3-5-haiku-20241022","provider_key_id":"{PK_A}"}}"#
         );

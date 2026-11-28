@@ -521,17 +521,14 @@ async fn dispatch(
             async move {
                 let model = &target.model;
 
-                // Per #168's reasoning on generations: only OpenAI's API and Azure
-                // OpenAI serve the `/v1/images/edits` route + form shape. Routing
-                // another provider here would dispatch to an upstream that 404s —
-                // reject explicitly at the gateway boundary instead. Cross-provider
-                // editing wires (Gemini / Vertex / BFL) are the AISIX-Cloud#1360
-                // Phase 2 follow-up.
-                let azure = crate::dispatch::references_azure_key(snapshot, model);
-                if model.provider.as_deref() != Some("openai") && !azure {
+                // Per #168's reasoning on generations: only OpenAI's API serves
+                // the `/v1/images/edits` route + form shape. Routing another
+                // provider here would dispatch to an upstream that 404s — reject
+                // explicitly at the gateway boundary instead.
+                if model.provider.as_deref() != Some("openai") {
                     return Err(ProxyError::InvalidRequest(format!(
                         "{} is not an OpenAI provider; \
-                         /v1/images/edits requires OpenAI or Azure OpenAI",
+                         /v1/images/edits requires OpenAI",
                         crate::routing::refused_model_label(model_name, model)
                     )));
                 }
@@ -541,22 +538,7 @@ async fn dispatch(
                 let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
                 let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
 
-                let (url, auth) = if azure {
-                    crate::dispatch::azure_upstream(
-                        &pk_entry,
-                        &upstream_model,
-                        aisix_provider_azure_openai::AzureOperation::ImageEdits,
-                    )
-                    .await
-                    .map_err(|e| {
-                        ProxyError::Bridge(crate::cooldown::note_failure(
-                            &state.runtime_status,
-                            &target.id,
-                            model.cooldown.as_ref(),
-                            e,
-                        ))
-                    })?
-                } else {
+                let (url, auth) = {
                     let url = aisix_gateway::url_cache::cached_endpoint_url(
                         &pk_entry.id,
                         "proxy/images/edits",
@@ -583,11 +565,6 @@ async fn dispatch(
                         })?;
                     (url, (header::AUTHORIZATION, auth_hv))
                 };
-                // Azure's deployment route names the deployment in the URL and
-                // takes no `model` field; everywhere else it is the upstream id.
-                let send_model = !azure
-                    || aisix_provider_azure_openai::AzureOperation::ImageEdits
-                        .sends_body_model(&pk_entry.value);
                 let provider_label = provider.to_ascii_lowercase();
 
                 // Rebuild the multipart form with `model` rewritten. A `multipart::Form`
@@ -597,9 +574,6 @@ async fn dispatch(
                 let build_form = || {
                     let mut form = multipart::Form::new();
                     for (name, file_name, content_type, data) in fields {
-                        if name == "model" && !send_model {
-                            continue;
-                        }
                         let field_data = if name == "model" {
                             Bytes::copy_from_slice(upstream_model.as_bytes())
                         } else {
@@ -690,7 +664,7 @@ async fn dispatch(
                                 tracker,
                                 model_id,
                                 cooldown_cfg,
-                                crate::dispatch::held_route_http_error(azure, resp).await,
+                                crate::dispatch::held_route_http_error(resp).await,
                             ));
                         }
                         let body_bytes = resp.bytes().await.map_err(|e| {
@@ -1289,7 +1263,7 @@ mod tests {
         assert_eq!(
             v["error"]["message"],
             "request payload is invalid: model `mixed-group` (target `claude-img`) \
-             is not an OpenAI provider; /v1/images/edits requires OpenAI or Azure OpenAI"
+             is not an OpenAI provider; /v1/images/edits requires OpenAI"
         );
     }
 

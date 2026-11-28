@@ -11,12 +11,11 @@
 //!
 //! v1 relays the **OpenAI Realtime wire protocol**: adapter `openai`
 //! (api.openai.com and any OpenAI-compatible `api_base`, which covers
-//! xAI-style vendors) and `azure-openai` (`{base}/openai/realtime
-//! ?api-version=…&deployment=…`, `api-key` header). Gemini Live / AWS
-//! Bedrock speak entirely different session/event models and need a
-//! cross-protocol translation layer (LiteLLM ships those as dedicated
-//! per-provider `transform_realtime_request/response` modules) — that is
-//! a separate feature, not part of this endpoint.
+//! xAI-style vendors). Gemini Live / AWS Bedrock speak entirely
+//! different session/event models and need a cross-protocol translation
+//! layer (LiteLLM ships those as dedicated per-provider
+//! `transform_realtime_request/response` modules) — that is a separate
+//! feature, not part of this endpoint.
 //!
 //! OpenAI's Realtime API is GA and its GA endpoint **rejects**
 //! `openai-beta: realtime=v1` (`beta_api_shape_disabled`), so the
@@ -82,10 +81,6 @@ use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
 use crate::state::ProxyState;
 use aisix_gateway::BridgeError;
-
-/// Azure Realtime api-version when the Provider Key sets no `api_version`
-/// (see the jobs surface twin constant).
-const AZURE_REALTIME_API_VERSION: &str = "2024-10-01-preview";
 
 /// Subprotocol item carrying the caller's API key in the browser flow.
 const SUBPROTOCOL_KEY_PREFIX: &str = "openai-insecure-api-key.";
@@ -784,45 +779,10 @@ async fn prepare(
             }
             req
         }
-        Some(Adapter::AzureOpenai) => {
-            let base = aisix_provider_azure_openai::AzureUpstreamRef::api_base_url(
-                pk_entry.value.api_base.as_deref(),
-            )
-            .map_err(ProxyError::Bridge)?;
-            // The v1 route names the deployment as `model` and takes no
-            // api-version; the dated route names it as `deployment`.
-            let url = match aisix_provider_azure_openai::dated_api_version(
-                pk_entry.value.api_version.as_deref(),
-                AZURE_REALTIME_API_VERSION,
-            ) {
-                Some(version) => format!(
-                    "{}/openai/realtime?api-version={version}&deployment={}",
-                    to_ws_scheme(&base)?,
-                    urlencode(&upstream_model)
-                ),
-                None => format!(
-                    "{}/openai/v1/realtime?model={}",
-                    to_ws_scheme(&base)?,
-                    urlencode(&upstream_model)
-                ),
-            };
-            let mut req = url.into_client_request().map_err(|e| {
-                ProxyError::InvalidRequest(format!("invalid upstream realtime URL: {e}"))
-            })?;
-            // A resource key goes out as `api-key`; an Entra ID
-            // client-credentials secret is exchanged for a bearer token.
-            let credential = aisix_provider_azure_openai::resolve_credential(&secret)
-                .await
-                .map_err(ProxyError::Bridge)?;
-            let (name, value) = aisix_provider_azure_openai::auth_header(&credential)
-                .map_err(ProxyError::Bridge)?;
-            req.headers_mut().insert(name, value);
-            req
-        }
         _ => {
             return Err(ProxyError::InvalidRequest(format!(
                 "model {requested_model:?} uses provider {:?} which does not speak the OpenAI \
-                 Realtime protocol; /v1/realtime supports OpenAI-compatible and Azure OpenAI \
+                 Realtime protocol; /v1/realtime supports OpenAI-compatible \
                  providers",
                 pk_entry.value.provider
             )));
@@ -3004,7 +2964,14 @@ mod tests {
 
     #[tokio::test]
     async fn non_realtime_capable_adapter_is_rejected() {
-        let snap = snapshot("http://127.0.0.1:9", "anthropic", "anthropic");
+        // A ProviderKey with no `adapter` cannot serve realtime: the only
+        // adapter left is `openai`, and the handshake must reject the key
+        // outright rather than dispatch it anywhere.
+        let snap = snapshot("http://127.0.0.1:9", "openai", "openai");
+        let pk_json =
+            r#"{"display_name":"rt-pk","api_key":"sk-up","api_base":"http://127.0.0.1:9","provider":"other"}"#;
+        let pk: aisix_core::ProviderKey = serde_json::from_str(pk_json).unwrap();
+        snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 2));
         let (addr, _state, _rx) = serve(snap).await;
 
         let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")

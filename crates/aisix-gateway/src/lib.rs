@@ -27,14 +27,11 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
-#[cfg(feature = "aws")]
-pub mod aws_auth;
 pub mod bridge;
 pub mod chat;
 pub mod content_part;
 pub mod credential;
 pub mod dns_cache;
-pub mod gemini;
 pub mod hub;
 pub mod media_fetch;
 pub mod response_tap;
@@ -54,7 +51,7 @@ pub use bridge::{
     in_band_error_reported, parse_retry_after, read_body_capped, response_is_json, truncate_lossy,
     upstream_error_message, upstream_error_within, upstream_status_of_body,
     upstream_status_parsed_from_response, Bridge, BridgeCapability, BridgeContext, BridgeError,
-    ChatChunkStream, NativeMessages, UpstreamErrorBody, UpstreamErrorView, UpstreamWire,
+    ChatChunkStream, UpstreamErrorBody, UpstreamErrorView, UpstreamWire,
     MAX_UPSTREAM_ERROR_BODY_BYTES, MAX_UPSTREAM_ERROR_MESSAGE_BYTES,
 };
 pub use chat::{
@@ -74,7 +71,7 @@ pub use sse::{SseDecoder, SseEvent, SseFrameTooLarge};
 pub use structured_output::{
     apply_schema_limits, close_object_schemas, json_schema_from_response_format,
     response_into_fake_stream_chunks, seal_object_schemas, unwrap_json_tool_call, SchemaLimits,
-    ANTHROPIC_SCHEMA_LIMITS, GEMINI_OPENAPI_SCHEMA_LIMITS, JSON_TOOL_DESCRIPTION, JSON_TOOL_NAME,
+    JSON_TOOL_DESCRIPTION, JSON_TOOL_NAME,
 };
 pub use upstream_headers::{
     apply_request_headers, client_header_forwardable, header_forward_blocked,

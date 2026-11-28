@@ -8,7 +8,6 @@ use aisix_core::resource::ResourceEntry;
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AisixSnapshot, ApiKey, Model, ProviderKey, ProxyConfig};
 use aisix_gateway::Hub;
-use aisix_provider_anthropic::AnthropicBridge;
 use aisix_provider_openai::OpenAiBridge;
 use aisix_proxy::{build_router, ProxyState};
 use axum::body::{to_bytes, Body};
@@ -27,28 +26,6 @@ struct Endpoint {
     upstream_model: &'static str,
     body: &'static str,
     response: Value,
-}
-
-fn messages() -> Endpoint {
-    Endpoint {
-        path: "/v1/messages",
-        provider: "anthropic",
-        upstream_model: "claude-sonnet-4-5",
-        body: r#"{"max_tokens":64,"messages":[{"content":"quote: \"; backslash: \\; newline: \n; Unicode: 猫","role":"user"}],"metadata":{"model":"nested-model"},"model":"client-model","stream":false}"#,
-        response: json!({
-            "id": "msg_test", "type": "message", "role": "assistant",
-            "model": "claude-sonnet-4-5", "content": [{"type": "text", "text": "ok"}],
-            "stop_reason": "end_turn", "usage": {"input_tokens": 2, "output_tokens": 1}
-        }),
-    }
-}
-
-fn count_tokens() -> Endpoint {
-    Endpoint {
-        path: "/v1/messages/count_tokens",
-        response: json!({"input_tokens": 2}),
-        ..messages()
-    }
 }
 
 fn rerank() -> Endpoint {
@@ -129,7 +106,6 @@ async fn forward(endpoint: &Endpoint, body: &str, overrides: Value) -> String {
         .insert(ResourceEntry::new("caller", key, 1));
     let hub = Arc::new(Hub::new());
     hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
-    hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
     let config = ProxyConfig {
         addr: "127.0.0.1:0".into(),
         request_body_limit_bytes: 1024 * 1024,
@@ -209,17 +185,6 @@ async fn preserves_wire_and_overrides(endpoint: Endpoint) {
         endpoint.path
     );
 }
-
-#[tokio::test]
-async fn messages_preserves_model_only_wire_and_body_overrides() {
-    preserves_wire_and_overrides(messages()).await;
-}
-
-#[tokio::test]
-async fn count_tokens_preserves_model_only_wire_and_body_overrides() {
-    preserves_wire_and_overrides(count_tokens()).await;
-}
-
 #[tokio::test]
 async fn rerank_preserves_model_only_wire_and_body_overrides() {
     preserves_wire_and_overrides(rerank()).await;
@@ -234,16 +199,6 @@ async fn speech_preserves_model_only_wire_and_body_overrides() {
 async fn responses_preserves_model_only_wire_and_body_overrides() {
     preserves_wire_and_overrides(responses()).await;
 }
-
-async fn assert_signed_tool_ids_stripped(endpoint: Endpoint) {
-    let body = r#"{"max_tokens":64,"messages":[{"content":[{"id":"call_1__thought__eHl6","input":{"id":"argument__thought__keep"},"name":"lookup","type":"tool_use"}],"role":"assistant"},{"content":[{"content":"done","tool_use_id":"call_1__thought__eHl6","type":"tool_result"}],"role":"user"}],"model":"client-model"}"#;
-    let received = forward(&endpoint, body, json!({})).await;
-    let expected = body
-        .replace("call_1__thought__eHl6", "call_1")
-        .replace(MODEL_ALIAS, endpoint.upstream_model);
-    assert_eq!(received, expected, "{} signed tool ids", endpoint.path);
-}
-
 #[tokio::test]
 async fn responses_strips_signed_call_ids_without_touching_tool_arguments() {
     let body = r#"{"input":[{"arguments":"{\"call_id\":\"argument__thought__keep\"}","call_id":"call_1__thought__eHl6","name":"lookup","type":"function_call"},{"call_id":"call_1__thought__eHl6","output":"done","type":"function_call_output"}],"model":"client-model"}"#;
@@ -253,14 +208,4 @@ async fn responses_strips_signed_call_ids_without_touching_tool_arguments() {
         .replace("call_1__thought__eHl6", "call_1")
         .replace(MODEL_ALIAS, endpoint.upstream_model);
     assert_eq!(received, expected, "{} signed call ids", endpoint.path);
-}
-
-#[tokio::test]
-async fn messages_strips_signed_tool_ids_without_touching_tool_arguments() {
-    assert_signed_tool_ids_stripped(messages()).await;
-}
-
-#[tokio::test]
-async fn count_tokens_strips_signed_tool_ids_without_touching_tool_arguments() {
-    assert_signed_tool_ids_stripped(count_tokens()).await;
 }

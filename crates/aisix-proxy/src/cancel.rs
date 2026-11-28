@@ -122,10 +122,7 @@ impl Phase {
 /// fields empty; what it cannot do is file an UNATTRIBUTABLE one, because
 /// the api_key is resolved before the body is read. An unauthenticated path
 /// — the health and discovery routes, a rejected credential — stays silent,
-/// where the pre-dispatch rejections in [`crate::reject`] already sit. So
-/// does a route that declared itself unmetered
-/// ([`CancelContext::unmetered`]), which it must do whenever it files no row
-/// at any outcome yet shares a label with a metering sibling.
+/// where the pre-dispatch rejections in [`crate::reject`] already sit.
 pub(crate) fn emit(
     state: &ProxyState,
     endpoint: &'static str,
@@ -148,7 +145,7 @@ pub(crate) fn emit(
     else {
         return;
     };
-    if ctx.api_key_id.is_empty() || ctx.unmetered {
+    if ctx.api_key_id.is_empty() {
         return;
     }
     // The passthrough routes resolve their principal without this

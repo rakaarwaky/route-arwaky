@@ -56,12 +56,6 @@ pub(crate) fn outbound_json<T: serde::Serialize + ?Sized>(
     })
 }
 
-/// The outbound request as text, for content capture: the wire bytes are
-/// exactly what `serde_json::to_string` of the body would produce.
-pub(crate) fn outbound_text(outbound: &[u8]) -> String {
-    String::from_utf8_lossy(outbound).into_owned()
-}
-
 /// The outbound request as a `Value`, rebuilt from its wire bytes for a
 /// reader that runs after the upstream has answered.
 pub(crate) fn outbound_value(outbound: &[u8]) -> serde_json::Value {

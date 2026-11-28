@@ -978,34 +978,6 @@ impl ModalityTokens {
         }
     }
 
-    /// Read Gemini's `promptTokensDetails` / `candidatesTokensDetails`
-    /// arrays of `{modality, tokenCount}`; a modality entry without a count
-    /// reports `0`.
-    pub fn from_gemini_details(
-        prompt: Option<&serde_json::Value>,
-        candidates: Option<&serde_json::Value>,
-    ) -> Self {
-        let count = |details: Option<&serde_json::Value>, modality: &str| {
-            details?
-                .as_array()?
-                .iter()
-                .filter(|d| d.get("modality").and_then(serde_json::Value::as_str) == Some(modality))
-                .map(|d| {
-                    d.get("tokenCount")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0)
-                })
-                .reduce(|a, b| a.saturating_add(b))
-                .map(|n| n.min(u64::from(u32::MAX)) as u32)
-        };
-        Self {
-            prompt_audio_tokens: count(prompt, "AUDIO"),
-            prompt_image_tokens: count(prompt, "IMAGE"),
-            completion_audio_tokens: count(candidates, "AUDIO"),
-            completion_image_tokens: count(candidates, "IMAGE"),
-        }
-    }
-
     /// Field-wise sum, `None` only where neither side reported.
     pub fn saturating_add(&self, other: &Self) -> Self {
         fn add(a: Option<u32>, b: Option<u32>) -> Option<u32> {
@@ -1473,16 +1445,6 @@ pub fn gemini_header_service_tier(headers: &http::HeaderMap) -> Option<ServiceTi
             .get(GEMINI_SERVICE_TIER_HEADER)
             .and_then(|v| v.to_str().ok())
             .map(|v| v.trim().to_owned()),
-    )
-}
-
-/// Gemini `usageMetadata.serviceTier`, verbatim; an `unspecified` value (in
-/// any spelling, `SERVICE_TIER_UNSPECIFIED` included) reports nothing.
-pub fn gemini_usage_service_tier(value: Option<&str>) -> Option<ServiceTier> {
-    ServiceTier::native(
-        value
-            .filter(|v| !v.to_ascii_lowercase().ends_with("unspecified"))
-            .map(str::to_owned),
     )
 }
 

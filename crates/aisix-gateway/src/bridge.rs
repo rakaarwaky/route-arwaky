@@ -45,17 +45,6 @@ pub const MAX_UPSTREAM_ERROR_MESSAGE_BYTES: usize = 1024;
 pub enum UpstreamWire {
     /// OpenAI-compatible envelope: `{error:{message,type,code,param}}`.
     OpenAI,
-    /// Anthropic envelope: `{type:"error",error:{type,message}}`.
-    Anthropic,
-    /// Azure OpenAI envelope: OpenAI-like with `error.inner_error.code`
-    /// quirks for content policy violations.
-    AzureOpenAI,
-    /// AWS Bedrock structured error from the strongly-typed SDK; `kind`
-    /// carries the AWS exception code (e.g. `"ThrottlingException"`).
-    Bedrock,
-    /// Vertex AI envelope: `{error:{code:int,message,status}}` where
-    /// `status` is the canonical gRPC code string.
-    Vertex,
     /// Wire format unknown / not applicable (tests, synthesised errors,
     /// the legacy convenience constructors). Renders as the generic
     /// `upstream_error` envelope with no translation attempt.
@@ -314,9 +303,6 @@ pub enum BridgeCapability {
     TextCompletions,
     /// [`Bridge::generate_image`] — `/v1/images/generations`.
     ImageGeneration,
-    /// [`Bridge::anthropic_messages`] and [`Bridge::anthropic_count_tokens`]
-    /// — `/v1/messages` served on the platform's own Claude routes.
-    AnthropicMessages,
 }
 
 impl BridgeCapability {
@@ -326,7 +312,6 @@ impl BridgeCapability {
             Self::Embeddings => "embeddings",
             Self::TextCompletions => "text completions",
             Self::ImageGeneration => "image generation",
-            Self::AnthropicMessages => "Anthropic messages",
         }
     }
 }
@@ -1116,18 +1101,6 @@ impl BridgeError {
 /// (the Hub holds `Arc<dyn Bridge>` values).
 pub type ChatChunkStream = BoxStream<'static, Result<ChatChunk, BridgeError>>;
 
-/// What a platform answered an Anthropic Messages request with, in the
-/// Anthropic Messages wire itself.
-pub enum NativeMessages {
-    /// The Messages response object.
-    Json(serde_json::Value),
-    /// Anthropic SSE frames (`event:` + `data:` + blank line), each item
-    /// one or more whole frames. A failure inside the committed stream
-    /// arrives as an Anthropic `error` frame; an `Err` item is a transport
-    /// failure the bridge could not express as one.
-    Stream(BoxStream<'static, Result<bytes::Bytes, BridgeError>>),
-}
-
 /// The provider-agnostic chat operation. Implementors live in the
 /// individual `aisix-provider-*` crates.
 #[async_trait]
@@ -1256,39 +1229,6 @@ pub trait Bridge: Send + Sync + 'static {
         ))
     }
 
-    /// Whether `upstream_model` is a Claude model this platform serves on
-    /// its own Anthropic Messages routes, so `/v1/messages` reaches it
-    /// through [`Bridge::anthropic_messages`] rather than the chat
-    /// translation.
-    fn serves_anthropic_messages(&self, _upstream_model: &str) -> bool {
-        false
-    }
-
-    /// An Anthropic Messages body sent to the platform's own Claude route
-    /// and answered in the same wire. `body` is the caller's request with
-    /// the gateway's own rewrites applied; the bridge adapts it to what the
-    /// platform accepts. `body.stream` picks the streaming route.
-    async fn anthropic_messages(
-        &self,
-        _body: serde_json::Value,
-        _ctx: &BridgeContext,
-    ) -> Result<NativeMessages, BridgeError> {
-        Err(BridgeError::UnsupportedCapability(
-            BridgeCapability::AnthropicMessages,
-        ))
-    }
-
-    /// `/v1/messages/count_tokens` on the platform's own token-counting
-    /// API, answered as Anthropic's `{"input_tokens": N}`.
-    async fn anthropic_count_tokens(
-        &self,
-        _body: serde_json::Value,
-        _ctx: &BridgeContext,
-    ) -> Result<serde_json::Value, BridgeError> {
-        Err(BridgeError::UnsupportedCapability(
-            BridgeCapability::AnthropicMessages,
-        ))
-    }
 }
 
 #[cfg(test)]
@@ -1503,24 +1443,6 @@ mod tests {
                 assert_eq!(view.kind.as_deref(), Some("server_error"));
                 assert_eq!(view.code.as_deref(), Some("overloaded"));
                 assert!(matches!(wire, UpstreamWire::OpenAI));
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn in_band_probe_parses_google_numeric_code_and_grpc_status() {
-        let e = capture_in_band_error(
-            r#"{"error":{"code":503,"message":"The service is currently unavailable.","status":"UNAVAILABLE"}}"#,
-            UpstreamWire::Vertex,
-        )
-        .expect("google error shape must be captured");
-        match e {
-            BridgeError::UpstreamInBand { status, parsed, .. } => {
-                assert_eq!(status, Some(503));
-                // The gRPC token lands in `kind` so the Vertex
-                // translation table applies.
-                assert_eq!(parsed.expect("view").kind.as_deref(), Some("UNAVAILABLE"));
             }
             other => panic!("unexpected: {other:?}"),
         }

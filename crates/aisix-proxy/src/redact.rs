@@ -5,11 +5,11 @@
 //! this module owns WHERE the rewrite is applied on each wire shape:
 //!
 //! - request side: the normalised [`ChatFormat`] (chat/completions), the
-//!   Anthropic-native `/v1/messages` body, the `/v1/responses` body, the
-//!   legacy completions `prompt`, and embeddings `input` — message text
-//!   only, mirroring the scan surface of `check_input`;
+//!   `/v1/responses` body, the legacy completions `prompt`, and embeddings
+//!   `input` — message text only, mirroring the scan surface of
+//!   `check_input`;
 //! - response side: [`ChatResponse`] content + tool-call arguments, the
-//!   Anthropic-native response JSON, and buffered streamed chunks
+//!   `/v1/responses` response JSON, and buffered streamed chunks
 //!   (channel-reassembly: a masked span can cross chunk boundaries, so
 //!   each content channel is concatenated, rewritten once, and the full
 //!   rewritten text re-emitted on the channel's first chunk).
@@ -353,9 +353,10 @@ pub async fn moderate_body(
 ///
 /// The walker is both the collect pass and the apply pass, so a slot it
 /// offers is a slot the provider may rewrite. That makes it the wrong place
-/// for a signed Anthropic `thinking` block: the block has to reach the
-/// screening call (an operator's block rule must still fire on it) and must
-/// come back byte-identical (#1104). `scan_only` is appended after the
+/// for a signed reasoning slot (e.g. a `thinking` block carrying a provider
+/// signature): the text has to reach the screening call (an operator's
+/// block rule must still fire on it) and must come back byte-identical
+/// (#1104). `scan_only` is appended after the
 /// collected slots and truncated off the masked reply before the apply
 /// walk, so those texts are judged and never rewritten. Each text carries
 /// whether it sits in the latest-turn window.
@@ -773,114 +774,11 @@ fn redact_tool_call_arguments(
     }
 }
 
-/// Mask an Anthropic-native `/v1/messages` request body in place:
-/// `system` (string or text blocks) and `messages[].content` (string or
-/// blocks — `text` blocks and nested `tool_result` content). `tool_use`
-/// input objects in history are walked as JSON strings.
-pub fn redact_anthropic_request(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
-    let mut counts = RedactionCounts::new();
-    if !chain.redacts_input() {
-        return counts;
-    }
-    // The top-level `system` prompt is never in the window.
-    if let Some(system) = body.get_mut("system") {
-        redact_anthropic_content(chain, Direction::InputHistory, system, &mut counts);
-    }
-    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
-        let window_from = anthropic_latest_turn_start(messages);
-        for (i, msg) in messages.iter_mut().enumerate() {
-            // A `role: "system"` entry is not in the Anthropic spec but
-            // Claude Code sends it (#597); it is a system message wherever
-            // it sits, so it stays out of the window like the field above.
-            let is_system = msg.get("role").and_then(Value::as_str) == Some("system");
-            let dir = Direction::input_window(i >= window_from && !is_system);
-            if let Some(content) = msg.get_mut("content") {
-                redact_anthropic_content(chain, dir, content, &mut counts);
-            }
-        }
-    }
-    counts
-}
 
-/// Index of the first `messages[]` entry inside the latest-turn window on
-/// the Anthropic wire: one past the last `role: "assistant"` entry.
-///
-/// A tool-loop turn is an assistant message carrying `tool_use` blocks,
-/// so the boundary lands where the parsed view puts it — the `tool_result`
-/// blocks answering it ride the FINAL user message, which is in the window
-/// whole. A TRAILING assistant message is a prefill and never closes the
-/// window; see `aisix_guardrails::latest_turn_view`.
-fn anthropic_latest_turn_start(messages: &[Value]) -> usize {
-    let answered = messages
-        .iter()
-        .rposition(|m| m.get("role").and_then(Value::as_str) != Some("system"))
-        .unwrap_or(0);
-    messages[..answered]
-        .iter()
-        .rposition(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
-        .map_or(0, |i| i + 1)
-}
 
-/// Anthropic `content` is either a bare string or an array of typed
-/// blocks. Rewrites `text` blocks, `tool_result` nested content, and
-/// `tool_use` input objects; leaves image/document blocks alone.
-///
-/// **Deliberate exception to "no write-back channel means block".** A
-/// `thinking` / `redacted_thinking` block is signed by the provider, so it
-/// can be neither rewritten (the signature would no longer verify and the
-/// upstream rejects the replayed turn) nor, per the ruling on #1104,
-/// blocked. A mask-action hit inside one is FORWARDED UNCHANGED, for every
-/// guardrail kind — including the kinds that otherwise turn an unmaskable
-/// result into a blocking verdict.
-///
-/// Why refusing it buys nothing: the same bytes already left the gateway.
-/// Generated reasoning is out of the OUTPUT scope by design, so this block
-/// is one the gateway itself handed to the client, unmasked, on the
-/// previous turn. Blocking the replay protects nothing that was not already
-/// disclosed, and it denies service permanently, because a client following
-/// Anthropic's extended-thinking protocol re-sends the block every turn.
-///
-/// BLOCK-action rules are unaffected and still fire on thinking content —
-/// the scan reads it (`parse_inbound_request_for_scan`); only the mask has
-/// nowhere to write.
-fn redact_anthropic_content(
-    chain: &dyn Guardrail,
-    dir: Direction,
-    content: &mut Value,
-    counts: &mut RedactionCounts,
-) {
-    match content {
-        Value::String(_) => apply_to_value_string(chain, dir, content, counts),
-        Value::Array(blocks) => {
-            for block in blocks {
-                match block.get("type").and_then(Value::as_str) {
-                    Some("text") => {
-                        if let Some(text) = block.get_mut("text") {
-                            apply_to_value_string(chain, dir, text, counts);
-                        }
-                    }
-                    Some("tool_result") => {
-                        if let Some(inner) = block.get_mut("content") {
-                            redact_anthropic_content(chain, dir, inner, counts);
-                        }
-                    }
-                    Some("tool_use") => {
-                        offer_tool_name(chain, dir, block.get("name"));
-                        if let Some(input) = block.get_mut("input") {
-                            redact_value_strings(chain, dir, input, counts);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
-    }
-}
 
 /// The text of every signed reasoning content part in a chat request, for
 /// SCAN-ONLY submission to the segment pass ([`moderate_body_scanning`]) —
-/// the chat-wire counterpart of [`anthropic_signed_reasoning_texts`], and
 /// the slots [`redact_chat_format`] leaves unoffered.
 ///
 /// Each text carries whether its message sits in the latest-turn window,
@@ -902,56 +800,7 @@ pub fn chat_signed_reasoning_texts(req: &ChatFormat) -> Vec<(String, bool)> {
         .collect()
 }
 
-/// The plaintext of every signed reasoning block in an Anthropic request,
-/// for SCAN-ONLY submission to the segment pass
-/// ([`moderate_body_scanning`]).
-///
-/// Deliberately not part of `redact_anthropic_content`'s walk: that walk is
-/// also the write-back path, and a signed `thinking` block must be
-/// forwarded byte-identical (#1104). Collecting it here is what lets a
-/// segment-moderating kind — `bedrock`, `presidio`, `lakera`,
-/// `aliyun_ai_guardrail`, `custom` — judge the text without being handed a
-/// slot it could rewrite.
-///
-/// `redacted_thinking` carries only provider ciphertext under `data`, so
-/// there is no plaintext in it to screen.
-///
-/// Every text is marked outside the latest-turn window, as it always has
-/// been on this route.
-pub fn anthropic_signed_reasoning_texts(body: &Value) -> Vec<(String, bool)> {
-    body.get("messages")
-        .and_then(Value::as_array)
-        .map(|msgs| {
-            msgs.iter()
-                .filter_map(|m| m.get("content").and_then(Value::as_array))
-                .flatten()
-                .filter(|b| b.get("type").and_then(Value::as_str) == Some("thinking"))
-                .filter_map(|b| b.get("thinking").and_then(Value::as_str))
-                .filter(|t| !t.is_empty())
-                .map(|t| (t.to_owned(), false))
-                .collect()
-        })
-        .unwrap_or_default()
-}
 
-/// Mask an Anthropic-native `/v1/messages` RESPONSE body in place (the
-/// non-streaming passthrough JSON): top-level `content` blocks (`text` +
-/// `tool_use` input). Server-tool blocks (`server_tool_use`
-/// and the `*_tool_result` blocks) are not walked, so the
-/// kinds judged by this walk (`keyword`, `pii`, and the segment-moderating
-/// kinds) neither scan nor mask them; the block-only kinds that read the
-/// serialized content in `messages.rs` still see them. The stream differs,
-/// see [`redact_anthropic_sse`].
-pub fn redact_anthropic_response(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
-    let mut counts = RedactionCounts::new();
-    if !chain.redacts_output() {
-        return counts;
-    }
-    if let Some(content) = body.get_mut("content") {
-        redact_anthropic_content(chain, Direction::Output, content, &mut counts);
-    }
-    counts
-}
 
 /// Mask a `/v1/responses` request body in place: `instructions` and
 /// `input` (bare string, or item list whose `message` items carry
@@ -1089,17 +938,16 @@ fn redact_responses_item(
         // reported a hit, returned Allow, and dispatched the body with the
         // match still in it — the mask has to reach the same slots the scan
         // does. Neither slot carries a provider signature, so rewriting one
-        // is not replay-breaking; the Anthropic `thinking` block is the
-        // signed case and is forwarded unchanged instead (see
-        // `redact_anthropic_content`).
+        // is not replay-breaking; a SIGNED reasoning slot (e.g. a
+        // `thinking` block carrying a provider signature) is the signed
+        // case and is forwarded unchanged instead — see
+        // `chat_signed_reasoning_texts`.
         //
         // NOT closed here: a reasoning item's `encrypted_content` is
         // forwarded verbatim and is neither scanned nor rewritten, so on a
         // request that replays one the masked `text` is a readable copy
         // while the provider still receives the original. Masking it is not
-        // possible (it is provider ciphertext) and refusing on it is the
-        // open question this arm's Anthropic sibling raises — do not read
-        // this arm as closing the `/v1/responses` side.
+        // possible (it is provider ciphertext).
         //
         // Input only. Reasoning the model GENERATES is out of
         // output-guardrail scope, so this arm must not fire on
@@ -1557,9 +1405,9 @@ pub fn redact_chat_chunks(chain: &dyn Guardrail, chunks: &mut [ChatChunk]) -> Re
     counts
 }
 
-// ─── Anthropic-native SSE (passthrough) rewrite ──────────────────────────────
+// ─── SSE frame parsing (buffered stream rewrite) ────
 
-/// One parsed SSE frame from a buffered Anthropic-native byte stream.
+/// One parsed SSE frame from a buffered byte stream.
 struct SseFrame {
     /// Original frame bytes (no trailing separator). Emitted verbatim
     /// unless `data` was modified.
@@ -1960,210 +1808,11 @@ fn excise_unscannable_frames(buf: &mut Vec<u8>) -> (Vec<String>, usize) {
     (excised, excised_bytes)
 }
 
-/// Mask a fully-buffered Anthropic-native SSE response (the `/v1/messages`
-/// passthrough hold-back). Text deltas are reassembled per content-block
-/// `index` (a masked span can cross frame boundaries), masked once, and
-/// the full masked text re-emitted on the channel's first frame;
-/// `input_json_delta` channels are masked as complete JSON documents — for
-/// every block that streams one, so a `server_tool_use`
-/// input is masked here although the non-streaming walk
-/// ([`redact_anthropic_response`]) does not reach it. Tool-result blocks
-/// arriving in `content_block_start` are not scanned or masked. `None` =
-/// nothing matched, forward the original bytes byte-identical.
-pub fn redact_anthropic_sse(
-    chain: &dyn Guardrail,
-    raw: &[u8],
-) -> Option<(Vec<u8>, RedactionCounts)> {
-    if !chain.redacts_output() {
-        return None;
-    }
-    let (mut frames, trailing) = split_sse_frames(raw);
-    let mut counts = RedactionCounts::new();
 
-    // channel key → ordered (frame_idx, kind) sites. Kind distinguishes the
-    // JSON path to rewrite inside the frame payload.
-    #[derive(Clone, Copy)]
-    enum Site {
-        DeltaText,
-        DeltaPartialJson,
-        BlockStartText,
-    }
-    let mut text_channels: BTreeMap<u64, Vec<(usize, Site)>> = BTreeMap::new();
-    let mut json_channels: BTreeMap<u64, Vec<(usize, Site)>> = BTreeMap::new();
-
-    for (fi, frame) in frames.iter().enumerate() {
-        let Some(data) = frame.data.as_ref() else {
-            continue;
-        };
-        let index = data.get("index").and_then(Value::as_u64).unwrap_or(0);
-        match data.get("type").and_then(Value::as_str) {
-            Some("content_block_delta") => {
-                match data
-                    .get("delta")
-                    .and_then(|d| d.get("type"))
-                    .and_then(Value::as_str)
-                {
-                    Some("text_delta") => {
-                        if data
-                            .get("delta")
-                            .and_then(|d| d.get("text"))
-                            .and_then(Value::as_str)
-                            .is_some_and(|t| !t.is_empty())
-                        {
-                            text_channels
-                                .entry(index)
-                                .or_default()
-                                .push((fi, Site::DeltaText));
-                        }
-                    }
-                    Some("input_json_delta") => {
-                        if data
-                            .get("delta")
-                            .and_then(|d| d.get("partial_json"))
-                            .and_then(Value::as_str)
-                            .is_some_and(|t| !t.is_empty())
-                        {
-                            json_channels
-                                .entry(index)
-                                .or_default()
-                                .push((fi, Site::DeltaPartialJson));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Some("content_block_start") => {
-                if let Some(block) = data.get("content_block") {
-                    if block.get("type").and_then(Value::as_str) == Some("tool_use") {
-                        offer_tool_name(chain, Direction::Output, block.get("name"));
-                    }
-                }
-                // A `text` block may open with non-empty initial text; it
-                // belongs at the head of the same channel as its deltas.
-                if data
-                    .get("content_block")
-                    .and_then(|b| b.get("text"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|t| !t.is_empty())
-                {
-                    text_channels
-                        .entry(index)
-                        .or_default()
-                        .push((fi, Site::BlockStartText));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn site_text(data: &Value, site: Site) -> &str {
-        let path = match site {
-            Site::DeltaText => data.get("delta").and_then(|d| d.get("text")),
-            Site::DeltaPartialJson => data.get("delta").and_then(|d| d.get("partial_json")),
-            Site::BlockStartText => data.get("content_block").and_then(|b| b.get("text")),
-        };
-        path.and_then(Value::as_str).unwrap_or("")
-    }
-
-    fn site_slot(data: &mut Value, site: Site) -> Option<&mut Value> {
-        match site {
-            Site::DeltaText => data.get_mut("delta").and_then(|d| d.get_mut("text")),
-            Site::DeltaPartialJson => data
-                .get_mut("delta")
-                .and_then(|d| d.get_mut("partial_json")),
-            Site::BlockStartText => data
-                .get_mut("content_block")
-                .and_then(|b| b.get_mut("text")),
-        }
-    }
-
-    let rewrite = |frames: &mut Vec<SseFrame>, sites: &[(usize, Site)], new_text: String| {
-        let mut first = true;
-        for &(fi, site) in sites {
-            let frame = &mut frames[fi];
-            if let Some(slot) = frame.data.as_mut().and_then(|d| site_slot(d, site)) {
-                *slot = Value::String(if first {
-                    first = false;
-                    new_text.clone()
-                } else {
-                    String::new()
-                });
-                frame.dirty = true;
-            }
-        }
-    };
-
-    for sites in text_channels.values() {
-        let joined: String = sites
-            .iter()
-            .map(|&(fi, site)| site_text(frames[fi].data.as_ref().unwrap(), site))
-            .collect();
-        if let Some(r) = chain.redact_output_text(&joined) {
-            rewrite(&mut frames, sites, r.text);
-            merge_counts(&mut counts, r.counts);
-        }
-    }
-    for sites in json_channels.values() {
-        let joined: String = sites
-            .iter()
-            .map(|&(fi, site)| site_text(frames[fi].data.as_ref().unwrap(), site))
-            .collect();
-        let mut rewritten = joined.clone();
-        let mut local = RedactionCounts::new();
-        redact_json_encoded(chain, Direction::Output, &mut rewritten, &mut local);
-        if !local.is_empty() {
-            rewrite(&mut frames, sites, rewritten);
-            merge_counts(&mut counts, local);
-        }
-    }
-
-    if counts.is_empty() {
-        return None;
-    }
-    let mut out = Vec::with_capacity(raw.len());
-    for frame in &frames {
-        out.extend_from_slice(&frame.render());
-        out.extend_from_slice(frame.term);
-    }
-    out.extend_from_slice(trailing);
-    Some((out, counts))
-}
-
-/// The concatenated TEXT-channel content of a buffered Anthropic-native
-/// SSE stream (per content-block `index` order, `content_block_start`
-/// head text included). Used to rebuild the content-capture accumulator
-/// after a segment (provider-side) mask rewrote the held bytes — the
-/// sync redactor can't reproduce a provider mask (#932 × AISIX-Cloud#947).
-pub fn anthropic_sse_text(raw: &[u8]) -> String {
-    let (frames, _) = split_sse_frames(raw);
-    let mut channels: BTreeMap<u64, String> = BTreeMap::new();
-    for frame in &frames {
-        let Some(data) = frame.data.as_ref() else {
-            continue;
-        };
-        let index = data.get("index").and_then(Value::as_u64).unwrap_or(0);
-        let text = match data.get("type").and_then(Value::as_str) {
-            Some("content_block_delta") => data
-                .get("delta")
-                .filter(|d| d.get("type").and_then(Value::as_str) == Some("text_delta"))
-                .and_then(|d| d.get("text"))
-                .and_then(Value::as_str),
-            Some("content_block_start") => data
-                .get("content_block")
-                .and_then(|b| b.get("text"))
-                .and_then(Value::as_str),
-            _ => None,
-        };
-        if let Some(t) = text {
-            channels.entry(index).or_default().push_str(t);
-        }
-    }
-    channels.into_values().collect()
-}
 
 /// The concatenated client-visible delta content of a buffered `/v1/responses`
-/// SSE stream (channel order). Same capture-rebuild role as
-/// [`anthropic_sse_text`].
+/// SSE stream (channel order) — the capture-rebuild source after a segment
+/// mask.
 pub fn responses_sse_text(raw: &[u8]) -> String {
     let (frames, _) = split_sse_frames(raw);
     // First-seen channel order (NOT key order): the rebuilt capture must
@@ -2524,17 +2173,6 @@ mod tests {
         .unwrap();
         assert_eq!(chat_latest_turn_start(&chat.messages), 2);
 
-        let anthropic = json!([
-            {"role": "user", "content": "old"},
-            {"role": "assistant", "content": "answered"},
-            {"role": "user", "content": "fresh"},
-            {"role": "assistant", "content": "Sure, here is"},
-        ]);
-        assert_eq!(
-            anthropic_latest_turn_start(anthropic.as_array().unwrap()),
-            2,
-        );
-
         let responses = json!([
             {"role": "user", "content": "old"},
             {"role": "assistant", "type": "message",
@@ -2576,17 +2214,6 @@ mod tests {
         .unwrap();
         assert_eq!(chat_latest_turn_start(&chat_developer.messages), 0);
 
-        // The non-spec `role: "system"` entry Claude Code sends (#597).
-        let anthropic = json!([
-            {"role": "user", "content": "secret"},
-            {"role": "assistant", "content": "Sure, here is"},
-            {"role": "system", "content": "trailing policy"},
-        ]);
-        assert_eq!(
-            anthropic_latest_turn_start(anthropic.as_array().unwrap()),
-            0,
-        );
-
         let responses = json!([
             {"role": "user", "content": "secret"},
             {"role": "assistant", "type": "message",
@@ -2624,24 +2251,6 @@ mod tests {
         assert_eq!(chat_latest_turn_start(&req.messages), 0);
     }
 
-    /// An Anthropic tool loop: the assistant turn carrying `tool_use` is
-    /// the boundary, and the `tool_result` answering it rides the final
-    /// user message, which is inside the window whole.
-    #[test]
-    fn anthropic_window_starts_after_the_tool_use_turn() {
-        let messages = json!([
-            {"role": "user", "content": "old"},
-            {"role": "assistant", "content": [{"type": "text", "text": "reply"}]},
-            {"role": "user", "content": "call it"},
-            {"role": "assistant", "content": [
-                {"type": "tool_use", "id": "t1", "name": "f", "input": {}}
-            ]},
-            {"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "t1", "content": "result"}
-            ]},
-        ]);
-        assert_eq!(anthropic_latest_turn_start(messages.as_array().unwrap()), 4,);
-    }
 
     /// The Responses API spells a model turn as a typed item with no role
     /// at all, so `role: "assistant"` alone would put a whole agent tool
@@ -2833,70 +2442,43 @@ mod tests {
         );
     }
 
-    /// A mask-action hit inside a signed `thinking` / `redacted_thinking`
-    /// block is FORWARDED UNCHANGED — the deliberate exception to "no
-    /// write-back channel means block" (#1104). The block is byte-identical
-    /// afterwards, and the ordinary block beside it still masks, so this
-    /// pins an exception for the signed block rather than an exemption for
-    /// the whole message.
-    #[test]
-    fn signed_reasoning_is_forwarded_unchanged_while_its_neighbours_mask() {
-        let chain = both();
-        let mut body = json!({
-            "model": "m",
-            "messages": [
-                {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": [
-                    {"type": "thinking", "thinking": "mail a@x.com", "signature": "sig-abc"},
-                    {"type": "redacted_thinking", "data": "opaque a@x.com blob"},
-                    {"type": "text", "text": "also mail a@x.com"}
-                ]}
-            ]
-        });
-        let before = body["messages"][1]["content"].clone();
-        redact_anthropic_request(chain.as_ref(), &mut body);
-
-        assert_eq!(
-            body["messages"][1]["content"][0], before[0],
-            "the signed thinking block is byte-identical",
-        );
-        assert_eq!(
-            body["messages"][1]["content"][1], before[1],
-            "so is the redacted_thinking block",
-        );
-        assert_eq!(
-            body["messages"][1]["content"][2]["text"].as_str(),
-            Some("also mail [EMAIL_REDACTED]"),
-            "the mask is demonstrably running on this very request",
-        );
-    }
 
     /// The exception is for the MASK only. A block-action rule still fires
-    /// on thinking content, because the scan reads it — otherwise the
-    /// exception would have turned a signed block into a channel any
-    /// forbidden text could travel through.
-    #[test]
-    fn a_block_rule_still_fires_on_thinking_content() {
-        use aisix_guardrails::{KeywordBlocklist, KeywordRule};
+    /// on signed reasoning content, because the scan-only channel reads it —
+    /// otherwise the exception would have turned a signed block into a
+    /// channel any forbidden text could travel through.
+    #[tokio::test]
+    async fn a_block_rule_still_fires_on_signed_reasoning_content() {
+        use aisix_guardrails::{KeywordBlocklist, KeywordRule, GuardrailVerdict};
 
         let chain: Arc<dyn Guardrail> = Arc::new(GuardrailChain::new(vec![Arc::new(
             KeywordBlocklist::input_only(vec![KeywordRule::literal("FORBIDDENTHOUGHT")]),
         )]));
 
-        let body = json!({
-            "model": "claude",
+        let mut req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
             "messages": [{"role": "assistant", "content": [
                 {"type": "thinking", "thinking": "I will FORBIDDENTHOUGHT now", "signature": "s"}
             ]}]
-        });
-        let chat = aisix_provider_anthropic::parse_inbound_request_for_scan(&body).unwrap();
-        let verdict = futures::executor::block_on(aisix_guardrails::Guardrail::check_input(
+        }))
+        .unwrap();
+
+        let mut counts = RedactionCounts::new();
+        let mut hits = Vec::new();
+        let verdict = moderate_body_scanning(
             chain.as_ref(),
-            &chat,
-        ));
+            Direction::Input,
+            None,
+            GuardrailVerdict::Allow,
+            &mut counts,
+            &mut hits,
+            chat_signed_reasoning_texts(&req),
+            |g| redact_chat_format(g, &mut req),
+        )
+        .await;
         assert!(
-            matches!(verdict, aisix_guardrails::GuardrailVerdict::Block { .. }),
-            "a block rule must still reach thinking text, got {verdict:?}",
+            matches!(verdict, GuardrailVerdict::Block { .. }),
+            "a block rule must still reach signed reasoning text, got {verdict:?}",
         );
     }
 
@@ -2904,12 +2486,12 @@ mod tests {
     /// `aliyun_ai_guardrail`, `custom` — answer `Allow` from
     /// `check_input_non_segment` by design and take their real verdict from
     /// the segment pass. That pass walks the redactor, which never offers a
-    /// signed `thinking` block, so before the scan-only channel existed a
+    /// signed reasoning slot, so before the scan-only channel existed a
     /// block policy on any of those kinds was bypassable by moving the text
-    /// into a thinking block. The keyword test above cannot see this: keyword
-    /// is not a segment moderator.
+    /// into a signed reasoning part. The keyword test above cannot see
+    /// this: keyword is not a segment moderator.
     #[tokio::test]
-    async fn a_segment_kind_sees_thinking_text_and_can_block_on_it() {
+    async fn a_segment_kind_sees_signed_reasoning_and_can_block_on_it() {
         use aisix_guardrails::{GuardrailVerdict, SegmentsOutcome};
         use std::sync::Mutex;
 
@@ -2947,16 +2529,17 @@ mod tests {
         });
         let chain: Arc<dyn Guardrail> = Arc::new(GuardrailChain::new(vec![seg.clone()]));
 
-        let mut body = json!({
-            "model": "claude",
+        let mut req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
             "messages": [
                 {"role": "user", "content": "benign question"},
                 {"role": "assistant", "content": [
                     {"type": "thinking", "thinking": "I will FORBIDDENTHOUGHT now", "signature": "s"}
                 ]}
             ]
-        });
-        let before = body.clone();
+        }))
+        .unwrap();
+        let before = req.clone();
 
         let mut counts = RedactionCounts::new();
         let mut hits = Vec::new();
@@ -2967,30 +2550,34 @@ mod tests {
             GuardrailVerdict::Allow,
             &mut counts,
             &mut hits,
-            anthropic_signed_reasoning_texts(&body),
-            |g| redact_anthropic_request(g, &mut body),
+            chat_signed_reasoning_texts(&req),
+            |g| redact_chat_format(g, &mut req),
         )
         .await;
 
         let seen = seg.seen.lock().unwrap().clone();
         assert!(
             seen.iter().any(|t| t.contains("FORBIDDENTHOUGHT")),
-            "the segment pass must be offered the thinking text, got {seen:?}",
+            "the segment pass must be offered the signed reasoning text, got {seen:?}",
         );
         assert!(
             matches!(verdict, GuardrailVerdict::Block { .. }),
-            "a segment kind's block rule must fire on thinking content, got {verdict:?}",
+            "a segment kind's block rule must fire on signed reasoning content, got {verdict:?}",
         );
-        assert_eq!(body, before, "and the body is never rewritten");
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            serde_json::to_value(&before).unwrap(),
+            "and the request is never rewritten"
+        );
     }
 
     /// The scan-only text is judged but never written back: a segment kind
     /// that masks every slot it was offered must not have that mask land on
-    /// the signed block, and must still land on the ordinary ones. (What
-    /// enforces that is the walk not offering the block — see the note on
-    /// `masked.truncate`, which is about log truthfulness, not this.)
+    /// the signed reasoning slot, and must still land on the ordinary ones.
+    /// (What enforces that is the walk not offering the slot — see the note
+    /// on `masked.truncate`, which is about log truthfulness, not this.)
     #[tokio::test]
-    async fn a_segment_masks_ordinary_slots_but_never_the_signed_block() {
+    async fn a_segment_masks_ordinary_slots_but_never_the_signed_slot() {
         use aisix_guardrails::{GuardrailVerdict, SegmentsOutcome};
 
         struct MaskEverything;
@@ -3014,13 +2601,14 @@ mod tests {
 
         let chain: Arc<dyn Guardrail> =
             Arc::new(GuardrailChain::new(vec![Arc::new(MaskEverything)]));
-        let mut body = json!({
-            "model": "claude",
+        let mut req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
             "messages": [{"role": "assistant", "content": [
                 {"type": "thinking", "thinking": "secret chain", "signature": "s"},
                 {"type": "text", "text": "ordinary text"}
             ]}]
-        });
+        }))
+        .unwrap();
 
         let mut counts = RedactionCounts::new();
         let mut hits = Vec::new();
@@ -3031,16 +2619,16 @@ mod tests {
             GuardrailVerdict::Allow,
             &mut counts,
             &mut hits,
-            anthropic_signed_reasoning_texts(&body),
-            |g| redact_anthropic_request(g, &mut body),
+            chat_signed_reasoning_texts(&req),
+            |g| redact_chat_format(g, &mut req),
         )
         .await;
 
-        let blocks = &body["messages"][0]["content"];
+        let blocks = req.messages[0].content_blocks.as_ref().unwrap();
         assert_eq!(
             blocks[0]["thinking"].as_str(),
             Some("secret chain"),
-            "the signed block is byte-identical even under a mask-everything segmenter",
+            "the signed slot is byte-identical even under a mask-everything segmenter",
         );
         assert_eq!(
             blocks[1]["text"].as_str(),
@@ -3193,55 +2781,7 @@ mod tests {
         assert_eq!(counts.get("email"), Some(&2));
     }
 
-    #[test]
-    fn anthropic_request_masks_system_text_blocks_and_tool_result() {
-        let chain = both();
-        let mut body = json!({
-            "model": "claude",
-            "system": [{"type": "text", "text": "user email a@x.com"}],
-            "messages": [
-                {"role": "user", "content": "call 13800138000"},
-                {"role": "user", "content": [
-                    {"type": "text", "text": "and b@y.org"},
-                    {"type": "tool_result", "tool_use_id": "t1", "content": [
-                        {"type": "text", "text": "result c@z.io"}
-                    ]}
-                ]}
-            ]
-        });
-        let counts = redact_anthropic_request(chain.as_ref(), &mut body);
-        assert_eq!(body["system"][0]["text"], "user email [EMAIL_REDACTED]");
-        assert_eq!(
-            body["messages"][0]["content"],
-            "call [CHINA_MOBILE_REDACTED]"
-        );
-        assert_eq!(
-            body["messages"][1]["content"][0]["text"],
-            "and [EMAIL_REDACTED]"
-        );
-        assert_eq!(
-            body["messages"][1]["content"][1]["content"][0]["text"],
-            "result [EMAIL_REDACTED]",
-        );
-        assert_eq!(counts.get("email"), Some(&3));
-    }
 
-    #[test]
-    fn anthropic_response_masks_text_and_tool_use_input() {
-        let chain = both();
-        let mut body = json!({
-            "content": [
-                {"type": "text", "text": "email a@x.com"},
-                {"type": "tool_use", "id": "t", "name": "send",
-                 "input": {"to": "b@y.org", "count": 3}}
-            ]
-        });
-        let counts = redact_anthropic_response(chain.as_ref(), &mut body);
-        assert_eq!(body["content"][0]["text"], "email [EMAIL_REDACTED]");
-        assert_eq!(body["content"][1]["input"]["to"], "[EMAIL_REDACTED]");
-        assert_eq!(body["content"][1]["input"]["count"], 3);
-        assert_eq!(counts.get("email"), Some(&2));
-    }
 
     #[test]
     fn responses_request_masks_string_and_item_forms() {
@@ -3374,44 +2914,7 @@ mod tests {
         assert_eq!(chunks[1].delta.content.as_deref(), Some("world"));
     }
 
-    #[test]
-    fn anthropic_sse_masks_text_delta_across_frames() {
-        let chain = both();
-        let raw = concat!(
-            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n\n",
-            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
-            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"mail a@\"}}\n\n",
-            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x.com ok\"}}\n\n",
-            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
-        );
-        let (out, counts) = redact_anthropic_sse(chain.as_ref(), raw.as_bytes()).unwrap();
-        let out = String::from_utf8(out).unwrap();
-        assert!(out.contains("mail [EMAIL_REDACTED] ok"), "out: {out}");
-        assert!(!out.contains("a@x.com"));
-        // Second delta emptied; frame structure + unrelated frames intact.
-        assert!(
-            out.contains("{\"type\":\"text_delta\",\"text\":\"\"}")
-                || out.contains("\"text\":\"\"")
-        );
-        assert!(out.contains("message_start"));
-        assert!(out.contains("message_stop"));
-        assert_eq!(counts.get("email"), Some(&1));
-    }
 
-    #[test]
-    fn anthropic_sse_masks_tool_use_input_json_channel() {
-        let chain = both();
-        let raw = concat!(
-            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"send\",\"input\":{}}}\n\n",
-            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"to\\\":\\\"a@\"}}\n\n",
-            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"x.com\\\"}\"}}\n\n",
-        );
-        let (out, counts) = redact_anthropic_sse(chain.as_ref(), raw.as_bytes()).unwrap();
-        let out = String::from_utf8(out).unwrap();
-        assert!(out.contains("[EMAIL_REDACTED]"), "out: {out}");
-        assert!(!out.contains("a@"), "no split original fragments: {out}");
-        assert_eq!(counts.get("email"), Some(&1));
-    }
 
     #[test]
     fn responses_sse_masks_delta_channel_and_aggregate_events() {
@@ -3657,27 +3160,6 @@ mod tests {
         assert!(out.ends_with("\n\n"), "out: {out}");
     }
 
-    #[test]
-    fn anthropic_sse_masks_a_final_frame_the_upstream_never_terminated() {
-        let chain = both();
-        let mut raw = concat!(
-            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello \"}}\n\n",
-            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"mail a@x.com\"}}",
-        )
-        .as_bytes()
-        .to_vec();
-        assert_eq!(
-            seal_buffered_sse(&mut raw).tail,
-            SseTailSeal::Completed { padded: 2 }
-        );
-        let (out, counts) = redact_anthropic_sse(chain.as_ref(), &raw)
-            .expect("the sealed tail must reach the redactor");
-        let out = String::from_utf8(out).unwrap();
-        assert!(!out.contains("a@x.com"), "tail left unmasked: {out}");
-        assert!(out.contains("[EMAIL_REDACTED]"), "out: {out}");
-        assert_eq!(counts.get("email"), Some(&1));
-        assert!(out.ends_with("\n\n"), "out: {out}");
-    }
 
     #[test]
     fn seal_leaves_a_terminated_body_byte_identical() {
@@ -3990,34 +3472,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn anthropic_sse_masks_a_frame_whose_payload_spans_several_data_lines() {
-        let chain = both();
-        let mut raw = concat!(
-            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello \"}}\n\n",
-            // One frame, one JSON document, written over two `data:` lines.
-            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\n",
-            "data: \"delta\":{\"type\":\"text_delta\",\"text\":\"mail a@x.com\"}}\n\n",
-        )
-        .as_bytes()
-        .to_vec();
-        // Nothing to seal — every frame here is terminated — and nothing to
-        // excise either: the joined payload IS one JSON document.
-        let seal = seal_buffered_sse(&mut raw);
-        assert_eq!(seal.tail, SseTailSeal::Terminated);
-        assert!(seal.excised.is_empty(), "excised: {:?}", seal.excised);
-        let (out, counts) = redact_anthropic_sse(chain.as_ref(), &raw)
-            .expect("the whole payload must reach the redactor");
-        let out = String::from_utf8(out).unwrap();
-        assert!(!out.contains("a@x.com"), "left unmasked: {out}");
-        assert!(out.contains("[EMAIL_REDACTED]"), "out: {out}");
-        assert_eq!(counts.get("email"), Some(&1));
-        // The rewritten frame carries the whole document, re-serialised onto
-        // one `data:` line — the payload is preserved, not truncated to its
-        // first line.
-        assert!(out.contains("\"index\":0"), "second line dropped: {out}");
-        assert!(out.contains("\"text_delta\""), "second line dropped: {out}");
-    }
 
     #[test]
     fn responses_sse_masks_a_frame_whose_payload_spans_several_data_lines() {
@@ -4123,31 +3577,6 @@ mod tests {
         assert_eq!(crlf, b"data: {\"a\":1}\r\n\r\ndata: [DONE]\r\n\r\n");
     }
 
-    #[test]
-    fn anthropic_sse_masks_a_crlf_frame_whose_payload_spans_several_data_lines() {
-        // The CRLF half of the LF case above. The dropped `data:` line takes
-        // its line ending with it, so without care the CR of the line BEFORE
-        // the separator is left stranded and the client reads `...}\r` as
-        // the payload.
-        let chain = both();
-        let mut raw = concat!(
-            "event: content_block_delta\r\ndata: {\"type\":\"content_block_delta\",\"index\":0,\r\n",
-            "data: \"delta\":{\"type\":\"text_delta\",\"text\":\"mail a@x.com\"}}\r\n\r\n",
-        )
-        .as_bytes()
-        .to_vec();
-        let seal = seal_buffered_sse(&mut raw);
-        assert!(seal.excised.is_empty(), "excised: {:?}", seal.excised);
-        let (out, _) = redact_anthropic_sse(chain.as_ref(), &raw)
-            .expect("the whole payload must reach the redactor");
-        let out = String::from_utf8(out).unwrap();
-        assert!(!out.contains("a@x.com"), "left unmasked: {out}");
-        assert!(out.contains("[EMAIL_REDACTED]"), "out: {out}");
-        // A masked CRLF frame stays a well-formed CRLF frame: the payload
-        // ends at `}`, not at a stray CR.
-        assert!(out.ends_with("}\r\n\r\n"), "stray CR: {out:?}");
-        assert!(!out.contains("\r\r"), "stray CR: {out:?}");
-    }
 
     /// The event-stream spec lets a line end in a bare `\r` too. A body
     /// framed that way is framed, scanned and masked like any other, and
@@ -4173,24 +3602,6 @@ mod tests {
         assert_eq!(out.matches("\r\r").count(), 2, "out: {out:?}");
     }
 
-    #[test]
-    fn a_masked_cr_frame_spanning_several_data_lines_keeps_one_line_and_its_framing() {
-        let chain = both();
-        let raw = concat!(
-            "event: content_block_delta\rdata: {\"type\":\"content_block_delta\",\"index\":0,\r",
-            "data: \"delta\":{\"type\":\"text_delta\",\"text\":\"mail a@x.com\"}}\r\r",
-        );
-        let (out, _) = redact_anthropic_sse(chain.as_ref(), raw.as_bytes())
-            .expect("the whole payload must reach the redactor");
-        let out = String::from_utf8(out).unwrap();
-        assert!(!out.contains("a@x.com"), "left unmasked: {out:?}");
-        assert!(
-            out.starts_with("event: content_block_delta\rdata: {"),
-            "out: {out:?}"
-        );
-        assert_eq!(out.matches("data:").count(), 1, "out: {out:?}");
-        assert!(out.ends_with("}\r\r"), "out: {out:?}");
-    }
 
     #[test]
     fn seal_pads_a_cr_stream_with_cr() {
@@ -4245,12 +3656,6 @@ mod tests {
         assert_eq!(counts.get("email"), Some(&3));
     }
 
-    #[test]
-    fn anthropic_sse_returns_none_when_clean() {
-        let chain = both();
-        let raw = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n";
-        assert!(redact_anthropic_sse(chain.as_ref(), raw.as_bytes()).is_none());
-    }
 
     #[test]
     fn malformed_tool_args_fall_back_to_raw_text_masking() {
@@ -4526,18 +3931,18 @@ mod tests {
         assert_eq!(verdict, GuardrailVerdict::Allow);
     }
 
-    /// The round trip through the Anthropic SSE walker: the masked
+    /// The round trip through the Responses SSE walker: the masked
     /// channel text lands on the channel's first frame (later frames
     /// empty) even though the applier only returns marker counts — the
     /// gate that discards count-less SSE rewrites must fire on them.
     #[tokio::test]
-    async fn moderate_body_masks_anthropic_sse_channels() {
+    async fn moderate_body_masks_responses_sse_channels() {
         let chain = seg_chain(StubSegments::masker());
         let mut held: Vec<u8> = concat!(
-            "event: content_block_delta\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello \"}}\n\n",
-            "event: content_block_delta\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"world\"}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"i1\",\"content_index\":0,\"delta\":\"hello \"}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"i1\",\"content_index\":0,\"delta\":\"world\"}\n\n",
         )
         .as_bytes()
         .to_vec();
@@ -4549,7 +3954,7 @@ mod tests {
             GuardrailVerdict::Allow,
             &mut counts,
             &mut Vec::new(),
-            |g| match redact_anthropic_sse(g, &held) {
+            |g| match redact_responses_sse(g, &held) {
                 Some((rewritten, c)) => {
                     held = rewritten;
                     c
@@ -4566,7 +3971,7 @@ mod tests {
         );
         assert_eq!(counts.get("EMAIL"), Some(&1));
         // The capture-rebuild helper reads the masked channel back.
-        assert_eq!(anthropic_sse_text(&held), "<M0:HELLO WORLD>");
+        assert_eq!(responses_sse_text(&held), "<M0:HELLO WORLD>");
     }
 
     /// `responses_sse_text` assembles `output_text` deltas per channel —

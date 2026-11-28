@@ -626,7 +626,6 @@ where
             source_ip: &client.source_ip,
             context_origin: None,
             budget: Some(&budget_gate),
-            client: Some(client),
         },
     )?;
     let routing = entry.value.routing.as_ref();
@@ -1450,9 +1449,6 @@ pub(crate) struct RoutingRequest<'a> {
     /// exhausted is not a candidate, and a direct model on one is refused.
     /// `None` only in tests that exercise no budget.
     pub budget: Option<&'a crate::budget::BudgetGate>,
-    /// The caller, for a semantic router's internal call to render the
-    /// request headers a direct call renders. `None` only in tests.
-    pub client: Option<&'a crate::client_ip::ClientContext>,
 }
 
 /// Drop the targets whose own `allowed_cidrs` excludes `source_ip`.
@@ -1617,7 +1613,7 @@ pub(crate) fn resolve_attempt_models(
     // exhausted is not a candidate either, for the same reasons as the IP
     // allowlist — it must not consume a `max_fallbacks` slot, and it has no
     // "try anyway".
-    let mut eligible = match req.budget {
+    let eligible = match req.budget {
         Some(gate) => targets_within_budget(snapshot, gate, eligible)?,
         None => eligible,
     };

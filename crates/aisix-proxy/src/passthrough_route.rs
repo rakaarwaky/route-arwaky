@@ -177,7 +177,6 @@ pub async fn host_dispatch(
     next: Next,
 ) -> Response {
     let snapshot = state.snapshot.load();
-    let path = req.uri().path();
     let matched = has_host_match(&snapshot, inbound_host(&req).as_deref());
     drop(snapshot);
     if matched {
@@ -4270,12 +4269,9 @@ fn body_in_band_error(
     }
 }
 
-/// The chat envelope carries Anthropic Messages traffic too, whose in-band
-/// failure is a `type: "error"` event read with the Anthropic taxonomy.
+/// The chat envelope's in-band failure, read with the generic error
+/// capture on the OpenAI wire.
 fn chat_in_band_error(value: &serde_json::Value) -> Option<aisix_gateway::BridgeError> {
-    if value.get("type").and_then(|t| t.as_str()) == Some("error") {
-        return aisix_provider_anthropic::wire::body_in_band_error(value);
-    }
     aisix_gateway::capture_in_band_error_value(value, aisix_gateway::UpstreamWire::OpenAI)
 }
 
@@ -5872,9 +5868,7 @@ fn frame_parts_and_tier(
         let report = match metering {
             Metering::Chat => {
                 if v.get("usage").is_some() {
-                    v.get("usage")
-                        .and_then(openai_chat_usage)
-                        .map(PassthroughUsage::from_stats)
+                    v.get("usage").and_then(openai_chat_usage)
                 } else {
                     None
                 }
@@ -5885,7 +5879,8 @@ fn frame_parts_and_tier(
             Metering::Responses => crate::responses::responses_terminal_usage_stats(&v)
                 .as_ref()
                 .map(PassthroughUsage::from_stats),
-            Metering::Embeddings
+            Metering::Anthropic
+            | Metering::Embeddings
             | Metering::Images
             | Metering::Rerank
             | Metering::DashscopeNative
@@ -8421,23 +8416,16 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
             })
         );
 
-        // Anthropic: cache counters are separate, additive fields.
+        // Anthropic: the envelope is still classified for scanning, but
+        // its usage parser left with the adapter — the spelling records
+        // nothing rather than being read as another protocol's.
         let anthropic = serde_json::json!({
             "input_tokens": 11,
             "output_tokens": 5,
             "cache_creation_input_tokens": 300,
             "cache_read_input_tokens": 1200,
         });
-        assert_eq!(
-            read(Metering::Anthropic, anthropic),
-            Some(PassthroughUsage {
-                prompt_tokens: 11,
-                completion_tokens: 5,
-                cache_creation_tokens: 300,
-                cache_read_tokens: 1200,
-                ..Default::default()
-            })
-        );
+        assert_eq!(read(Metering::Anthropic, anthropic), None);
 
         // DeepSeek reports the cache hit flat, and a ZEROED nested detail
         // must not mask it (the typed OpenAI reader's precedence).
@@ -8482,47 +8470,6 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
         assert_eq!(agent_token_usage(&serde_json::json!({"disk": "80%"})), None);
     }
 
-    #[test]
-    fn anthropic_stream_reports_the_prompt_side_from_message_start() {
-        // Anthropic splits usage across two frames: `message_start` carries
-        // the input + cache counters, the terminal `message_delta` only the
-        // output ones. Reading the top level alone loses the prompt side.
-        let start = br#"data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":12,"cache_creation_input_tokens":300,"cache_read_input_tokens":1200}}}
-
-"#;
-        let (_, start_usage) = frame_delta(PassthroughProtocol::OpenaiChat, start);
-        let start_usage = start_usage.expect("message_start must report usage");
-        assert_eq!(start_usage.prompt_tokens, 12);
-        assert_eq!(start_usage.cache_creation_tokens, 300);
-        assert_eq!(start_usage.cache_read_tokens, 1200);
-
-        let delta = br#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}
-
-"#;
-        let (_, delta_usage) = frame_delta(PassthroughProtocol::OpenaiChat, delta);
-        let mut acc = start_usage;
-        acc.merge(delta_usage.expect("message_delta must report usage"));
-        // The later, partial report EXTENDS the record instead of
-        // truncating the prompt side to zero.
-        assert_eq!(
-            acc,
-            PassthroughUsage {
-                prompt_tokens: 12,
-                completion_tokens: 7,
-                cache_creation_tokens: 300,
-                cache_read_tokens: 1200,
-                ..Default::default()
-            }
-        );
-
-        // The nested read is gated on the event type: a `message` object on
-        // any other frame is not a usage report.
-        let other = br#"data: {"type":"conversation","message":{"usage":{"input_tokens":999}}}
-
-"#;
-        assert_eq!(frame_delta(PassthroughProtocol::OpenaiChat, other).1, None);
-    }
-
     /// A frame's payload is ALL of its `data:` lines joined with `\n`
     /// (WHATWG SSE). Parsing each line on its own turns one document into
     /// N unparseable fragments, so the frame's usage went unread and — on
@@ -8530,7 +8477,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
     /// scan instead of its values.
     #[test]
     fn a_payload_spread_over_several_data_lines_is_read_as_one_document() {
-        let frame = b"event: message_delta\ndata: {\"type\":\"message_delta\",\ndata: \"usage\":{\"output_tokens\":7,\"input_tokens\":12}}\n\n";
+        let frame = b"event: message_delta\ndata: {\"type\":\"message_delta\",\ndata: \"usage\":{\"prompt_tokens\":12,\"completion_tokens\":7}}\n\n";
         let (_, usage) = frame_delta(PassthroughProtocol::OpenaiChat, frame);
         assert_eq!(
             usage,
@@ -10635,27 +10582,26 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
             })
         );
         let anthropic = br#"{"type":"message","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":9,"output_tokens":4,"cache_creation_input_tokens":100,"cache_read_input_tokens":800}}"#;
-        let additive = Some(PassthroughUsage {
-            cache_creation_tokens: 100,
-            cache_read_tokens: 800,
-            ..usage_dims(9, 4)
-        });
-        // An Anthropic reply is Anthropic usage whichever hint reached it.
+        // An Anthropic reply names no envelope any remaining parser reads:
+        // its usage parser left with the adapter, so the record is nothing
+        // whichever hint reached it.
         for hint in [
             PassthroughProtocol::OpenaiChat,
             PassthroughProtocol::AnthropicMessages,
         ] {
-            assert_eq!(usage_for(hint, None, anthropic), additive);
+            assert_eq!(
+                usage_for(hint, None, anthropic),
+                None,
+                "the Anthropic spelling records nothing now that its usage parser left"
+            );
         }
-        // A bare usage object names no envelope, so the hint decides.
+        // A bare usage object names no envelope either; with the Anthropic
+        // parser gone its hint reads none rather than reading by field name.
         let bare =
             br#"{"usage":{"input_tokens":9,"output_tokens":4,"cache_read_input_tokens":800}}"#;
         assert_eq!(
             usage_for(PassthroughProtocol::AnthropicMessages, None, bare),
-            Some(PassthroughUsage {
-                cache_read_tokens: 800,
-                ..usage_dims(9, 4)
-            })
+            None
         );
         assert_eq!(usage_for(PassthroughProtocol::Raw, None, openai), None);
 
@@ -11760,7 +11706,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
     }
 
     const OUTPUT_KEYWORD_BLOCK: &str = r#"{"name":"out-block","enabled":true,"hook_point":"output","kind":"keyword","patterns":[{"kind":"literal","value":"FORBIDDEN"}]}"#;
-    const OUTPUT_CAP_FAIL_CLOSED: &str = r#"{"name":"out-cap","enabled":true,"hook_point":"output","kind":"azure_content_safety_text_moderation","endpoint":"http://127.0.0.1:1","api_key":"k","stream_processing_mode":"buffer_full","max_buffer_bytes":4,"on_buffer_exceeded":"fail_closed"}"#;
+    const OUTPUT_CAP_FAIL_CLOSED: &str = r#"{"name":"out-cap","enabled":true,"hook_point":"output","kind":"lakera","endpoint":"http://127.0.0.1:1","api_key":"k","max_buffer_bytes":4,"on_buffer_exceeded":"fail_closed"}"#;
     const OUTPUT_FAIL_OPEN: &str = r#"{"name":"out-open","enabled":true,"hook_point":"output","kind":"openai_moderation","endpoint":"http://127.0.0.1:1","api_key":"k","output_fail_open":true}"#;
 
     const ANTHROPIC_SSE: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude\",\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n\

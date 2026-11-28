@@ -930,32 +930,9 @@ pub(crate) fn completions_chunk_parts(v: &Value) -> Parts {
     p
 }
 
-/// Held content in one Anthropic Messages stream event.
-pub(crate) fn anthropic_event(v: &Value) -> usize {
-    anthropic_event_parts(v).held()
-}
-
 /// Held content in one OpenAI Responses stream event.
 pub(crate) fn responses_event(v: &Value) -> usize {
     responses_event_parts(v).held()
-}
-
-/// Held content across every SSE frame in `frames` (complete frames; an
-/// unterminated trailing fragment counts as one more frame).
-pub(crate) fn sse_frames(frames: &[u8], per_event: fn(&Value) -> usize) -> usize {
-    crate::redact::sse_frame_payloads(frames)
-        .iter()
-        .map(|payload| {
-            let p = payload.trim();
-            if p.is_empty() || p == "[DONE]" {
-                return 0;
-            }
-            match serde_json::from_str::<Value>(p) {
-                Ok(v) => per_event(&v),
-                Err(_) => p.len(),
-            }
-        })
-        .sum()
 }
 
 /// Held Responses content across every SSE frame in `frames`, with one
@@ -1031,33 +1008,25 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_event_ignores_envelope_and_empty_tool_input() {
-        let start = json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t","name":"lookup","input":{}}});
-        assert_eq!(anthropic_event(&start), 0);
-        let thinking = json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}});
-        assert_eq!(anthropic_event(&thinking), 3);
-        let args = json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"a\""}});
-        assert_eq!(anthropic_event(&args), 4);
-        let stop = json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}});
-        assert_eq!(anthropic_event(&stop), 0);
-    }
-
-    #[test]
-    fn responses_frames_count_every_authoritative_output_carrier() {
-        let frames = concat!(
-            "event: response.reasoning_summary_text.delta\n",
-            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"think\"}\n\n",
-            "event: response.output_text.delta\n",
-            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
-            "event: response.refusal.delta\n",
-            "data: {\"type\":\"response.refusal.delta\",\"delta\":\"no\"}\n\n",
-            "event: response.output_text.done\n",
-            "data: {\"type\":\"response.output_text.done\",\"text\":\"hi\"}\n\n",
-            "data: [DONE]\n\n",
+    fn responses_event_counts_every_authoritative_output_carrier() {
+        assert_eq!(
+            responses_event(&json!({
+                "type": "response.reasoning_summary_text.delta",
+                "delta": "think"
+            })),
+            5
         );
         assert_eq!(
-            sse_frames(frames.as_bytes(), responses_event),
-            5 + 2 + 2 + 2
+            responses_event(&json!({"type": "response.output_text.delta", "delta": "hi"})),
+            2
+        );
+        assert_eq!(
+            responses_event(&json!({"type": "response.refusal.delta", "delta": "no"})),
+            2
+        );
+        assert_eq!(
+            responses_event(&json!({"type": "response.output_text.done", "text": "hi"})),
+            2
         );
     }
 
@@ -1226,9 +1195,9 @@ mod tests {
         kept.push(&json!("c"), 10);
         assert_eq!(kept.take(), Some(vec![json!("aaaa")]));
     }
-
     #[test]
     fn unparseable_payload_counts_whole() {
-        assert_eq!(sse_frames(b"data: not json\n\n", responses_event), 8);
+        let mut ledger = ResponsesHeldContent::default();
+        assert_eq!(responses_sse_held_frames(&mut ledger, b"data: not json\n\n"), 8);
     }
 }

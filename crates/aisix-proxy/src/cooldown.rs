@@ -197,7 +197,7 @@ mod tests {
             status,
             message: "m".into(),
             parsed: None,
-            wire: aisix_gateway::UpstreamWire::Anthropic,
+            wire: aisix_gateway::UpstreamWire::OpenAI,
         };
         // Embedded status follows the trigger-status list: 503 is in
         // the default list, 400 is not.

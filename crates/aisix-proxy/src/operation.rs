@@ -355,18 +355,7 @@ mod tests {
     ///
     /// Derived rather than listed, because the guard sees only the
     /// NORMALIZED label (`crate::normalize_endpoint_label`) and several
-    /// routes share one. A hand-written exemption list would let a route be quietly
-    /// dropped from the emitting side while its own sibling still meters,
-    /// which is the AISIX-Cloud#1571 bug arriving one route at a time.
-    /// Routes that file no usage row at any outcome yet NORMALIZE to a label
-    /// a metering route also uses. The guard sees only the label, so each of
-    /// these must call `attribution::note_unmetered_route()` itself — there
-    /// is nothing else that can tell it apart from its metering sibling.
-    ///
-    /// Listed here so the pairing is visible: adding a route to a shared
-    /// label without that call means a cancelled request on it is filed as
-    /// its sibling's traffic.
-    const UNMETERED_ON_A_SHARED_LABEL: &[&str] = &[];
+    /// routes share one.
 
     #[test]
     fn every_route_the_guard_wraps_reports_a_cancel_it_can_name() {
@@ -392,23 +381,6 @@ mod tests {
                 );
             }
             *entry = Some(*surface);
-        }
-
-        // A silent route that shares a label with a metering one can only be
-        // silent by declaring itself so.
-        for (label, silent) in &silent_by_label {
-            if by_label.get(label).copied().flatten().is_none() {
-                continue;
-            }
-            for route in silent {
-                assert!(
-                    UNMETERED_ON_A_SHARED_LABEL.contains(route),
-                    "{route} files no usage row, but normalizes to {label:?}, which a metering \
-                     route reports — so a cancelled request on it is filed as that route's \
-                     traffic. Call attribution::note_unmetered_route() in its handler and name \
-                     it in UNMETERED_ON_A_SHARED_LABEL.",
-                );
-            }
         }
 
         // A label NO metering route reaches must report nothing — the half
