@@ -140,7 +140,7 @@ pub async fn chat_completions(
     // which diverges from OpenAI — every SDK that branches on 400
     // vs 422 sees different semantics here than it does talking to
     // api.openai.com. Same discriminate-then-map pattern as
-    // messages.rs (#336) which already handles this for /v1/messages.
+    // established in #336.
     body: Result<Json<ChatFormat>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let started = Instant::now();
@@ -1256,12 +1256,9 @@ async fn estimate_missing_chat_usage(
 /// is billed changes: a provider counting overhead we cannot see is still
 /// not corrected downward.
 ///
-/// The chat stream's `include_usage` frame, the bridged `/v1/messages`
-/// exits, the buffered native `/v1/messages` passthrough, every
+/// The chat stream's `include_usage` frame, every
 /// `/v1/responses` exit (native and bridged), `/v1/completions` and
-/// `/v1/embeddings` fill the same way, for the same reason. Only the native
-/// `/v1/messages` stream still relays the provider's usage as it reported
-/// it.
+/// `/v1/embeddings` fill the same way, for the same reason.
 fn apply_estimated_usage(
     usage: &mut aisix_gateway::chat::UsageStats,
     prompt_tokens: u32,
@@ -1990,8 +1987,8 @@ async fn dispatch(
                         // carries no `error.policy` attribution and no
                         // `x-ratelimit-*` headers, so a caller refused by this
                         // gateway's own limiter would see the wire shape of
-                        // somebody else's refusal. `/v1/messages` and
-                        // `/v1/responses` keep theirs too; this arm used to keep
+                        // somebody else's refusal. `/v1/responses` keeps
+                        // theirs too; this arm used to keep
                         // only the policy layer's.
                         last_reserve_reject = Some(e);
                         continue 'targets;
@@ -3200,8 +3197,8 @@ async fn dispatch(
                     // carries no `error.policy` attribution and no
                     // `x-ratelimit-*` headers, so a caller refused by this
                     // gateway's own limiter would see the wire shape of
-                    // somebody else's refusal. `/v1/messages` and
-                    // `/v1/responses` keep theirs too; this arm used to keep
+                    // somebody else's refusal. `/v1/responses` keeps
+                    // theirs too; this arm used to keep
                     // only the policy layer's.
                     last_reserve_reject = Some(e);
                     continue 'targets;
@@ -6259,8 +6256,8 @@ where
         };
         // #448 parity for streaming: accumulate tool-call text (function name +
         // arguments) so the end-of-stream output check scans tool calls too.
-        // The chat non-streaming path (`guardrail_output_text`) and /v1/messages
-        // streaming already scan tool calls, but chat streaming buffered only
+        // The chat non-streaming path (`guardrail_output_text`) already scans
+        // tool calls, but chat streaming buffered only
         // `delta.content` — a blocked literal in tool-call `arguments` leaked.
         // Under BufferFull the held-content budget below bounds it (a stream
         // that overflows is refused, or released unscanned and no longer

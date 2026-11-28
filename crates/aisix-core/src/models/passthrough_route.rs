@@ -104,8 +104,7 @@ pub struct PassthroughRoute {
     pub credential_mode: PassthroughCredentialMode,
 
     /// ProviderKey whose secret is injected upstream when `credential_mode`
-    /// is `inject` (per-provider auth shape: `x-api-key` +
-    /// `anthropic-version` for Anthropic, `Authorization: Bearer` otherwise;
+    /// is `inject` (auth shape: `Authorization: Bearer`;
     /// its `strip_headers` and TLS settings apply). Required for `inject`;
     /// forbidden for `forward_client`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -146,8 +145,8 @@ pub struct PassthroughRoute {
     /// Under `credential_mode: inject` the route removes every credential
     /// slot, whatever the ProviderKey's `strip_headers` lists and whatever
     /// the `auth_mode`, and removes the rest of `strip_headers` as well.
-    /// Naming the slot the route injects into (`x-api-key` for an Anthropic
-    /// ProviderKey, `authorization` otherwise) puts the caller's value on
+    /// Naming the slot the route injects into (`authorization` for the
+    /// ProviderKey's bearer credential) puts the caller's value on
     /// the upstream request in place of the injected one, never both —
     /// which is what lets an internal service that already authorizes on
     /// the end user's `Authorization` keep doing so unchanged. Any other

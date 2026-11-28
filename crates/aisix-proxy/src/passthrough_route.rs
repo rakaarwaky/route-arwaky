@@ -1433,8 +1433,8 @@ fn message_scan_text(msg: &serde_json::Value, reasoning: bool) -> String {
 /// Request text of one chat-envelope `content` value, which on this
 /// envelope may also be an Anthropic Messages block array: `text` blocks,
 /// a `tool_result`'s own content, a replayed `tool_use`'s input, and a
-/// replayed `thinking` block — the same slots the typed `/v1/messages`
-/// route scans once it has parsed the body. Caller-replayed reasoning is
+/// replayed `thinking` block — the same slots a parsed Anthropic Messages
+/// body scans. Caller-replayed reasoning is
 /// request text, as it is for `reasoning_content` above.
 fn request_content_text(v: &serde_json::Value) -> String {
     let serde_json::Value::Array(blocks) = v else {
@@ -1556,7 +1556,7 @@ fn detect_protocol(body: &[u8]) -> PassthroughProtocol {
 /// Split the `messages` envelope into OpenAI Chat and Anthropic Messages,
 /// which share the request carrier. Anthropic is recognised from what its
 /// SDKs always send: the `anthropic-version` header, or a request path
-/// ending in `/messages` (`/v1/messages`, a provider-prefixed variant),
+/// ending in `/messages` (a provider-prefixed Messages path included),
 /// where OpenAI Chat ends in `/chat/completions`. Neither signal is
 /// consulted for any other envelope.
 ///
@@ -5918,7 +5918,8 @@ fn frame_capture_text(protocol: PassthroughProtocol, frame: &[u8], scan: &str) -
 }
 
 /// The SSE error frame appended when an output guardrail blocks mid-relay,
-/// in the protocol of the stream it ends: the frame `/v1/messages` emits for
+/// in the protocol of the stream it ends: the error frame the Anthropic
+/// Messages protocol prescribes for
 /// the same refusal on an Anthropic Messages stream, the one
 /// `/v1/chat/completions` emits on every other.
 fn guardrail_error_frame(
@@ -11386,7 +11387,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
     }
 
     /// An Anthropic Messages body on the chat envelope is scanned in every
-    /// slot the typed `/v1/messages` route scans.
+    /// slot the Anthropic Messages protocol defines.
     #[test]
     fn anthropic_request_blocks_and_system_are_request_scan_text() {
         let body = serde_json::json!({
@@ -11707,7 +11708,7 @@ data: [DONE]\n\n";
     const MALFORMED_SUPPLEMENTAL_SSE: &str = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"input\":\"clean\",\"name\":1}}\n\n";
 
     /// A refusal ending a relayed Anthropic Messages stream is the frame
-    /// `/v1/messages` emits for it: an SDK-legal `error.type` and the
+    /// the Messages protocol prescribes for it: an SDK-legal `error.type` and the
     /// refusal named on `error.code`.
     #[tokio::test]
     async fn a_relayed_anthropic_stream_is_refused_in_the_anthropic_shape() {

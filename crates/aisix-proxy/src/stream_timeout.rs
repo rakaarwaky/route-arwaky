@@ -10,11 +10,11 @@
 //!
 //! Two flavours:
 //! - [`with_read_timeout`] for the typed [`ChatChunkStream`] path
-//!   (`/v1/chat/completions`, cross-provider `/v1/messages`): a read
+//!   (`/v1/chat/completions`): a read
 //!   timeout surfaces as [`BridgeError::Timeout`], which the SSE pump
 //!   already renders as an error frame.
 //! - [`with_read_timeout_bytes`] for the raw byte passthroughs
-//!   (`/v1/responses`, native-Anthropic `/v1/messages`): a read timeout
+//!   (`/v1/responses`, the passthrough routes): a read timeout
 //!   simply ends the forwarded byte stream (the client sees a truncated
 //!   response); there is no in-band error frame to inject into an opaque
 //!   passthrough.

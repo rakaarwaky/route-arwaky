@@ -46,8 +46,8 @@ pub fn raw_relay_client_for(conn: Option<&UpstreamConnection>) -> Client {
 
 #[cfg(test)]
 mod tests {
-    /// The passthrough surfaces are a family — `/v1/messages`,
-    /// `/v1/responses`, `count_tokens`, rerank, audio, videos, the jobs
+    /// The passthrough surfaces are a family — `/v1/responses`,
+    /// rerank, audio, videos, the jobs
     /// surface, the raw tunnel — and a new one added on [`client`]
     /// instead of [`client_for`] fails in exactly one way: the Provider
     /// Key's private CA and resolution address are ignored on that

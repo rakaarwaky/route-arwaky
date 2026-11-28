@@ -64,7 +64,7 @@ etcd:
 
 # Standalone file-based resource source — the alternative to etcd for a
 # single-container gateway. When set, every resource (provider keys,
-# models, API keys, guardrails, MCP servers, A2A agents, cache policies,
+# models, API keys, guardrails, cache policies,
 # observability exporters, rate-limit policies) is loaded from this one
 # YAML file at boot and re-read on SIGHUP; the `etcd` section above must
 # then be removed (the two sources are mutually exclusive), and the
@@ -74,9 +74,9 @@ etcd:
 
 proxy:
   addr: "0.0.0.0:3000"
-  # Cap on inbound request bodies (JSON, multipart, passthrough, MCP,
-  # A2A). 0 — the default — disables the cap: providers accept larger
-  # requests than any fixed gateway default (Anthropic takes 32 MB), so
+  # Cap on inbound request bodies (JSON, multipart, passthrough).
+  # 0 — the default — disables the cap: providers accept larger
+  # requests than any fixed gateway default, so
   # a gateway-side cap rejects requests the upstream would have served.
   # Set a value to bound per-request memory; over-limit requests get a
   # 413 in the caller's error envelope. Media the gateway downloads for a
@@ -162,16 +162,15 @@ proxy:
   # group references, and `?`/`#`/whitespace in the template fail startup.
   # In env-only deployments set the whole list as one JSON array:
   # AISIX_PROXY__URL_REWRITES='[{"match":"...","rewrite":"..."}]'
-  # Example: serve per-server MCP URLs like /mcp-servers/github/mcp on
-  # the /mcp/{server} endpoint.
+  # Example: serve a legacy health path on the canonical one.
   # Runs before ALL routing, including host-matched passthrough routes.
   # Optional hosts restrict a rule to those inbound hosts; omit for all hosts.
   # Host matching ignores case/port; *.example.com matches one extra label.
   # url_rewrites:
-  #   - name: per-server-mcp-compat
+  #   - name: legacy-health-compat
   #     hosts: ["gateway.example.com"]
-  #     match: "^/mcp-servers/([^/]+)/mcp$"
-  #     rewrite: "/mcp/$1"
+  #     match: "^/legacy/health$"
+  #     rewrite: "/livez"
   # Send debug response headers on /v1/chat/completions: x-aisix-call-id,
   # x-aisix-served-by (the routing target that answered), x-aisix-route
   # (the semantic route that matched) and x-aisix-cache / -cache-layer /
@@ -514,8 +513,8 @@ upstream:
   # retries: 2
 
   # Trust settings for the TLS handshake with every upstream: the provider
-  # bridges, guardrail services, MCP and A2A upstreams, OIDC/JWKS fetches,
-  # the Realtime WebSocket, Bedrock, and the log-export object stores.
+  # bridge, guardrail services, OIDC/JWKS fetches,
+  # the Realtime WebSocket, and the log-export object stores.
   #
   # Unset, the trust store is the platform's — the built-in root set plus
   # whatever SSL_CERT_FILE / SSL_CERT_DIR point at. Those environment
@@ -540,14 +539,13 @@ upstream:
   #   # test environment where the alternative is not running at all;
   #   # prefer ca_file everywhere else.
   #   #
-  #   # Two paths cannot honour it and log so at startup: Bedrock (the AWS
-  #   # SDK's HTTP stack cannot disable verification, and cannot present a
-  #   # client certificate either), and Redis in sentinel mode.
+  #   # One path cannot honour it and logs so at startup: Redis in sentinel
+  #   # mode.
   #   # verify: true
 
   # Media URLs in chat requests. When an image, audio or file part is a
-  # URL the target upstream cannot read itself — Amazon Bedrock, Claude
-  # on Vertex AI, or an http:// URL toward Anthropic or Gemini — the
+  # URL the target upstream cannot read itself — an http:// URL toward an
+  # https-only upstream, for example — the
   # gateway downloads it and sends the bytes inline. An upstream that
   # reads the URL itself still gets the URL.
   #
@@ -567,23 +565,12 @@ upstream:
   #   # against proxy.request_body_limit_bytes when that is set (413 past it).
   #   max_bytes: 52428800
 
-  # Amazon Bedrock endpoints a provider key's api_base does not name.
-  # bedrock:
-  #   # Bedrock Mantle, where /v1/messages/count_tokens for a Claude model is
-  #   # counted when bedrock-runtime's CountTokens refuses that model (Claude
-  #   # models served only through cross-region inference). null derives the
-  #   # public regional host from the provider key's region,
-  #   # https://bedrock-mantle.{region}.api.aws; set it for a VPC endpoint or
-  #   # GovCloud. One value serves every Bedrock provider key.
-  #   mantle_endpoint: null
-
 # Outbound requests to URLs the operator did not choose: the media download
 # (upstream.media_fetch), whose URL an API caller supplied, and an OAuth
-# document or endpoint an MCP server's metadata names on another scheme, host
-# or port than the server's url. URLs an operator configured (a provider key's
-# api_base, guardrail, MCP and A2A endpoints, a trust provider and its
-# discovery document, an MCP server's configured OAuth endpoints and what it
-# publishes on its own address, JWKS, exporters) are not affected.
+# document or endpoint an OIDC trust provider's metadata names on another
+# scheme, host or port than its url. URLs an operator configured (a provider
+# key's api_base, guardrail, OIDC discovery and JWKS, a trust provider and its
+# endpoints, exporters) are not affected.
 # outbound:
 #   # Server-side request forgery protection. On (the default), such a
 #   # request only reaches publicly routable addresses: loopback, private
@@ -591,8 +578,8 @@ upstream:
 #   # endpoint), benchmarking (198.18.0.0/15), IPv6 unique-local /
 #   # link-local, multicast and reserved ranges are refused, for every
 #   # address a name resolves to. A media download is refused with a 400 and
-#   # each of its redirect hops is checked; an MCP sign-in fails with an error
-#   # page or an OAuth error and follows no redirects. A direct
+#   # each of its redirect hops is checked; an OAuth discovery fetch fails
+#   # and follows no redirects. A direct
 #   # connection goes only to the addresses that were checked. When a
 #   # proxy applies to the URL, the name is resolved and checked locally
 #   # first and the proxy then resolves it again itself.

@@ -54,7 +54,7 @@ rm -f "$PGO_DIR"/*.profraw "$PGO_DIR"/merged-*.profdata "$PGO_DIR"/train-manifes
 # Shape list comes from the trainer itself — one source of truth; a drift
 # between this loop and the trainer's table is impossible by construction.
 mapfile -t SHAPES < <("$TRAINER" --list-shapes)
-[ "${#SHAPES[@]}" -ge 12 ] || { echo "FATAL: trainer lists ${#SHAPES[@]} shapes, expected >= 12" >&2; exit 1; }
+[ "${#SHAPES[@]}" -ge 8 ] || { echo "FATAL: trainer lists ${#SHAPES[@]} shapes, expected >= 8" >&2; exit 1; }
 
 # ---- gateway training config -------------------------------------------------
 # Modeled on the committed bench topology (bench/onthebench/run-baseline.sh):
@@ -82,11 +82,6 @@ provider_keys:
     adapter: openai
     api_base: "http://127.0.0.1:$MOCK_PORT/v1"
     api_key: "sk-pgo-mock"
-  - id: 4bd09d38-b683-4938-8d11-dc6c6bb4ae7b
-    display_name: pgo-anthropic
-    provider: anthropic
-    api_base: "http://127.0.0.1:$MOCK_PORT"
-    api_key: "sk-pgo-mock"
 models:
   - id: cc417944-9d8f-4e68-88d8-eda672d6bf79
     display_name: gpt-4o-mini
@@ -112,11 +107,6 @@ models:
       targets:
         - model_id: cc417944-9d8f-4e68-88d8-eda672d6bf79
         - model_id: 4032998c-3981-454c-8ddc-c92de240471d
-  - id: 0333c9ee-ad2d-4158-8c34-3454eb598c6a
-    display_name: claude-pgo
-    provider: anthropic
-    model_name: claude-pgo
-    provider_key_id: 4bd09d38-b683-4938-8d11-dc6c6bb4ae7b
   - id: 2e5485b6-4997-4aa4-8b4e-47455dc791b4
     display_name: text-embedding-mock
     provider: openai

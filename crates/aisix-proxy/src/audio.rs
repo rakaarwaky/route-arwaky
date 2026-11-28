@@ -179,8 +179,7 @@ pub async fn transcriptions(
             // On this family the flag IS "the response is a live relay" — it
             // is set only inside the `is_event_stream` branch and is what
             // labels the metric as streaming — so there is no second
-            // predicate to conjoin, unlike `/v1/messages` and
-            // `/v1/responses`. If it ever comes to mean "already emitted"
+            // predicate to conjoin, unlike `/v1/responses`. If it ever comes to mean "already emitted"
             // too, park on the relay itself instead: a parked line with no
             // later emitter is a line silently lost.
             if let Some(deferred_metrics) = deferred_metrics {
@@ -1911,8 +1910,8 @@ async fn multipart_dispatch(
         // been read by nothing. Refuse when a member of the chain both
         // reads the response AND fails closed on it — the predicate and
         // tag the tool-result arm uses, and the response-side mirror
-        // of the one `/v1/messages` and `/v1/messages/count_tokens` apply
-        // to a request body they cannot parse. Otherwise the transcript is
+        // of the request-side rule that refuses a body the gateway
+        // cannot parse. Otherwise the transcript is
         // released unscreened in part, which is a bypass and is recorded
         // as one; the decodable text is still scanned below, so only the
         // undecodable bytes go unread.

@@ -648,13 +648,13 @@ pub struct UsageEvent {
     /// - `"openai"` — `/v1/chat/completions` / `/v1/responses` /
     ///   `/v1/embeddings` / `/v1/audio/*` / `/v1/images/*` / `/v1/rerank`
     ///   (every OpenAI-shape endpoint family)
-    /// - `"anthropic"` — `/v1/messages` (Anthropic SDK)
+    /// - `"passthrough"` — passthrough-route traffic
     ///
-    /// Disambiguates the `provider` label which today reflects the
-    /// **upstream** provider only — an Anthropic-SDK call routed at a
-    /// non-Anthropic Model used to log `provider=openai` with no
-    /// indication the inbound protocol was Anthropic. Empty string on
-    /// the wire = legacy DP image; cp-api stores empty as NULL.
+    /// Disambiguates the `provider` label, which reflects the
+    /// **upstream** provider: a request whose Model id shadows a
+    /// different upstream name still logs the provider that actually
+    /// served it. Empty string on the wire = legacy DP image; cp-api
+    /// stores empty as NULL.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub inbound_protocol: String,
 

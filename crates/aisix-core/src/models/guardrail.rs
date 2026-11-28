@@ -281,7 +281,8 @@ pub struct OpenaiModerationConfig {
     /// before projection. Plaintext is held in memory only and is not logged.
     #[schemars(length(min = 1))]
     pub api_key: String,
-    /// Endpoint override, such as an Azure OpenAI deployment. AISIX appends
+    /// Endpoint override, such as a self-hosted or OpenAI-compatible
+    /// moderation service. AISIX appends
     /// `/moderations`. Defaults to `https://api.openai.com/v1`.
     #[serde(default)]
     #[schemars(length(min = 1))]
@@ -636,7 +637,7 @@ pub struct CustomConfig {
     /// Max bytes of model-generated content held back from a streamed response
     /// before `on_buffer_exceeded` applies: in `buffer_full` mode, and in
     /// `window` mode wherever output is held whole (the whole stream on
-    /// `/v1/messages` and `/v1/responses`, and tool-call arguments on
+    /// `/v1/responses`, and tool-call arguments on
     /// `/v1/chat/completions`) and no output guardrail in the chain uses
     /// `buffer_full`, whose rows alone then set the cap. Counts assistant
     /// text, reasoning, and tool-call arguments; SSE and JSON framing is not
