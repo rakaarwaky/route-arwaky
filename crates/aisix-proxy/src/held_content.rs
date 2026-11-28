@@ -1198,6 +1198,9 @@ mod tests {
     #[test]
     fn unparseable_payload_counts_whole() {
         let mut ledger = ResponsesHeldContent::default();
-        assert_eq!(responses_sse_held_frames(&mut ledger, b"data: not json\n\n"), 8);
+        assert_eq!(
+            responses_sse_held_frames(&mut ledger, b"data: not json\n\n"),
+            8
+        );
     }
 }

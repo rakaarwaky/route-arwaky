@@ -738,7 +738,7 @@ mod tests {
 
     // ── provider schema subsets ───────────────────────────────────
 
-            #[test]
+    #[test]
     fn one_of_is_relaxed_to_any_of_rather_than_dropped() {
         // Neither provider documents `oneOf`; dropping it would take the
         // alternatives with it, so the branches move to `anyOf`.
@@ -820,7 +820,7 @@ mod tests {
         assert!(json.contains("#/$defs/Node"), "{json}");
     }
 
-        #[test]
+    #[test]
     fn a_property_named_like_a_keyword_is_not_mistaken_for_one() {
         // `properties` is a map of caller-chosen names, not of schema
         // keywords. Walking it blindly deletes a field called `minimum`

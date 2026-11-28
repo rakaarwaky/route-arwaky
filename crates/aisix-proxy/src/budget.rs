@@ -66,7 +66,6 @@ pub struct BudgetReason {
 }
 
 impl BudgetReason {
-
     fn gauges(&self) -> aisix_obs::BudgetGauges {
         let amount = |v: &Option<String>| v.as_deref().and_then(|s| s.parse::<f64>().ok());
         aisix_obs::BudgetGauges {

@@ -153,7 +153,6 @@ pub(crate) struct Owned {
 }
 
 impl Owned {
-
     pub(crate) fn from_caller(c: Caller<'_>) -> Self {
         let known = |v: &str| (v != UNKNOWN).then(|| v.to_owned());
         Self {

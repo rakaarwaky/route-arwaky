@@ -774,9 +774,6 @@ fn redact_tool_call_arguments(
     }
 }
 
-
-
-
 /// The text of every signed reasoning content part in a chat request, for
 /// SCAN-ONLY submission to the segment pass ([`moderate_body_scanning`]) —
 /// the slots [`redact_chat_format`] leaves unoffered.
@@ -799,8 +796,6 @@ pub fn chat_signed_reasoning_texts(req: &ChatFormat) -> Vec<(String, bool)> {
         })
         .collect()
 }
-
-
 
 /// Mask a `/v1/responses` request body in place: `instructions` and
 /// `input` (bare string, or item list whose `message` items carry
@@ -1808,8 +1803,6 @@ fn excise_unscannable_frames(buf: &mut Vec<u8>) -> (Vec<String>, usize) {
     (excised, excised_bytes)
 }
 
-
-
 /// The concatenated client-visible delta content of a buffered `/v1/responses`
 /// SSE stream (channel order) — the capture-rebuild source after a segment
 /// mask.
@@ -2251,7 +2244,6 @@ mod tests {
         assert_eq!(chat_latest_turn_start(&req.messages), 0);
     }
 
-
     /// The Responses API spells a model turn as a typed item with no role
     /// at all, so `role: "assistant"` alone would put a whole agent tool
     /// loop inside the window.
@@ -2442,14 +2434,13 @@ mod tests {
         );
     }
 
-
     /// The exception is for the MASK only. A block-action rule still fires
     /// on signed reasoning content, because the scan-only channel reads it —
     /// otherwise the exception would have turned a signed block into a
     /// channel any forbidden text could travel through.
     #[tokio::test]
     async fn a_block_rule_still_fires_on_signed_reasoning_content() {
-        use aisix_guardrails::{KeywordBlocklist, KeywordRule, GuardrailVerdict};
+        use aisix_guardrails::{GuardrailVerdict, KeywordBlocklist, KeywordRule};
 
         let chain: Arc<dyn Guardrail> = Arc::new(GuardrailChain::new(vec![Arc::new(
             KeywordBlocklist::input_only(vec![KeywordRule::literal("FORBIDDENTHOUGHT")]),
@@ -2781,8 +2772,6 @@ mod tests {
         assert_eq!(counts.get("email"), Some(&2));
     }
 
-
-
     #[test]
     fn responses_request_masks_string_and_item_forms() {
         let chain = both();
@@ -2913,8 +2902,6 @@ mod tests {
         assert_eq!(chunks[0].delta.content.as_deref(), Some("hello "));
         assert_eq!(chunks[1].delta.content.as_deref(), Some("world"));
     }
-
-
 
     #[test]
     fn responses_sse_masks_delta_channel_and_aggregate_events() {
@@ -3159,7 +3146,6 @@ mod tests {
         // And the client gets a frame it can actually parse.
         assert!(out.ends_with("\n\n"), "out: {out}");
     }
-
 
     #[test]
     fn seal_leaves_a_terminated_body_byte_identical() {
@@ -3472,7 +3458,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn responses_sse_masks_a_frame_whose_payload_spans_several_data_lines() {
         let chain = both();
@@ -3577,7 +3562,6 @@ mod tests {
         assert_eq!(crlf, b"data: {\"a\":1}\r\n\r\ndata: [DONE]\r\n\r\n");
     }
 
-
     /// The event-stream spec lets a line end in a bare `\r` too. A body
     /// framed that way is framed, scanned and masked like any other, and
     /// comes back framed the way it arrived.
@@ -3601,7 +3585,6 @@ mod tests {
         assert!(!out.contains('\n'), "re-framed with LF: {out:?}");
         assert_eq!(out.matches("\r\r").count(), 2, "out: {out:?}");
     }
-
 
     #[test]
     fn seal_pads_a_cr_stream_with_cr() {
@@ -3655,7 +3638,6 @@ mod tests {
         );
         assert_eq!(counts.get("email"), Some(&3));
     }
-
 
     #[test]
     fn malformed_tool_args_fall_back_to_raw_text_masking() {

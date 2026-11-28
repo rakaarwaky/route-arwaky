@@ -2968,8 +2968,7 @@ mod tests {
         // adapter left is `openai`, and the handshake must reject the key
         // outright rather than dispatch it anywhere.
         let snap = snapshot("http://127.0.0.1:9", "openai", "openai");
-        let pk_json =
-            r#"{"display_name":"rt-pk","api_key":"sk-up","api_base":"http://127.0.0.1:9","provider":"other"}"#;
+        let pk_json = r#"{"display_name":"rt-pk","api_key":"sk-up","api_base":"http://127.0.0.1:9","provider":"other"}"#;
         let pk: aisix_core::ProviderKey = serde_json::from_str(pk_json).unwrap();
         snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 2));
         let (addr, _state, _rx) = serve(snap).await;

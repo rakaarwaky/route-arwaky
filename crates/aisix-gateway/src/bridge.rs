@@ -1228,7 +1228,6 @@ pub trait Bridge: Send + Sync + 'static {
             BridgeCapability::ImageGeneration,
         ))
     }
-
 }
 
 #[cfg(test)]

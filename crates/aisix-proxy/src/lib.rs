@@ -12471,12 +12471,8 @@ data: [DONE]\n\n";
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let next = tokio::time::timeout(remaining, rx.recv())
                 .await
-                .unwrap_or_else(|_| {
-                    panic!("{client:?}/stream={streaming}: no served UsageEvent")
-                })
-                .unwrap_or_else(|| {
-                    panic!("{client:?}/stream={streaming}: usage sink closed")
-                });
+                .unwrap_or_else(|_| panic!("{client:?}/stream={streaming}: no served UsageEvent"))
+                .unwrap_or_else(|| panic!("{client:?}/stream={streaming}: usage sink closed"));
             if next.status_code == 200 {
                 break next;
             }
@@ -12514,10 +12510,7 @@ data: [DONE]\n\n";
     /// Every cell, regardless of conversion: the event carries the
     /// UPSTREAM's own counters, so the same call bills identically no
     /// matter which client protocol addressed it.
-    fn um_assert_event_keeps_upstream_shape(
-        event: &aisix_obs::UsageEvent,
-        label: &str,
-    ) {
+    fn um_assert_event_keeps_upstream_shape(event: &aisix_obs::UsageEvent, label: &str) {
         assert_eq!(event.completion_tokens, UM_OUT, "{label}: completion");
         assert_eq!(event.prompt_tokens, UM_TOTAL_IN, "{label}: prompt");
         assert_eq!(

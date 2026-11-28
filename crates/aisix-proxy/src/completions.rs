@@ -1790,9 +1790,13 @@ mod tests {
         )
         .unwrap();
         let snap = AisixSnapshot::new();
-        snap.provider_keys
-            .insert(ResourceEntry::new("22222222-2222-2222-2222-222222222222", pk, 1));
-        snap.models.insert(ResourceEntry::new("m-chat-only", model, 1));
+        snap.provider_keys.insert(ResourceEntry::new(
+            "22222222-2222-2222-2222-222222222222",
+            pk,
+            1,
+        ));
+        snap.models
+            .insert(ResourceEntry::new("m-chat-only", model, 1));
         snap
     }
 

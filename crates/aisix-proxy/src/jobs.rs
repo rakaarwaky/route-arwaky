@@ -281,7 +281,6 @@ fn upstream_url(target: &JobTarget, path: &str, query: &str) -> Result<String, P
     }
 }
 
-
 /// Client query pairs forwarded upstream — routing hints are gateway-only.
 fn forwardable_query(raw_query: Option<&str>) -> String {
     raw_query
@@ -2820,7 +2819,6 @@ mod tests {
             Some(("file-res".to_string(), "jobs-a".to_string()))
         );
     }
-
 
     // ---- guards ----
 

@@ -341,7 +341,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn restamp_sse_buffer_rewrites_every_snapshot_frame_and_preserves_the_rest() {
         let buf = concat!(

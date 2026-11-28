@@ -736,9 +736,11 @@ async fn request_body_is_held_at_most_twice_while_upstream_is_pending() {
         );
         report.push((family, m, peak));
     }
-    let streaming_families = [
-        Family::new("responses stream", "/v1/responses", responses_body),
-    ];
+    let streaming_families = [Family::new(
+        "responses stream",
+        "/v1/responses",
+        responses_body,
+    )];
     let mut stream_failures = Vec::new();
     for family in &streaming_families {
         // Prompt capture retains its own full string; these cases isolate

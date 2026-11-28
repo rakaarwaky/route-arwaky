@@ -491,7 +491,6 @@ pub(crate) fn resolve_base_url_for(
     }
 }
 
-
 /// The raw per-surface `base` override, if this key declares a non-empty
 /// one. Shared by [`resolve_base_url_for`] and the cache fingerprint so
 /// the two can never read different inputs.
@@ -521,7 +520,6 @@ pub(crate) fn pk_surface_url_fingerprint(
         adapter,
     ]
 }
-
 
 /// The upstream API key — `provider_key.api_key`. Empty string is
 /// treated as a config error (ProviderKey rows shouldn't be empty,
@@ -860,7 +858,11 @@ mod tests {
         );
         let m = model_on("byo", "pk-1");
         let pk = resolve_provider_key(&snap, &m).ok();
-        assert!(serves_natively_with(&m, pk.as_ref().map(|e| &e.value), ApiSurface::Responses));
+        assert!(serves_natively_with(
+            &m,
+            pk.as_ref().map(|e| &e.value),
+            ApiSurface::Responses
+        ));
     }
 
     /// An empty `base` resolves as "no override" rather than building a
@@ -1046,7 +1048,7 @@ mod tests {
     /// shape on any other adapter keeps requiring `api_base`, so its
     /// credential never reaches api.openai.com through the messages
     /// passthrough or any other resolver-fed route.
-                    #[test]
+    #[test]
     fn resolve_base_url_openai_fallback_tolerates_case_and_blank_base() {
         let pk: ProviderKey = serde_json::from_str(
             r#"{"display_name":"x","api_key":"k","provider":" OpenAI ","api_base":"   "}"#,
