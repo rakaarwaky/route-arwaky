@@ -840,8 +840,8 @@ mod tests {
             },
         });
         for (label, limits) in [
-            ("anthropic", &KEEP_REFS_LIMITS),
-            ("gemini", &INLINE_REFS_LIMITS),
+            ("keep-refs", &KEEP_REFS_LIMITS),
+            ("inline-refs", &INLINE_REFS_LIMITS),
         ] {
             let mut schema = document.clone();
             apply_schema_limits(&mut schema, limits);

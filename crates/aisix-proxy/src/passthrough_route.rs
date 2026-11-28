@@ -937,23 +937,7 @@ async fn dispatch(
     // what `forward_client_headers` promises on this surface.
     if let Some(pk) = pk_entry.as_ref() {
         let api_key = pk.value.api_key.as_str();
-        let provider_lower = pk.value.provider.to_ascii_lowercase();
-        if provider_lower == "anthropic" {
-            // Anthropic's documented auth shape (#166): `x-api-key` +
-            // `anthropic-version`, never a redundant Bearer alongside.
-            if !forwarded_slots.contains("x-api-key") {
-                builder = builder.header("x-api-key", api_key);
-            }
-            // Only when the caller sent none. `RequestBuilder::header`
-            // appends, and `anthropic-version` is in no strip set — every
-            // Anthropic SDK sends its own, so injecting unconditionally
-            // put two revisions on the wire and let the upstream pick.
-            // A route relays the body verbatim and decodes nothing, so
-            // the caller's revision is the right one to keep.
-            if !incoming_headers.contains_key("anthropic-version") {
-                builder = builder.header("anthropic-version", "2023-06-01");
-            }
-        } else if !forwarded_slots.contains("authorization") {
+        if !forwarded_slots.contains("authorization") {
             builder = builder.header(header::AUTHORIZATION, format!("Bearer {api_key}"));
         }
     }

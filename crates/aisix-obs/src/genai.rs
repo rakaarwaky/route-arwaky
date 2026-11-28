@@ -307,19 +307,6 @@ impl GenAiRequestParams {
         }
     }
 
-    /// `/v1/messages` (Anthropic Messages).
-    pub fn from_anthropic_messages(body: &Map<String, Value>) -> Self {
-        Self {
-            max_tokens: int(body.get("max_tokens")),
-            temperature: num(body.get("temperature")),
-            top_p: num(body.get("top_p")),
-            top_k: num(body.get("top_k")),
-            stop_sequences: strings(body.get("stop_sequences")),
-            stream: body.get("stream").and_then(Value::as_bool) == Some(true),
-            ..Self::default()
-        }
-    }
-
     /// `/v1/responses` (OpenAI Responses).
     pub fn from_openai_responses(body: &Map<String, Value>) -> Self {
         Self {
@@ -361,7 +348,6 @@ pub struct StructuredContent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptWire {
     OpenAiChat,
-    AnthropicMessages,
     OpenAiResponses,
     OpenAiCompletions,
 }
@@ -373,7 +359,6 @@ impl PromptWire {
     pub fn for_operation(operation: &str) -> Option<Self> {
         match operation {
             "chat" => Some(Self::OpenAiChat),
-            "messages" => Some(Self::AnthropicMessages),
             "responses" => Some(Self::OpenAiResponses),
             "completions" => Some(Self::OpenAiCompletions),
             _ => None,
@@ -401,7 +386,6 @@ pub fn structured_content(
     if let Ok(Value::Object(body)) = serde_json::from_str::<Value>(prompt) {
         let converted = match wire {
             PromptWire::OpenAiChat => openai_chat_input(&body),
-            PromptWire::AnthropicMessages => anthropic_input(&body),
             PromptWire::OpenAiResponses => responses_input(&body),
             PromptWire::OpenAiCompletions => completions_input(&body),
         };
@@ -644,101 +628,6 @@ fn openai_chat_input(body: &Map<String, Value>) -> Option<Converted> {
     // Chat carries its system prompt inside the message list, which is
     // where the conventions want history-borne instructions recorded.
     Some((out, None, openai_tools(body.get("tools"))))
-}
-
-fn anthropic_blocks(content: Option<&Value>) -> Option<Vec<Value>> {
-    match content {
-        Some(Value::String(s)) => Some(vec![text_part(s)]),
-        Some(Value::Array(blocks)) => blocks
-            .iter()
-            .map(|b| match b.get("type").and_then(Value::as_str) {
-                Some("text") => b.get("text").and_then(Value::as_str).map(text_part),
-                Some("thinking") => b
-                    .get("thinking")
-                    .and_then(Value::as_str)
-                    .map(|t| json!({"type": "reasoning", "content": t})),
-                Some("image") | Some("document") => {
-                    let modality = if b["type"] == "image" {
-                        "image"
-                    } else {
-                        "document"
-                    };
-                    let source = b.get("source")?;
-                    match source.get("type").and_then(Value::as_str) {
-                        Some("base64") => Some(json!({
-                            "type": "blob",
-                            "modality": modality,
-                            "mime_type": source.get("media_type").cloned().unwrap_or(Value::Null),
-                            "content": source.get("data").and_then(Value::as_str)?,
-                        })),
-                        Some("url") => Some(json!({
-                            "type": "uri",
-                            "modality": modality,
-                            "uri": source.get("url").and_then(Value::as_str)?,
-                        })),
-                        _ => generic_part(b),
-                    }
-                }
-                Some("tool_use") => {
-                    let mut part = json!({
-                        "type": "tool_call",
-                        "name": b.get("name").and_then(Value::as_str)?,
-                        "arguments": b.get("input").cloned().unwrap_or(Value::Null),
-                    });
-                    if let Some(id) = b.get("id").and_then(Value::as_str) {
-                        part["id"] = Value::String(id.to_string());
-                    }
-                    Some(part)
-                }
-                Some("tool_result") => {
-                    let mut part = json!({
-                        "type": "tool_call_response",
-                        "response": b.get("content").cloned().unwrap_or(Value::Null),
-                    });
-                    if let Some(id) = b.get("tool_use_id").and_then(Value::as_str) {
-                        part["id"] = Value::String(id.to_string());
-                    }
-                    Some(part)
-                }
-                _ => generic_part(b),
-            })
-            .collect(),
-        _ => None,
-    }
-}
-
-fn anthropic_input(body: &Map<String, Value>) -> Option<Converted> {
-    let messages = body.get("messages")?.as_array()?;
-    let mut out = Vec::with_capacity(messages.len());
-    for m in messages {
-        let role = m.get("role").and_then(Value::as_str)?;
-        out.push(json!({"role": role, "parts": anthropic_blocks(m.get("content"))?}));
-    }
-    let system = match body.get("system") {
-        None | Some(Value::Null) => None,
-        Some(system) => Some(anthropic_blocks(Some(system))?),
-    };
-    let tools = body.get("tools").and_then(Value::as_array).map(|tools| {
-        tools
-            .iter()
-            .filter_map(|t| {
-                let name = t.get("name").and_then(Value::as_str)?;
-                // A client tool carries no `type` (or `custom`); a server
-                // tool names its versioned kind.
-                let kind = match t.get("type").and_then(Value::as_str) {
-                    None | Some("custom") => "function",
-                    Some(kind) => kind,
-                };
-                Some(tool_definition(
-                    kind,
-                    name,
-                    t.get("description"),
-                    t.get("input_schema"),
-                ))
-            })
-            .collect()
-    });
-    Some((out, system, tools))
 }
 
 fn responses_input(body: &Map<String, Value>) -> Option<Converted> {
@@ -1129,44 +1018,6 @@ mod tests {
         let f = UpstreamFacts::default().with_base_url("not a url");
         assert_eq!(f.server_address, "");
         assert_eq!(f.server_port, None);
-    }
-
-    #[test]
-    fn anthropic_content_maps_system_tools_and_tool_blocks() {
-        let body = json!({
-            "system": "be brief",
-            "tools": [{"name": "get_weather", "input_schema": {}}],
-            "messages": [
-                {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": [
-                    {"type": "tool_use", "id": "t1", "name": "get_weather", "input": {"city": "Paris"}}
-                ]},
-                {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "t1", "content": "rainy"}
-                ]}
-            ]
-        });
-        let c = structured_content(
-            PromptWire::AnthropicMessages,
-            &body.to_string(),
-            "It rains.",
-            None,
-            "end_turn",
-        );
-        let input: Value = serde_json::from_str(c.input_messages.as_deref().unwrap()).unwrap();
-        assert_eq!(input[1]["parts"][0]["type"], "tool_call");
-        assert_eq!(input[1]["parts"][0]["arguments"]["city"], "Paris");
-        assert_eq!(input[2]["parts"][0]["type"], "tool_call_response");
-        assert_eq!(
-            c.system_instructions.as_deref(),
-            Some(r#"[{"content":"be brief","type":"text"}]"#)
-        );
-        assert_eq!(
-            c.tool_definitions.as_deref(),
-            Some(r#"[{"name":"get_weather","parameters":{},"type":"function"}]"#)
-        );
-        let output: Value = serde_json::from_str(c.output_messages.as_deref().unwrap()).unwrap();
-        assert_eq!(output[0]["finish_reason"], "stop");
     }
 
     #[test]
