@@ -198,32 +198,6 @@ object_store = { version = "0.14", default-features = false, features = ["aws", 
 # is pure Rust — no zlib/C, consistent with the no-OpenSSL posture.
 flate2 = "1"
 
-# AWS SDK — kind=bedrock guardrail dispatcher (PRD-09c §6 Phase 2).
-# Pulled into aisix-guardrails only; opt-out via `--no-default-features`
-# on the crate when the operator never plans to use Bedrock.
-#
-# `default-https-client` (hyper 1 + rustls 0.23/aws-lc) instead of the
-# legacy `rustls` feature: on aws-sdk-bedrockruntime the latter drags the
-# retired hyper 0.14 + rustls 0.21 connector (rustls-webpki 0.101, EOL,
-# GHSA-xgp8-3hg3-c2mh / GHSA-965h-392x-2mh5) into the build even though every Bedrock
-# client is built on `upstream_tls::aws_http_client()` and never uses it.
-aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
-aws-sdk-bedrockruntime = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
-aws-credential-types = "1"
-# STS for AssumeRole and GetCallerIdentity on Bedrock credentials.
-aws-sdk-sts = { version = "1", default-features = false, features = ["rt-tokio"] }
-# Signs the Bedrock requests the SDK has no operation for (the runtime's
-# OpenAI-compatible Chat Completions endpoint).
-aws-sigv4 = { version = "1", default-features = false, features = ["sign-http", "http1"] }
-aws-smithy-async = { version = "1", features = ["rt-tokio"] }
-aws-smithy-runtime-api = "1"
-aws-smithy-types = "1"
-# Lets the Bedrock clients be built on an HTTP stack that carries
-# `upstream.tls.ca_file`, instead of the SDK's own default trust store
-# (api7/aisix#860). aws-lc matches the process-wide rustls provider
-# installed in main().
-aws-smithy-http-client = { version = "1", default-features = false, features = ["rustls-aws-lc"] }
-
 # Test-only
 wiremock = "0.6"
 tempfile = "3.13"
