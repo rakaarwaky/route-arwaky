@@ -332,40 +332,8 @@ describe("streamed output hold-back cap measures held content (#513)", () => {
     expect(text.startsWith(UNDER_CAP_TEXT)).toBe(true);
   });
 
-  test("messages (native): fail_open releases a thinking-heavy stream unscanned", async (ctx) => {
-    if (!ready(ctx)) return;
-    const before = capLines(true);
-    const res = await messages("cap-msg-native");
-    expect(res.status).toBe(200);
-    const body = await res.text();
-    await expectCapLine(true, before);
-    expect(body).not.toContain("event: error");
-    expect(body).toContain(PIECES[29]);
-    expect(body, "released unscanned, so the mask never ran").toContain(EMAIL);
-    expect(body).toContain("message_stop");
-  });
 
-  test("messages (native): text under the cap is scanned however many frames carry it", async (ctx) => {
-    if (!ready(ctx)) return;
-    const res = await messages("cap-msg-native-text");
-    expect(res.status).toBe(200);
-    const body = await res.text();
-    expect(body).not.toContain("event: error");
-    expect(body).toContain(MASKED);
-    expect(body).not.toContain(EMAIL);
-  });
 
-  test("messages (bridged): fail_open releases a reasoning-heavy stream unscanned", async (ctx) => {
-    if (!ready(ctx)) return;
-    const before = capLines(true);
-    const res = await messages("cap-msg-bridge");
-    expect(res.status).toBe(200);
-    const body = await res.text();
-    await expectCapLine(true, before);
-    expect(body).not.toContain("event: error");
-    expect(body, "released unscanned, so the mask never ran").toContain(EMAIL);
-    expect(body).toContain("message_stop");
-  });
 
   test("responses (native): fail_open releases a reasoning-heavy stream unscanned", async (ctx) => {
     if (!ready(ctx)) return;

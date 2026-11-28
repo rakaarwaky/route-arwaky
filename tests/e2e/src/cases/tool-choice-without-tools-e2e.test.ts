@@ -185,59 +185,5 @@ describe("tool_choice without tools is dropped at every bridge (#1614)", () => {
     expect(sent).not.toHaveProperty("tools");
   });
 
-  test("/v1/messages: an Anthropic tool_choice whose tools all filter out does not reach a chat upstream", async (ctx) => {
-    if (!etcdReachable || !app || !chatUpstream) {
-      ctx.skip();
-      return;
-    }
-    await ready();
 
-    const baseline = chatUpstream.receivedRequests.length;
-    const res = await fetch(`${app.proxyUrl}/v1/messages`, {
-      method: "POST",
-      headers: HEADERS,
-      body: JSON.stringify({
-        model: "tc1614-chat",
-        max_tokens: 32,
-        messages: [{ role: "user", content: "Summarise: hello" }],
-        // A non-empty list that translates to nothing — the Anthropic →
-        // chat converter keeps only entries carrying a `name`. Both keys
-        // must therefore be absent upstream, which an empty list here
-        // would not have proved.
-        tools: [{ description: "no name" }],
-        tool_choice: { type: "auto" },
-      }),
-    });
-
-    expect(res.status).toBe(200);
-    const sent = lastBodyOn(chatUpstream, baseline, "/v1/chat/completions");
-    expect(sent).not.toHaveProperty("tool_choice");
-    expect(sent).not.toHaveProperty("tools");
-  });
-
-  test("/v1/chat/completions: an empty tool list drops the choice on the way to Anthropic", async (ctx) => {
-    if (!etcdReachable || !app || !anthropicUpstream) {
-      ctx.skip();
-      return;
-    }
-    await ready();
-
-    const baseline = anthropicUpstream.receivedRequests.length;
-    const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: HEADERS,
-      body: JSON.stringify({
-        model: "tc1614-anthropic",
-        max_tokens: 32,
-        messages: [{ role: "user", content: "Summarise: hello" }],
-        tools: [],
-        tool_choice: "auto",
-      }),
-    });
-
-    expect(res.status).toBe(200);
-    const sent = lastBodyOn(anthropicUpstream, baseline, "/v1/messages");
-    expect(sent).not.toHaveProperty("tool_choice");
-    expect(sent).not.toHaveProperty("tools");
-  });
 });

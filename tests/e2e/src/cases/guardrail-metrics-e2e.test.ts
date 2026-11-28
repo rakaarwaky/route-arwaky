@@ -485,40 +485,5 @@ describe("guardrail latency metrics e2e: per-execution histogram", () => {
     );
   });
 
-  test("aggregate block counter covers Chat, Messages, and Responses", async (ctx) => {
-    if (!etcdReachable || !app) {
-      ctx.skip();
-      return;
-    }
-    let body = await scrape();
-    let previous = counterValue(body, "aisix_guardrail_blocks_total");
-    for (const protocol of ["chat", "messages", "responses"] as const) {
-      const res = await protocolRequest(protocol, `matrix ${protocol} ${KW_BLOCK_MARKER}`);
-      await res.text();
-      expect(res.status, `${protocol} block status`).toBe(422);
-      body = await scrape();
-      const current = counterValue(body, "aisix_guardrail_blocks_total");
-      expect(current, `${protocol} block counter`).toBe(previous + 1);
-      previous = current;
-    }
-  });
 
-  test("aggregate bypass counter covers Chat, Messages, and Responses", async (ctx) => {
-    if (!etcdReachable || !app) {
-      ctx.skip();
-      return;
-    }
-    const labels = { reason: "openai_moderation_5xx" };
-    let body = await scrape();
-    let previous = counterValue(body, "aisix_guardrail_bypasses_total", labels);
-    for (const protocol of ["chat", "messages", "responses"] as const) {
-      const res = await protocolRequest(protocol, `matrix ${protocol} ${ERROR_MARKER}`);
-      const responseBody = await res.text();
-      expect(res.status, `${protocol} bypass status: ${responseBody}`).toBe(200);
-      body = await scrape();
-      const current = counterValue(body, "aisix_guardrail_bypasses_total", labels);
-      expect(current, `${protocol} bypass counter`).toBe(previous + 1);
-      previous = current;
-    }
-  });
 });

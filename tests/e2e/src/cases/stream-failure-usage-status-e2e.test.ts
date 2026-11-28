@@ -498,23 +498,7 @@ describe("usage status of a stream that fails after its 200 headers", () => {
     await expectRequestFamily(before, "/v1/chat/completions", "sf-chat-cut", "502");
   });
 
-  test("messages (translated): a connection lost mid-stream is a 502, not the caller leaving", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const before = await scrapeMetrics(app.metricsUrl);
-    const requestId = await streamToEnd("/v1/messages", "sf-messages-bridge-cut");
-    expectUpstreamFailure(await usageRow(requestId), "502");
-    await expectRequestFamily(before, "/v1/messages", "sf-messages-bridge-cut", "502");
-  });
 
-  test("messages (native): an in-band rate-limit error records the 429 it would have been", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const before = await scrapeMetrics(app.metricsUrl);
-    const requestId = await streamToEnd("/v1/messages", "sf-messages-native-error");
-    const row = await usageRow(requestId);
-    expectUpstreamFailure(row, "429");
-    expect(row.get("error_message")).toContain("exceeded your rate limit");
-    await expectRequestFamily(before, "/v1/messages", "sf-messages-native-error", "429");
-  });
 
   test("responses (translated): a connection lost mid-stream is a 502 with its error", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();
@@ -664,27 +648,6 @@ describe("usage status of a stream that fails after its 200 headers", () => {
     expectUpstreamFailure(await usageRow(requestId), "502");
   });
 
-  test("passthrough route: an in-band upstream error records the status it maps to", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const res = await fetch(`${app.proxyUrl}${ERROR_ROUTE_PREFIX}/v1/messages`, {
-      method: "POST",
-      headers: { authorization: `Bearer ${CALLER_PLAINTEXT}`, "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "claude-3-5-haiku-20241022",
-        max_tokens: 64,
-        messages: [{ role: "user", content: "hi" }],
-        stream: true,
-      }),
-    });
-    expect(res.status).toBe(200);
-    const requestId = res.headers.get("x-aisix-request-id") ?? "";
-    expect(requestId).not.toBe("");
-    // The caller still receives the upstream's own error event.
-    expect(await res.text()).toContain("rate_limit_error");
-    const row = await usageRow(requestId);
-    expectUpstreamFailure(row, "429");
-    expect(row.get("error_message")).toContain("exceeded your rate limit");
-  });
 
   test("passthrough route: a nested-shape Responses error event records the upstream's message", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();

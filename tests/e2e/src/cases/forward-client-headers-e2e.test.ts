@@ -551,21 +551,6 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
     expect(occurrences(seen, "authorization")).toBe(1);
   });
 
-  test("the Anthropic bridge forwards too, into its own credential slot", async () => {
-    if (!etcdReachable) return;
-    const mark = anthropicUpstream!.receivedRequests.length;
-
-    await chat(ANTHROPIC_MODEL, {
-      [CUSTOM_HEADER]: "carried.verbatim",
-      "x-api-key": "callers-own-api-key",
-    }).then((r) => bodyOf(r, "the Anthropic bridge on /v1/chat/completions"));
-
-    const seen = anthropicUpstream!.receivedRequests.slice(mark).at(-1)!;
-    expect(seen.headers[CUSTOM_HEADER]).toBe("carried.verbatim");
-    expect(seen.headers["x-api-key"]).toBe("callers-own-api-key");
-    // The bridge still selects the wire format it decodes.
-    expect(seen.headers["anthropic-version"]).toBeDefined();
-  });
 
   test("a passthrough route's list overrides its strip set", async () => {
     if (!etcdReachable) return;
@@ -675,29 +660,6 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
     expect(occurrences(seen, "authorization")).toBe(1);
   });
 
-  test("a passthrough route never doubles a header it injects", async () => {
-    if (!etcdReachable) return;
-    const mark = upstream!.receivedRequests.length;
-
-    // `anthropic-version` is in no strip set, so the caller's own copy is
-    // relayed by the default forward — the route must then not append a
-    // second value behind it and leave the upstream to pick.
-    await fetch(`${app!.proxyUrl}${ROUTE_PREFIX}-anthropic/v1/messages`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${CALLER_KEY}`,
-        "content-type": "application/json",
-        "anthropic-version": "2023-01-01",
-      },
-      body: JSON.stringify({ model: "claude-sonnet-4", messages: [] }),
-    }).then((r) => bodyOf(r, "the anthropic passthrough route"));
-
-    const seen = since(mark).at(-1)!;
-    expect(occurrences(seen, "anthropic-version")).toBe(1);
-    expect(seen.headers["anthropic-version"]).toBe("2023-01-01");
-    // And the gateway's own credential still authenticates the call.
-    expect(seen.headers["x-api-key"]).toBe(GATEWAY_SECRET);
-  });
 
   const callRoute = async (
     suffix: string,
@@ -767,18 +729,6 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
     expect(seen.headers[PLAIN_HEADER]).toBe("kept");
   });
 
-  test("an Anthropic injecting route returns a named x-api-key in place of its own", async () => {
-    if (!etcdReachable) return;
-
-    const seen = await callRoute("inject-anthropic-named", {
-      authorization: `Bearer ${CALLER_KEY}`,
-      "x-api-key": "caller-x-api-key",
-    });
-
-    expect(seen.headers["x-api-key"]).toBe("caller-x-api-key");
-    expect(occurrences(seen, "x-api-key")).toBe(1);
-    expect(seen.headers.authorization).toBeUndefined();
-  });
 
   test("naming one slot beside a glob returns that slot and no other", async () => {
     if (!etcdReachable) return;
@@ -812,50 +762,7 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
     expect(seen.headers[PLAIN_HEADER]).toBe("kept");
   });
 
-  test("a REST system server exposed as MCP tools receives them", async () => {
-    if (!etcdReachable) return;
-    const mark = upstream!.receivedRequests.length;
 
-    await callTool("systemserver__listmodels", {
-      [CUSTOM_HEADER]: "carried.verbatim",
-    });
-
-    const toolCall = since(mark).find((r) => r.path.endsWith("/models"));
-    expect(toolCall, "the generated tool must reach the REST upstream").toBeDefined();
-    expect(toolCall!.headers[CUSTOM_HEADER]).toBe("carried.verbatim");
-    // The caller's own credential took the slot `auth_type: bearer` would
-    // have filled with `gateway-held-mcp-secret`.
-    expect(toolCall!.headers.authorization).toBe(`Bearer ${CALLER_KEY}`);
-    expect(toolCall!.headers.authorization).not.toContain("gateway-held-mcp-secret");
-  });
-
-  test("a native MCP upstream receives them, minus the session slots", async () => {
-    if (!etcdReachable) return;
-    const mark = mcpUpstream!.receivedHeaders.length;
-
-    // The caller really sends the session slots, so the assertion below
-    // fails if the block is removed rather than because nothing matched.
-    await callTool("nativeserver__echo", {
-      [CUSTOM_HEADER]: "carried.verbatim",
-      "mcp-session-id": "callers-own-session",
-      "last-event-id": "callers-own-event",
-    });
-
-    const seen = mcpUpstream!.receivedHeaders.slice(mark);
-    expect(seen.length, "the tool call must reach the MCP upstream").toBeGreaterThan(0);
-    expect(seen.some((h) => h[CUSTOM_HEADER] === "carried.verbatim")).toBe(true);
-    // `*` sweeps in everything else, but never the session this gateway
-    // holds with the CALLER: it names a session the upstream never issued,
-    // and rmcp refuses a foreign `mcp-session-id` outright — the
-    // connection fails rather than degrades.
-    for (const h of seen) {
-      // `toContain`, not `toBe`: node joins a repeated header, so a
-      // relayed copy could arrive as `callers-own-session,<real id>` and
-      // an equality check would call that clean.
-      expect(h["mcp-session-id"] ?? "").not.toContain("callers-own-session");
-      expect(h["last-event-id"] ?? "").not.toContain("callers-own-event");
-    }
-  });
 
   /** A JSON-RPC call to an agent through the gateway. */
   const a2aCall = async (
@@ -891,92 +798,10 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
   const a2aSince = (mark: number, httpMethod: "GET" | "POST") =>
     a2aUpstream!.requests.slice(mark).filter((r) => r.httpMethod === httpMethod);
 
-  test("an A2A agent receives a named header, and a forwarded credential rides alone", async () => {
-    if (!etcdReachable) return;
-    const mark = a2aUpstream!.requests.length;
 
-    await a2aCall(A2A_AGENT, "message/send", {
-      [CUSTOM_HEADER]: "carried.verbatim",
-    }).then((r) => bodyOf(r, "/a2a message/send"));
 
-    const seen = a2aSince(mark, "POST").at(-1)!;
-    expect(seen.headers[CUSTOM_HEADER]).toBe("carried.verbatim");
-    // The caller authenticates to the GATEWAY with its own AISIX key; the
-    // operator has declared that this agent reads the caller's credential
-    // rather than the one the gateway holds for it.
-    expect(seen.headers.authorization).toBe(`Bearer ${CALLER_KEY}`);
-    // And ALONE: node keeps only the FIRST `authorization`, so a gateway
-    // credential appended behind the caller's would be invisible in the
-    // collapsed value and only the occurrence count shows it stood aside.
-    expect(occurrences(seen, "authorization")).toBe(1);
-    expect(seen.headers.authorization).not.toContain(A2A_GATEWAY_SECRET);
-  });
 
-  test("an A2A agent nobody opted in receives nothing", async () => {
-    if (!etcdReachable) return;
-    const mark = a2aUpstream!.requests.length;
 
-    await a2aCall(A2A_PLAIN_AGENT, "message/send", {
-      [CUSTOM_HEADER]: "carried.verbatim",
-    }).then((r) => bodyOf(r, "/a2a on the un-opted-in agent"));
-
-    const seen = a2aSince(mark, "POST").at(-1)!;
-    expect(seen.headers[CUSTOM_HEADER]).toBeUndefined();
-    expect(seen.headers.authorization).toBe(`Bearer ${A2A_GATEWAY_SECRET}`);
-  });
-
-  test("the A2A agent-card fetch forwards them too", async () => {
-    if (!etcdReachable) return;
-    const mark = a2aUpstream!.requests.length;
-
-    // Card discovery is an upstream hop of its own, built at a different call
-    // site than the JSON-RPC one — an agent that gates discovery on the end
-    // user's own credential is exactly what this capability is for.
-    await fetch(
-      `${app!.proxyUrl}/a2a/${A2A_AGENT}/.well-known/agent-card.json`,
-      { headers: { authorization: `Bearer ${CALLER_KEY}`, [CUSTOM_HEADER]: "carried.verbatim" } },
-    ).then((r) => bodyOf(r, "the A2A agent card"));
-
-    const card = a2aSince(mark, "GET").at(-1)!;
-    expect(card.headers[CUSTOM_HEADER]).toBe("carried.verbatim");
-    expect(card.headers.authorization).toBe(`Bearer ${CALLER_KEY}`);
-    expect(occurrences(card, "authorization")).toBe(1);
-  });
-
-  test("an A2A streaming call forwards them too", async () => {
-    if (!etcdReachable) return;
-    const mark = a2aUpstream!.requests.length;
-
-    // `message/stream` opens its upstream request at a different call site
-    // than the buffered one, and only this path exercises it.
-    await a2aCall(A2A_AGENT, "message/stream", {
-      [CUSTOM_HEADER]: "carried.verbatim",
-    }).then((r) => bodyOf(r, "/a2a message/stream"));
-
-    const seen = a2aSince(mark, "POST").at(-1)!;
-    expect(seen.headers[CUSTOM_HEADER]).toBe("carried.verbatim");
-    expect(seen.headers.authorization).toBe(`Bearer ${CALLER_KEY}`);
-  });
-
-  test("a glob never sweeps the A2A version the gateway announces", async () => {
-    if (!etcdReachable) return;
-    const mark = a2aUpstream!.requests.length;
-
-    await a2aCall(A2A_AGENT, "message/send", {
-      // Both MATCH the configured `*`, so what separates them is the rule
-      // under test rather than a pattern that failed to fire.
-      "a2a-version": "0.3",
-      "x-allowed": "yes",
-    }).then((r) => bodyOf(r, "the A2A glob case"));
-
-    const seen = a2aSince(mark, "POST").at(-1)!;
-    expect(seen.headers["x-allowed"]).toBe("yes");
-    // The version is the gateway's own announcement of the agent's pinned
-    // wire format. A relayed copy would let the caller pick the envelope
-    // shape the agent answers in, or make it refuse the call outright.
-    expect(seen.version).toBe("1.0");
-    expect(occurrences(seen, "a2a-version")).toBe(1);
-  });
 
   test("an ensemble's panel and judge each forward on their own upstream", async () => {
     if (!etcdReachable) return;

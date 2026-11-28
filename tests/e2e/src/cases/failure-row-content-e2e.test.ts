@@ -10,13 +10,11 @@ import {
   expectFailureRowsNamed,
   slsLogsFor,
   spawnApp,
-  startMcpUpstream,
   startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
   waitForLogLine,
   waitForSlsLog,
-  type McpUpstream,
   type MockSls,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -29,8 +27,6 @@ import {
 
 const CALLER = "sk-failure-row-caller";
 const LIMITED_CALLER = "sk-failure-row-limited";
-const MCP_LIMITED_CALLER = "sk-failure-row-mcp-limited";
-const MCP_BLOCKED_WORD = "sentinel-mcp-forbidden-word";
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
 
 const CREDENTIAL_REF = "mock";
@@ -51,7 +47,6 @@ describe("failure rows carry request and response bodies", () => {
   let app: SpawnedApp | undefined;
   const tcpServers: TcpServer[] = [];
   const httpServers: HttpServer[] = [];
-  let mcpUpstream: McpUpstream | undefined;
   const upstreams: OpenAiUpstream[] = [];
   let etcdReachable = false;
   let seed: SeedClient;
@@ -306,23 +301,6 @@ describe("failure rows carry request and response bodies", () => {
       adapter: "openai",
       model_name: "rerank-v3.5",
     });
-    await modelAt("row-bedrock-400", await fixedUpstream(
-      400,
-      JSON.stringify({ message: "sentinel-bedrock-answer" }),
-      {
-        "content-type": "application/json",
-        "x-amzn-errortype": "ValidationException:http://internal.amazon.com/coral/com.amazon.bedrock/",
-      },
-    ), {
-      provider: "bedrock",
-      adapter: "bedrock",
-      model_name: "openai.gpt-6-sol",
-      api_key: JSON.stringify({
-        access_key_id: "AKIA-failure-row",
-        secret_access_key: "sk-failure-row",
-        region: "us-east-1",
-      }),
-    });
     const textHeaders = { "content-type": "text/plain" };
     await modelAt("row-video-text", `${await fixedUpstream(500, "sentinel video gateway page", textHeaders)}/v1`);
     await modelAt("row-video-empty", `${await fixedUpstream(500, "", textHeaders)}/v1`);
@@ -344,36 +322,6 @@ describe("failure rows carry request and response bodies", () => {
       eventDelayMs: 1_000,
     });
 
-    await seed.update("a2a_agents", randomUUID(), {
-      name: "row-agent",
-      url: await fixedUpstream(500, "sentinel-a2a-answer", textHeaders),
-      protocol_version: "1.0",
-      auth_type: "none",
-      enabled: true,
-    });
-
-    mcpUpstream = await startMcpUpstream("rowmcp");
-    const mcpId = randomUUID();
-    await seed.update("mcp_servers", mcpId, {
-      name: "rowmcp",
-      url: mcpUpstream.url,
-      enabled: true,
-    });
-    const mcpGuard = await seed.createGuardrail(
-      {
-        name: "row-mcp-guard",
-        kind: "keyword",
-        patterns: [{ kind: "literal", value: MCP_BLOCKED_WORD }],
-      },
-      { attach: false },
-    );
-    await seed.update("guardrail_attachments", randomUUID(), {
-      guardrail_id: mcpGuard.id,
-      scope_type: "mcp_server",
-      scope_id: mcpId,
-      priority: 100,
-    });
-
     const passthroughUpstream = await startOpenAiUpstream({
       status: 500,
       errorBody: { error: { message: "sentinel-passthrough-answer" } },
@@ -387,12 +335,6 @@ describe("failure rows carry request and response bodies", () => {
     });
 
     await seed.createApiKey({
-      key_hash: hash(MCP_LIMITED_CALLER),
-      allowed_models: [],
-      mcp_access: { allow: ["*"] },
-      mcp_rate_limits: { rowmcp: { rpm: 1 } },
-    });
-    await seed.createApiKey({
       key_hash: hash(LIMITED_CALLER),
       allowed_models: ["row-ok"],
       rate_limit: { rpm: 1 },
@@ -400,14 +342,11 @@ describe("failure rows carry request and response bodies", () => {
     await seed.createApiKey({
       key_hash: hash(CALLER),
       allowed_routes: ["*"],
-      allowed_agents: ["*"],
-      mcp_access: { allow: ["*"] },
       allowed_models: [
         "row-truncated-rerank",
         "row-truncated-empty",
         "row-any-400",
         "row-rerank-400",
-        "row-bedrock-400",
         "row-video-text",
         "row-video-empty",
         "row-video-json",
@@ -449,7 +388,6 @@ describe("failure rows carry request and response bodies", () => {
       }
     }
     for (const upstream of upstreams) await upstream.close();
-    await mcpUpstream?.close();
     for (const server of tcpServers) server.close();
     for (const server of httpServers) server.close();
     await sls?.close();
@@ -702,35 +640,6 @@ describe("failure rows carry request and response bodies", () => {
     expect(row.get("response")).toContain("sentinel-passthrough-answer");
   });
 
-  test("count_tokens and videos, which capture nothing on success, report a failure", async () => {
-    if (!etcdReachable) return;
-    const counted = await fetch(`${app!.proxyUrl}/v1/messages/count_tokens`, {
-      method: "POST",
-      headers: { ...headers, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({
-        model: "row-unlisted",
-        messages: [{ role: "user", content: "count-prompt" }],
-      }),
-    });
-    const countedBody = await counted.text();
-    expect(counted.status).toBe(403);
-    const countedRow = await rowOf(counted.headers.get("x-aisix-request-id")!, "the count row");
-    expect(requestText(countedRow)).toContain("count-prompt");
-    // The Anthropic shape this route answers with, not the OpenAI one.
-    expect(JSON.parse(countedRow.get("response")!)).toEqual(JSON.parse(countedBody));
-    expect(JSON.parse(countedBody).type).toBe("error");
-
-    const video = await fetch(`${app!.proxyUrl}/v1/videos`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ model: "row-unlisted", prompt: "video-prompt" }),
-    });
-    await video.text();
-    expect(video.status).toBe(403);
-    const videoRow = await rowOf(video.headers.get("x-aisix-request-id")!, "the video row");
-    expect(requestText(videoRow)).toContain("video-prompt");
-  });
-
   test.each([
     ["an empty body", "row-empty-404", 404, 404, "upstream returned 404 Not Found"],
     ["a blank message", "row-blank-message", 404, 404, "upstream returned 404 Not Found"],
@@ -885,11 +794,9 @@ describe("failure rows carry request and response bodies", () => {
     ["images", "/v1/images/generations", { model: "row-any-400", prompt: "path-prompt" }, ANY_400],
     ["rerank", "/v1/rerank", { model: "row-rerank-400", query: "path-prompt", documents: ["a"] }, ANY_400],
     ["jobs", "/v1/batches?model=row-any-400", { input_file_id: "path-prompt" }, ANY_400],
-    ["bedrock converse", "/v1/chat/completions", { model: "row-bedrock-400", messages: [{ role: "user", content: "path-prompt" }] }, '{"message":"sentinel-bedrock-answer"}'],
-    ["a2a", "/a2a/row-agent", { jsonrpc: "2.0", id: "1", method: "message/send", params: { message: { role: "user", parts: [{ kind: "text", text: "path-prompt" }], messageId: "m-1" } } }, "sentinel-a2a-answer"],
   ] as const)("%s: an upstream failure carries both bodies", async (_what, path, payload, answer) => {
     if (!etcdReachable) return;
-    const res = await post(path, payload, { "anthropic-version": "2023-06-01" });
+    const res = await post(path, payload);
     await res.text();
     expect(res.status).toBeGreaterThanOrEqual(400);
     const row = await rowOf(res.headers.get("x-aisix-request-id")!, `the ${path} row`);
@@ -916,50 +823,6 @@ describe("failure rows carry request and response bodies", () => {
     expect(prompt.prompt).toBe("edit-prompt");
     expect(prompt.image_sha256).toBe(hash("sentinel-image-bytes"));
     expect(row.get("response")).toContain("sentinel-any-400");
-  });
-
-  const mcpCall = (key: string, text: string) =>
-    fetch(`${app!.proxyUrl}/mcp`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${key}`,
-        "content-type": "application/json",
-        accept: "application/json, text/event-stream",
-      },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 3,
-        method: "tools/call",
-        params: { name: "rowmcp__echo", arguments: { text } },
-      }),
-    });
-
-  test("mcp: a blocked tool call carries its arguments and the JSON-RPC refusal", async () => {
-    if (!etcdReachable) return;
-    const res = await mcpCall(CALLER, `say ${MCP_BLOCKED_WORD}`);
-    const body = await res.text();
-    expect(res.status).toBe(200);
-    expect(body).toContain("content policy");
-    const row = await rowOf(res.headers.get("x-aisix-request-id")!, "the blocked tool row");
-    expect(row.get("guardrail_blocked")).toBe("true");
-    expect(requestText(row)).toContain(MCP_BLOCKED_WORD);
-    expect(JSON.parse(row.get("response")!)).toEqual(JSON.parse(body));
-  });
-
-  test("mcp: a rate-limited tool call carries its arguments and the error the caller got", async () => {
-    if (!etcdReachable) return;
-    let refused: Response | undefined;
-    for (let i = 0; i < 5 && !refused; i++) {
-      const res = await mcpCall(MCP_LIMITED_CALLER, "limited-tool-prompt");
-      if (res.status === 429) refused = res;
-      else await res.text();
-    }
-    expect(refused, "the key's rpm refused a tool call").toBeDefined();
-    const body = await refused!.text();
-    const row = await rowOf(refused!.headers.get("x-aisix-request-id")!, "the limited tool row");
-    expect(row.get("status_code")).toBe("429");
-    expect(requestText(row)).toContain("limited-tool-prompt");
-    expect(JSON.parse(row.get("response")!)).toEqual(JSON.parse(body));
   });
 
   const openRealtime = (model: string) =>

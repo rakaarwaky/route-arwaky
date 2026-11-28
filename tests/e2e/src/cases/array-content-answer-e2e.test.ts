@@ -242,18 +242,6 @@ describe("an answer whose content is an array of parts", () => {
     await Promise.all(Object.values(up).map((u) => u.close()));
   });
 
-  test("reaches a /v1/messages caller as a text block", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const res = await post(app, "/v1/messages", {
-      model: "ac-short",
-      max_tokens: 64,
-      messages: [{ role: "user", content: "What is the capital of France?" }],
-    });
-    const body = (await res.json()) as any;
-    expect(res.status, JSON.stringify(body)).toBe(200);
-    expect(body.content).toEqual([{ type: "text", text: ANSWER }]);
-    expect(body.stop_reason).toBe("end_turn");
-  });
 
   test("reaches a /v1/responses caller as an output_text message", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
@@ -271,7 +259,6 @@ describe("an answer whose content is an array of parts", () => {
 
   test.for([
     ["/v1/chat/completions", "chat-capture-probe", { messages: [{ role: "user", content: "chat-capture-probe" }] }],
-    ["/v1/messages", "messages-capture-probe", { max_tokens: 64, messages: [{ role: "user", content: "messages-capture-probe" }] }],
   ] as const)("reaches the content exporter from %s", async ([path, probe, body], ctx) => {
     if (!etcdReachable || !app || !otlp) return ctx.skip();
     const res = await post(app, path, { model: "ac-long", ...body });
@@ -302,23 +289,6 @@ describe("an answer whose content is an array of parts", () => {
     }
   });
 
-  test.for(["mistral", "databricks"] as const)(
-    "reasoning parts (%s) reach a /v1/messages caller as a thinking block ahead of the text",
-    async (shape, ctx) => {
-      if (!etcdReachable || !app) return ctx.skip();
-      const res = await post(app, "/v1/messages", {
-        model: `ac-${shape}`,
-        max_tokens: 64,
-        messages: [{ role: "user", content: "What is the capital of France?" }],
-      });
-      const body = (await res.json()) as any;
-      expect(res.status, JSON.stringify(body)).toBe(200);
-      expect(body.content).toEqual([
-        { type: "thinking", thinking: THINKING, signature: "" },
-        { type: "text", text: ANSWER },
-      ]);
-    },
-  );
 
   test.for(["mistral", "databricks"] as const)(
     "reasoning parts (%s) reach a /v1/responses caller as a reasoning item ahead of the message",

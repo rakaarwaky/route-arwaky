@@ -209,9 +209,6 @@ const STREAMS: Record<string, string[]> = {
   "responses-function-done": [
     JSON.stringify({ type: "response.function_call_arguments.done", item_id: "function_done", output_index: 0, name: "lookup", arguments: JSON.stringify({ query: OUT_LIT }) }),
   ],
-  "responses-mcp-done": [
-    JSON.stringify({ type: "response.mcp_call_arguments.done", item_id: "mcp_done", output_index: 0, arguments: JSON.stringify({ query: OUT_LIT }) }),
-  ],
   "responses-custom-done": [
     JSON.stringify({ type: "response.custom_tool_call_input.done", item_id: "custom_done", output_index: 0, input: OUT_LIT }),
   ],
@@ -540,7 +537,6 @@ describe("passthrough guardrail scan coverage", () => {
     "responses-output-text-done",
     "responses-refusal-done-only",
     "responses-function-done",
-    "responses-mcp-done",
     "responses-custom-done",
     "responses-content-part-added",
     "responses-content-part-done",

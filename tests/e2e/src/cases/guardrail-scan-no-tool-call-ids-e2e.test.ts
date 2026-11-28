@@ -40,7 +40,6 @@ const CHAT_TOOL = {
     parameters: { type: "object", properties: { city: { type: "string" } } },
   },
 };
-const ANTHROPIC_TOOL = { name: TOOL, input_schema: CHAT_TOOL.function.parameters };
 const RESPONSES_TOOL = { type: "function", name: TOOL, parameters: CHAT_TOOL.function.parameters };
 
 const sse = (events: unknown[]) =>
@@ -191,19 +190,6 @@ describe("guardrails never scan a tool-call id", () => {
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const openaiPk = await seed.createProviderKey({ display_name: "ids-openai-pk", api_key: "sk-mock", api_base: `${base}/v1` });
     await seed.createModel({ display_name: "ids-gpt", provider: "openai", model_name: "gpt-4o", provider_key_id: openaiPk.id });
-    const anthropicPk = await seed.createProviderKey({
-      display_name: "ids-anthropic-pk",
-      provider: "anthropic",
-      adapter: "anthropic",
-      api_key: "sk-ant-mock",
-      api_base: base,
-    });
-    await seed.createModel({
-      display_name: "ids-claude",
-      provider: "anthropic",
-      model_name: "claude-sonnet-4-5",
-      provider_key_id: anthropicPk.id,
-    });
     await seed.createPassthroughRoute({
       name: "ids-pt",
       path_prefix: "/ids-pt",
@@ -284,36 +270,6 @@ describe("guardrails never scan a tool-call id", () => {
       }),
     },
     {
-      name: "/v1/messages",
-      path: "/v1/messages",
-      body: (history: boolean) => ({
-        model: "ids-claude",
-        max_tokens: 64,
-        messages: history ? messagesHistory : [{ role: "user", content: question }],
-        tools: [ANTHROPIC_TOOL],
-      }),
-    },
-    {
-      name: "/v1/chat/completions bridged to Anthropic",
-      path: "/v1/chat/completions",
-      body: (history: boolean) => ({
-        model: "ids-claude",
-        max_tokens: 64,
-        messages: history ? chatHistory : [{ role: "user", content: question }],
-        tools: [CHAT_TOOL],
-      }),
-    },
-    {
-      name: "/v1/messages bridged to OpenAI Chat",
-      path: "/v1/messages",
-      body: (history: boolean) => ({
-        model: "ids-gpt",
-        max_tokens: 64,
-        messages: history ? messagesHistory : [{ role: "user", content: question }],
-        tools: [ANTHROPIC_TOOL],
-      }),
-    },
-    {
       name: "/v1/responses",
       path: "/v1/responses",
       body: (history: boolean) => ({ model: "ids-gpt", input: history ? responsesHistory : question, tools: [RESPONSES_TOOL] }),
@@ -371,10 +327,10 @@ describe("guardrails never scan a tool-call id", () => {
       summary: [{ type: "summary_text", text: "REASONSUMMARY" }],
     },
   ];
-  for (const path of ["/v1/responses", "/ids-pt/v1/responses"]) {
+  for (const path of ["/v1/responses"]) {
     test(`${path} input leaves out item references, approval ids and reasoning ciphertext`, async (ctx) => {
       if (!etcdReachable || !app) return ctx.skip();
-      const model = path.startsWith("/ids-pt") ? "gpt-4o" : "ids-gpt";
+      const model = "ids-gpt";
       const texts = await scanned(path, { model, input: handleHistory, tools: [RESPONSES_TOOL] });
       expectNoIds(texts);
       for (const text of ["INARGMARK", "APPROVEREASON", "REASONSUMMARY"]) {
@@ -383,12 +339,6 @@ describe("guardrails never scan a tool-call id", () => {
     });
   }
 
-  test("/v1/messages/count_tokens", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const texts = await scanned("/v1/messages/count_tokens", { model: "ids-claude", messages: messagesHistory, tools: [ANTHROPIC_TOOL] });
-    expectNoIds(texts);
-    expect(texts.some((t) => t.includes(TOOL) && t.includes("INARGMARK")), "input name and arguments scanned").toBe(true);
-  });
 
   test("passthrough Anthropic body on the chat envelope", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();

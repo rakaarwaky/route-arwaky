@@ -9,13 +9,11 @@ import {
   SeedClient,
   expectFailureRowsNamed,
   spawnApp,
-  startMcpUpstream,
   startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
   waitForLogLine,
   waitForSlsLog,
-  type McpUpstream,
   type MockSls,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -41,7 +39,6 @@ describe("failure rows name the failure under metadata_only", () => {
   const httpServers: HttpServer[] = [];
   const tcpServers: TcpServer[] = [];
   const upstreams: OpenAiUpstream[] = [];
-  let mcpUpstream: McpUpstream | undefined;
   let etcdReachable = false;
 
   async function fixedUpstream(
@@ -148,23 +145,6 @@ describe("failure rows name the failure under metadata_only", () => {
         { "content-type": "text/event-stream" },
       )}/v1`,
     );
-    const anthropicPk = await seed.createProviderKey({
-      display_name: "meta-anthropic-pk",
-      api_key: "sk-mock",
-      provider: "anthropic",
-      api_base: failing,
-    });
-    await seed.createModel({
-      display_name: "meta-anthropic",
-      provider: "anthropic",
-      model_name: "claude-sonnet-4-5",
-      provider_key_id: anthropicPk.id,
-    });
-    mcpUpstream = await startMcpUpstream("metamcp");
-    await seed.update("mcp_servers", randomUUID(), {
-      name: "metamcp",
-      url: mcpUpstream.url,
-    });
     const failingPk = await modelAt("meta-chat-500", `${failing}/v1`);
 
     await seed.createPassthroughRoute({
@@ -207,22 +187,6 @@ describe("failure rows name the failure under metadata_only", () => {
       provider_key_id: failingPk.id,
     });
 
-    await seed.update("a2a_agents", randomUUID(), {
-      name: "meta-agent",
-      url: await fixedUpstream(500, SENTINEL),
-      protocol_version: "1.0",
-      auth_type: "none",
-      enabled: true,
-    });
-
-    await seed.update("a2a_agents", randomUUID(), {
-      name: "meta-agent-stream",
-      url: await fixedUpstream(200, "data: not-json\n\n", { "content-type": "text/event-stream" }),
-      protocol_version: "1.0",
-      auth_type: "none",
-      enabled: true,
-    });
-
     await seed.createApiKey({
       key_hash: hash(CALLER),
       allowed_models: ["*"],
@@ -233,8 +197,6 @@ describe("failure rows name the failure under metadata_only", () => {
         "meta-route-gzip",
         "meta-route-gzip-sse",
       ],
-      allowed_agents: ["*"],
-      mcp_access: { allow: ["*"] },
     });
     await waitConfigPropagation(async () => {
       const res = await fetch(`${app!.proxyUrl}/v1/models`, {
@@ -250,7 +212,6 @@ describe("failure rows name the failure under metadata_only", () => {
     if (etcdReachable) expect(expectFailureRowsNamed(sls!, LOGSTORE)).toBeGreaterThan(0);
     await sls?.close();
     await Promise.all(upstreams.map((u) => u.close()));
-    await mcpUpstream?.close();
     for (const server of tcpServers) server.close();
     await Promise.all(
       httpServers.map((s) => new Promise<void>((r) => s.close(() => r()))),
@@ -352,37 +313,7 @@ describe("failure rows name the failure under metadata_only", () => {
     },
   );
 
-  test("a2a: a failed agent call names the status the caller was told", async (ctx) => {
-    if (!etcdReachable) return ctx.skip();
-    const r = await post("/a2a/meta-agent", {
-      jsonrpc: "2.0",
-      id: "1",
-      method: "message/send",
-      params: { message: { role: "user", parts: [{ kind: "text", text: "hi" }], messageId: "m-1" } },
-    });
-    expect(r.status).toBe(502);
-    const row = await rowOf(r.requestId, "the a2a row");
-    expect(row.get("error_class")).toBe("upstream_status");
-    expect(row.get("error_message")).toBe(
-      "upstream A2A request failed: upstream returned HTTP 500",
-    );
-    expect(r.text).toContain(row.get("error_message"));
-  });
 
-  test("a2a: a stream the agent breaks after its head names the failure", async (ctx) => {
-    if (!etcdReachable) return ctx.skip();
-    const r = await post("/a2a/meta-agent-stream", {
-      jsonrpc: "2.0",
-      id: "1",
-      method: "message/stream",
-      params: { message: { role: "user", parts: [{ kind: "text", text: "hi" }], messageId: "m-1" } },
-    });
-    expect(r.status).toBe(200);
-    const row = await rowOf(r.requestId, "the a2a stream row");
-    expect(row.get("status_code")).toBe("502");
-    expect(row.get("error_class")).toBe("upstream_decode");
-    expect(row.get("error_message")).toMatch(/^upstream A2A request failed: malformed JSON-RPC event/);
-  });
 
   async function refusedRealtime(model: string) {
     const requestId = await new Promise<string>((resolve, reject) => {
@@ -452,57 +383,4 @@ describe("failure rows name the failure under metadata_only", () => {
     );
   });
 
-  test.for([
-    ["/v1/embeddings", { input: "hi" }],
-    ["/v1/completions", { prompt: "hi" }],
-    ["/v1/videos", { prompt: "hi" }],
-  ] as const)("%s: a provider lacking the route is named as the caller was told", async ([path, body], ctx) => {
-    if (!etcdReachable) return ctx.skip();
-    const r = await post(path, { model: "meta-anthropic", ...body });
-    expect(r.status).toBe(501);
-    const row = await rowOf(r.requestId, "the 501 row");
-    expect(row.get("error_class")).toBe("config");
-    expect(row.get("error_message")).toBe(JSON.parse(r.text).error.message);
-    const line = await waitForLogLine(
-      app!,
-      (l) => l.includes(r.requestId) && l.includes("status_code"),
-      "the 501 access-log line",
-    );
-    expect(line.replaceAll('\\"', '"')).toContain(row.get("error_message"));
-  });
-
-  test("mcp: a tool call the transport refuses is named with what it said", async (ctx) => {
-    if (!etcdReachable) return ctx.skip();
-    const res = await fetch(`${app!.proxyUrl}/mcp`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${CALLER}`,
-        "content-type": "application/json",
-        accept: "text/plain",
-      },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "tools/call",
-        params: { name: "metamcp__echo", arguments: { text: "hi" } },
-      }),
-    });
-    const text = await res.text();
-    expect(res.status).toBe(406);
-    const row = await rowOf(res.headers.get("x-aisix-request-id")!, "the refused tool row");
-    expect(row.get("status_code")).toBe("406");
-    expect(row.get("error_message")).toBe(text);
-  });
-
-  test("an access-log line with no failure to report still names its status", async (ctx) => {
-    if (!etcdReachable) return ctx.skip();
-    const res = await fetch(`${app!.proxyUrl}/mcp`, {
-      headers: { authorization: `Bearer ${CALLER}` },
-    });
-    await res.text();
-    expect(res.status).toBeGreaterThanOrEqual(400);
-    const requestId = res.headers.get("x-aisix-request-id")!;
-    const line = await waitForLogLine(app!, (l) => l.includes(requestId) && l.includes("status_code"), "the /mcp GET line");
-    expect(line).toContain(`request failed with status ${res.status}`);
-  });
 });

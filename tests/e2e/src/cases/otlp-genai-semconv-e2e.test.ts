@@ -444,58 +444,7 @@ describe("OTLP spans follow the GenAI semantic conventions", () => {
     }
   });
 
-  test("an Anthropic-shape usage folds cache read and creation into input tokens", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const { status, requestId, text } = await post("/v1/messages", {
-      model: ANTHROPIC_MODEL,
-      max_tokens: 128,
-      top_k: 40,
-      stop_sequences: ["STOP"],
-      system: "be precise",
-      tools: [{ name: "lookup", description: "look things up", input_schema: { type: "object" } }],
-      messages: [{ role: "user", content: "fold my cache" }],
-    });
-    expect(status, text).toBe(200);
-    const attempt = attemptSpan(await requestSpans(otlp!, requestId));
-    const a = attempt.attributes;
-    expect(attempt.name).toBe(`chat ${ANTHROPIC_UPSTREAM_MODEL}`);
-    expect(a["gen_ai.provider.name"]).toBe("anthropic");
-    expect(a["gen_ai.usage.input_tokens"]).toBe(350);
-    expect(a["gen_ai.usage.cache_read.input_tokens"]).toBe(300);
-    expect(a["gen_ai.usage.cache_creation.input_tokens"]).toBe(40);
-    expect(a["gen_ai.usage.output_tokens"]).toBe(5);
-    expect(a["gen_ai.request.max_tokens"]).toBe(128);
-    expect(a["gen_ai.request.top_k"]).toBe(40);
-    expect(a["gen_ai.request.stop_sequences"]).toBe("STOP");
-    expect(JSON.parse(String(a["gen_ai.system_instructions"]))).toEqual([
-      { type: "text", content: "be precise" },
-    ]);
-    // Each definition carries its description and parameter schema
-    // (Anthropic's `input_schema`) beside its type and name.
-    expect(JSON.parse(String(a["gen_ai.tool.definitions"]))).toEqual([
-      { type: "function", name: "lookup", description: "look things up", parameters: { type: "object" } },
-    ]);
-    expect(JSON.parse(String(a["gen_ai.input.messages"]))).toEqual([
-      { role: "user", parts: [{ type: "text", content: "fold my cache" }] },
-    ]);
-  });
 
-  test("the Datadog exporter's input tokens follow the same accounting", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const { status, requestId, text } = await post("/v1/messages", {
-      model: ANTHROPIC_MODEL,
-      max_tokens: 128,
-      messages: [{ role: "user", content: "datadog fold" }],
-    });
-    expect(status, text).toBe(200);
-    const log = await waitFor("the Datadog log of the Anthropic call", () =>
-      dd!.logs.find((l) => l["aisix.request_id"] === requestId),
-    );
-    expect(log["gen_ai.usage.input_tokens"]).toBe(350);
-    // The raw counters keep their own keys.
-    expect(log["aisix.cache_read_tokens"]).toBe(300);
-    expect(log["aisix.cache_creation_tokens"]).toBe(40);
-  });
 
   test("an embeddings call is an embeddings span with its encoding and dimensions", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();

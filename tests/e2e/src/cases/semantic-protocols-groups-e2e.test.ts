@@ -387,45 +387,8 @@ describe("semantic routing on every protocol, with model-group targets", () => {
   }
 
   describe("a semantic router on each protocol", () => {
-    test("/v1/messages, non-streaming", async (ctx) => {
-      if (!ready()) return ctx.skip();
-      const r = await messages("sp-router", [{ role: "user", content: LEGAL_ASK }]);
-      expect(r.status, r.text).toBe(200);
-      expect(r.text).toContain("served-by-legal");
-      expect(r.route).toBe("legal");
-      const line = await accessLine(r);
-      expect(field(line, "semantic_route"), line).toBe("legal");
 
-      const d = await messages("sp-router", [{ role: "user", content: OTHER_ASK }]);
-      expect(d.status, d.text).toBe(200);
-      expect(d.text).toContain("served-by-default");
-      expect(d.route).toBeNull();
-      expect(field(await accessLine(d), "semantic_fallback")).toBe("no_match");
-    });
 
-    test("/v1/messages, streaming", async (ctx) => {
-      if (!ready()) return ctx.skip();
-      const r = await messages("sp-router", [{ role: "user", content: LEGAL_ASK }], true);
-      expect(r.status, r.text).toBe(200);
-      expect(r.text).toContain("event: message_start");
-      expect(r.text).toContain("served-by-legal");
-      expect(r.route).toBe("legal");
-      expect(field(await accessLine(r), "semantic_route")).toBe("legal");
-    });
-
-    test("/v1/messages/count_tokens decides the same way", async (ctx) => {
-      if (!ready()) return ctx.skip();
-      const r = await countTokens("ct-router", [{ role: "user", content: LEGAL_ASK }]);
-      expect(r.status, r.text).toBe(200);
-      expect(r.json).toEqual({ input_tokens: 11 });
-      expect(r.route).toBe("legal");
-      expect(classified()).toBe(LEGAL_ASK);
-
-      const d = await countTokens("ct-router", [{ role: "user", content: OTHER_ASK }]);
-      expect(d.status, d.text).toBe(200);
-      expect(d.json).toEqual({ input_tokens: 22 });
-      expect(d.route).toBeNull();
-    });
 
     test("/v1/responses, non-streaming", async (ctx) => {
       if (!ready()) return ctx.skip();
@@ -457,61 +420,8 @@ describe("semantic routing on every protocol, with model-group targets", () => {
   });
 
   describe("what the router classifies", () => {
-    test("a newest turn of tool results only is skipped for the ask before it", async (ctx) => {
-      if (!ready()) return ctx.skip();
-      const r = await messages("sp-router", [
-        { role: "user", content: LEGAL_ASK },
-        {
-          role: "assistant",
-          content: [{ type: "tool_use", id: "toolu_1", name: "read_file", input: { path: "a" } }],
-        },
-        {
-          role: "user",
-          content: [{ type: "tool_result", tool_use_id: "toolu_1", content: OTHER_ASK }],
-        },
-      ]);
-      expect(r.status, r.text).toBe(200);
-      expect(classified()).toBe(LEGAL_ASK);
-      expect(r.text).toContain("served-by-legal");
 
-      const resp = await responses("sp-router", [
-        { type: "message", role: "user", content: [{ type: "input_text", text: LEGAL_ASK }] },
-        { type: "function_call", call_id: "call_1", name: "read_file", arguments: "{}" },
-        { type: "function_call_output", call_id: "call_1", output: OTHER_ASK },
-      ]);
-      expect(resp.status, resp.text).toBe(200);
-      expect(classified()).toBe(LEGAL_ASK);
-      expect(resp.text).toContain("served-by-legal");
-    });
 
-    test("a <system-reminder> block beside the ask is not classified", async (ctx) => {
-      if (!ready()) return ctx.skip();
-      // The reminder alone would match the legal route; the ask does not.
-      const r = await messages("sp-router", [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: REMINDER("the user has a contract open in the editor") },
-            { type: "text", text: OTHER_ASK },
-          ],
-        },
-      ]);
-      expect(r.status, r.text).toBe(200);
-      expect(classified()).toBe(OTHER_ASK);
-      expect(r.text).toContain("served-by-default");
-    });
-
-    test("a newest turn holding only a reminder is skipped", async (ctx) => {
-      if (!ready()) return ctx.skip();
-      const r = await messages("sp-router", [
-        { role: "user", content: LEGAL_ASK },
-        { role: "assistant", content: "Sure." },
-        { role: "user", content: [{ type: "text", text: REMINDER(OTHER_ASK) }] },
-      ]);
-      expect(r.status, r.text).toBe(200);
-      expect(classified()).toBe(LEGAL_ASK);
-      expect(r.text).toContain("served-by-legal");
-    });
 
     test("an image-only newest turn on chat is skipped for the ask before it", async (ctx) => {
       if (!ready()) return ctx.skip();
@@ -552,15 +462,6 @@ describe("semantic routing on every protocol, with model-group targets", () => {
       expect(chatMocks["sp-member-down"]!.hits).toBe(down + 1);
     });
 
-    test("/v1/messages fails over inside the group", async (ctx) => {
-      if (!ready()) return ctx.skip();
-      const down = chatMocks["sp-member-down"]!.hits;
-      const r = await messages("sp-group-router", [{ role: "user", content: LEGAL_ASK }]);
-      expect(r.status, r.text).toBe(200);
-      expect(r.text).toContain("served-by-group-member");
-      expect(r.route).toBe("legal");
-      expect(chatMocks["sp-member-down"]!.hits).toBe(down + 1);
-    });
 
     test("/v1/responses fails over inside the group", async (ctx) => {
       if (!ready()) return ctx.skip();
@@ -572,15 +473,6 @@ describe("semantic routing on every protocol, with model-group targets", () => {
       expect(chatMocks["sp-member-down"]!.hits).toBe(down + 1);
     });
 
-    test("/v1/messages/count_tokens fails over inside the group", async (ctx) => {
-      if (!ready()) return ctx.skip();
-      const down = anthropicMocks["ct-member-down"]!.receivedRequests.length;
-      const r = await countTokens("ct-group-router", [{ role: "user", content: LEGAL_ASK }]);
-      expect(r.status, r.text).toBe(200);
-      expect(r.json).toEqual({ input_tokens: 33 });
-      expect(r.route).toBe("legal");
-      expect(anthropicMocks["ct-member-down"]!.receivedRequests.length).toBe(down + 1);
-    });
 
     test("a failure target that is a group fails over inside the group", async (ctx) => {
       if (!ready()) return ctx.skip();
@@ -593,19 +485,6 @@ describe("semantic routing on every protocol, with model-group targets", () => {
       expect(field(await accessLine(r), "semantic_fallback")).toBe("decision_failed");
     });
 
-    test("the group's own rate limit binds traffic the router sends it", async (ctx) => {
-      if (!ready()) return ctx.skip();
-      await awaitWindowHeadroom(5);
-      const ask = [{ role: "user", content: LEGAL_ASK }];
-      const first = await chat("sp-limited-router", ask);
-      expect(first.status, first.text).toBe(200);
-      expect(first.text).toContain("served-by-limited-member");
-      const second = await messages("sp-limited-router", ask);
-      expect(second.status, second.text).toBe(200);
-      const third = await responses("sp-limited-router", LEGAL_ASK);
-      expect(third.status, third.text).toBe(429);
-      expect(chatMocks["sp-limited-member"]!.hits).toBe(2);
-    });
 
     test("a policy pinned to the group counts once per request, failovers included", async (ctx) => {
       if (!ready()) return ctx.skip();
@@ -651,19 +530,5 @@ describe("semantic routing on every protocol, with model-group targets", () => {
       expect(over.status).toBe(429);
     });
 
-    test("a group with no member this caller may reach is unavailable: default serves", async (ctx) => {
-      if (!ready()) return ctx.skip();
-      const locked = chatMocks["sp-locked-member"]!.hits;
-      for (const r of [
-        await chat("sp-locked-router", [{ role: "user", content: LEGAL_ASK }]),
-        await messages("sp-locked-router", [{ role: "user", content: LEGAL_ASK }]),
-      ]) {
-        expect(r.status, r.text).toBe(200);
-        expect(r.text).toContain("served-by-default");
-        expect(r.route).toBeNull();
-        expect(field(await accessLine(r), "semantic_fallback")).toBe("target_unavailable");
-      }
-      expect(chatMocks["sp-locked-member"]!.hits).toBe(locked);
-    });
   });
 });

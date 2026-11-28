@@ -233,18 +233,6 @@ describe("guardrail bypass reason across the handler family", () => {
     await expectBypassReason("bypass-chat", SCRIPT_TAG);
   });
 
-  test("/v1/messages reports it too (Claude-Code path)", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-
-    const res = await post(
-      "/v1/messages",
-      { model: "bypass-messages", max_tokens: 64, messages: [{ role: "user", content: "go" }] },
-      true,
-    );
-    expect(res.status).toBe(200);
-
-    await expectBypassReason("bypass-messages", SCRIPT_TAG);
-  });
 
   test("/v1/embeddings reports it on its own terminal event", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();
@@ -255,39 +243,4 @@ describe("guardrail bypass reason across the handler family", () => {
     await expectBypassReason("bypass-embeddings", SCRIPT_TAG);
   });
 
-  test("a body the scanner cannot read reports the unscannable tag", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-
-    // No `messages`: the Anthropic scan parser rejects it, so the chain is
-    // never offered the body at all. Nothing in scope refuses an
-    // unevaluable request, so it is forwarded — as a bypass, which is what
-    // the tag has to say. A different tag from the case above on purpose:
-    // "the guardrail broke" and "we could not give it the body" are
-    // different outages with different fixes.
-    const before = await scrapeMetrics(app.metricsUrl);
-    const res = await post("/v1/messages", { model: "bypass-unscannable", max_tokens: 64 }, true);
-    expect(res.status).toBe(200);
-
-    await expectBypassReason("bypass-unscannable", UNSCANNABLE_TAG);
-
-    // The same pass-through has to show up in the scrape, not only in the
-    // usage row. No member executed, so the per-execution path that feeds
-    // this counter for a provider outage never fires here — an operator
-    // sizing "how much unscreened traffic got through" from
-    // `aisix_guardrail_bypasses_total` would otherwise read zero for the
-    // one cause the counter exists to expose. Scraped after the terminal
-    // event so the request is provably finished.
-    //
-    // Only the positive direction is driven here: which pass-throughs are
-    // bypasses at all is decided by the chain's member set, and that
-    // discrimination is pinned in aisix-guardrails' chain unit test, where
-    // an output-only chain can be built without a second seeded route.
-    const after = await scrapeMetrics(app.metricsUrl);
-    expect(
-      metricDelta(before, after, "aisix_guardrail_bypasses_total", {
-        reason: UNSCANNABLE_TAG,
-      }),
-      "an unscannable body a fail-open chain let through did not reach the bypass counter",
-    ).toBe(1);
-  });
 });

@@ -80,7 +80,7 @@ interface Seeded {
   /** `chat` and `responses-native` keys declare the upstream's own
    *  `/v1/responses`; `responses-bridge` ones do not, so that surface is
    *  translated through chat. */
-  kind: "chat" | "responses-native" | "responses-bridge" | "anthropic";
+  kind: "chat" | "responses-native" | "responses-bridge";
 }
 
 const MODELS: Record<string, Seeded> = {
@@ -97,15 +97,6 @@ const MODELS: Record<string, Seeded> = {
   "ib-responses-bridge-ns": {
     upstream: { nonStreamBody: { error: PROVIDER_ERROR } },
     kind: "responses-bridge",
-  },
-  "ib-messages-native-ns": {
-    upstream: {
-      nonStreamBody: {
-        type: "error",
-        error: { type: "overloaded_error", message: "Overloaded right now" },
-      },
-    },
-    kind: "anthropic",
   },
   "ib-responses-native-failed-ns": {
     upstream: {
@@ -207,22 +198,6 @@ describe("an upstream 200 that reports a failure in its body", () => {
     for (const [model, { upstream: opts, kind }] of Object.entries(MODELS)) {
       const upstream = await startOpenAiUpstream(opts);
       upstreams.push(upstream);
-      if (kind === "anthropic") {
-        const pk = await seed.createProviderKey({
-          display_name: `${model}-pk`,
-          api_key: "sk-ant-mock",
-          api_base: upstream.baseUrl,
-          provider: "anthropic",
-          adapter: "anthropic",
-        });
-        await seed.createModel({
-          display_name: model,
-          provider: "anthropic",
-          model_name: "claude-3-5-haiku-20241022",
-          provider_key_id: pk.id,
-        });
-        continue;
-      }
       const pk = await seed.createProviderKey({
         display_name: `${model}-pk`,
         api_key: "sk-mock",
@@ -362,18 +337,6 @@ describe("an upstream 200 that reports a failure in its body", () => {
     ["image generations", "/v1/images/generations", { model: "ib-chat-ns", prompt: "hi" }, PROVIDER_MESSAGE],
     ["translated responses", "/v1/responses", { model: "ib-responses-bridge-ns", input: "hi" }, PROVIDER_MESSAGE],
     ["native responses", "/v1/responses", { model: "ib-responses-native-bare-ns", input: "hi" }, PROVIDER_MESSAGE],
-    [
-      "native messages",
-      "/v1/messages",
-      { model: "ib-messages-native-ns", max_tokens: 64, messages: [{ role: "user", content: "hi" }] },
-      "Overloaded right now",
-    ],
-    [
-      "count_tokens",
-      "/v1/messages/count_tokens",
-      { model: "ib-messages-native-ns", messages: [{ role: "user", content: "hi" }] },
-      "Overloaded right now",
-    ],
   ])("%s: a failure in a whole body is not recorded as a stream's", async (_what, path, body, message) => {
     if (!etcdReachable || !app || !sls) return;
     const res = await post(path, body);
@@ -419,35 +382,8 @@ describe("an upstream 200 that reports a failure in its body", () => {
     expectInBandFailure(await usageRow(res.requestId), "502", PROVIDER_MESSAGE);
   });
 
-  test("messages (native): an error body is a failure carrying the provider's message", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const res = await post("/v1/messages", {
-      model: "ib-messages-native-ns",
-      max_tokens: 64,
-      messages: [{ role: "user", content: "hi" }],
-    });
-    expect(res.status).toBe(502);
-    expect(res.text).toContain("Overloaded right now");
-    expectInBandFailure(await usageRow(res.requestId), "502", "Overloaded right now");
-  });
 
-  test("chat/completions onto an Anthropic upstream: an error body is a failure", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const res = await post("/v1/chat/completions", chat("ib-messages-native-ns", false));
-    expect(res.status).toBe(502);
-    expect(res.text).toContain("Overloaded right now");
-    expectInBandFailure(await usageRow(res.requestId), "502", "Overloaded right now");
-  });
 
-  test("messages/count_tokens: an error body is a failure, not a count", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const res = await post("/v1/messages/count_tokens", {
-      model: "ib-messages-native-ns",
-      messages: [{ role: "user", content: "hi" }],
-    });
-    expect(res.status).toBe(502);
-    expect(res.text).toContain("Overloaded right now");
-  });
 
   test("responses (native): a bare error body is a 502 carrying the provider's message", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();

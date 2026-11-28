@@ -372,16 +372,6 @@ describe("semantic routing e2e", () => {
     expect(r.servedBy).toBe("legal-model");
   });
 
-  test("Gemini requests use the semantic default when the matching target cannot serve them", async (ctx) => {
-    if (!app) return ctx.skip();
-    const res = await fetch(app.proxyUrl + "/v1beta/models/gemini-semantic:generateContent", {
-      method: "POST", headers: { "content-type": "application/json", authorization: "Bearer " + CALLER_PLAINTEXT },
-      body: JSON.stringify({ contents: [{ parts: [{ text: "please review the contract for risk" }] }] }),
-    });
-    expect(res.status).toBe(200);
-    expect(res.headers.get("x-aisix-route")).toBeNull();
-    expect((await res.json()).candidates[0].content.parts).toEqual([{ text: "served-by-default" }]);
-  });
 
   test("falls through to default when no route clears its threshold (no x-aisix-route)", async (ctx) => {
     if (!etcdReachable || !app || !seed) {

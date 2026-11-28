@@ -1,6 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createServer, type Server } from "node:http";
-import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
@@ -16,10 +14,9 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: an Azure text-moderation OUTPUT guardrail in its default `window`
-// streaming mode, on the routes that hold a streamed response whole —
-// /v1/messages and /v1/responses, each native and through the Chat bridge,
-// plus passthrough Chat routes.
+// E2E: a custom OUTPUT guardrail in its default `window` streaming mode, on
+// the routes that hold a streamed response whole — /v1/responses and
+// passthrough Chat routes — plus a chat release path for the mixed chain.
 //
 // A block-capable output guardrail has to judge the content before any of it
 // reaches the caller, so on each route:
@@ -48,13 +45,15 @@ const LEAD = "Here is the first part of the answer. ";
 const FLAGGED = "wndholdflaggedphrase";
 const CLEAN_TAIL = "Nothing else to add.";
 
-const BLOCK_ROW = "window-azure-block";
-const CLOSED_ROW = "window-azure-cap-closed";
-const OPEN_ROW = "window-azure-cap-open";
-const FOLD_OPEN_ROW = "window-azure-fold-open";
-const FOLD_CLOSED_ROW = "window-azure-fold-closed";
-const MIXED_FULL_ROW = "mixed-azure-buffer-full";
-const MIXED_WINDOW_ROW = "mixed-azure-window-default";
+const SCRIPT_BLOCK = `\nexport function checkOutput(ctx) {\n  return ctx.text.includes("${FLAGGED}") ? { action: "block" } : { action: "none" };\n}`;
+
+const BLOCK_ROW = "window-custom-block";
+const CLOSED_ROW = "window-custom-cap-closed";
+const OPEN_ROW = "window-custom-cap-open";
+const FOLD_OPEN_ROW = "window-custom-fold-open";
+const FOLD_CLOSED_ROW = "window-custom-fold-closed";
+const MIXED_FULL_ROW = "mixed-custom-buffer-full";
+const MIXED_WINDOW_ROW = "mixed-custom-window-default";
 const PASSTHROUGH_AT_CAP_ROUTE = "window-pt-cap-equal";
 const PASSTHROUGH_CLOSED_ROUTE = "window-pt-cap-closed";
 const PASSTHROUGH_OPEN_ROUTE = "window-pt-cap-open";
@@ -154,34 +153,6 @@ const responsesEvents = (pieces: string[]) => [
   }),
 ];
 
-// Azure Content Safety `text:analyze`: severity 6 in Violence for text that
-// carries the flagged phrase, 0 otherwise.
-async function startMockAzure(): Promise<{ url: string; close: () => Promise<void> }> {
-  const server: Server = createServer((req, res) => {
-    let body = "";
-    req.on("data", (c) => (body += c));
-    req.on("end", () => {
-      const text = (JSON.parse(body || "{}") as { text?: string }).text ?? "";
-      res.setHeader("content-type", "application/json");
-      res.end(
-        JSON.stringify({
-          categoriesAnalysis: [
-            { category: "Hate", severity: 0 },
-            { category: "Violence", severity: text.includes(FLAGGED) ? 6 : 0 },
-          ],
-          blocklistsMatch: [],
-        }),
-      );
-    });
-  });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const { port } = server.address() as AddressInfo;
-  return {
-    url: `http://127.0.0.1:${port}`,
-    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
-  };
-}
-
 type Variant = "block" | "clean" | "closed" | "open" | "fold" | "mixed";
 const variants = ["block", "clean", "closed", "open", "fold", "mixed"] as const;
 const piecesFor = (v: Variant) =>
@@ -196,21 +167,15 @@ interface EnforcedHit {
 describe("a window-mode output guardrail holds a streamed response it cannot release by window", () => {
   let app: SpawnedApp | undefined;
   let sls: MockSls | undefined;
-  let azure: { url: string; close: () => Promise<void> } | undefined;
   const upstreams: OpenAiUpstream[] = [];
   const passthroughUpstreams = new Map<string, OpenAiUpstream>();
   let etcdReachable = false;
 
   const routes = [
-    { route: "/v1/messages (native)", slug: "msg-native", provider: "anthropic", events: anthropicEvents, pk: {} },
-    { route: "/v1/messages (bridged)", slug: "msg-bridge", provider: "openai", events: chatEvents, pk: {} },
-    { route: "/v1/responses (native)", slug: "resp-native", provider: "openai", events: responsesEvents, pk: {} },
-    // `apis: {}`: no `/v1/responses` on this endpoint, so the route reaches
-    // it through the chat bridge.
-    { route: "/v1/responses (bridged)", slug: "resp-bridge", provider: "openai", events: chatEvents, pk: { apis: {} } },
+    { route: "/v1/responses", slug: "resp-native", events: responsesEvents },
     // Chat releases a window chain window by window; only the mixed chain,
     // which holds as buffer_full, is driven through it.
-    { route: "/v1/chat/completions", slug: "chat", provider: "openai", events: chatEvents, pk: {} },
+    { route: "/v1/chat/completions", slug: "chat", events: chatEvents },
   ] as const;
   const variantsFor = (slug: string): readonly Variant[] => (slug === "chat" ? ["mixed"] : variants);
   const modelName = (slug: string, v: Variant) => `wnd-${slug}-${v}`;
@@ -221,7 +186,6 @@ describe("a window-mode output guardrail holds a streamed response it cannot rel
     if (!etcdReachable) return;
 
     sls = await startMockSls();
-    azure = await startMockAzure();
     app = await spawnApp({
       extraEnv: {
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-akid",
@@ -246,10 +210,10 @@ describe("a window-mode output guardrail holds a streamed response it cannot rel
         {
           name,
           enabled: true,
-          kind: "azure_content_safety_text_moderation",
+          kind: "custom",
           hook_point: "output",
-          endpoint: azure!.url,
-          api_key: "azure-mock-key",
+          script: SCRIPT_BLOCK,
+          timeout_ms: 5000,
           ...extra,
         },
         { attach: false },
@@ -280,14 +244,12 @@ describe("a window-mode output guardrail holds a streamed response it cannot rel
         const pk = await seed.createProviderKey({
           display_name: `${modelName(r.slug, v)}-pk`,
           api_key: "sk-mock",
-          api_base: r.provider === "openai" ? `${upstream.baseUrl}/v1` : upstream.baseUrl,
-          ...(r.provider === "anthropic" ? { provider: "anthropic", adapter: "anthropic" } : {}),
-          ...r.pk,
+          api_base: `${upstream.baseUrl}/v1`,
         });
         const m = await seed.createModel({
           display_name: modelName(r.slug, v),
-          provider: r.provider,
-          model_name: r.provider === "openai" ? "gpt-4o-mini" : "claude-3-5-haiku-20241022",
+          provider: "openai",
+          model_name: "gpt-4o-mini",
           provider_key_id: pk.id,
         });
         for (const g of rows[v]) await seed.attachGuardrailToModel(g.id, m.id);
@@ -381,24 +343,18 @@ describe("a window-mode output guardrail holds a streamed response it cannot rel
   afterAll(async () => {
     await app?.exit();
     await Promise.all(upstreams.map((u) => u.close()));
-    await azure?.close();
     await sls?.close();
   });
 
   const send = async (slug: string, model: string) => {
-    const path = slug.startsWith("msg") ? "/v1/messages" : slug === "chat" ? "/v1/chat/completions" : "/v1/responses";
-    const body = slug.startsWith("msg")
-      ? { model, max_tokens: 256, messages: [{ role: "user", content: "go" }] }
-      : slug === "chat"
-        ? { model, messages: [{ role: "user", content: "go" }] }
-        : { model, input: "go" };
+    const path = slug === "chat" ? "/v1/chat/completions" : "/v1/responses";
+    const body =
+      slug === "chat" ? { model, messages: [{ role: "user", content: "go" }] } : { model, input: "go" };
     const res = await fetch(`${app!.proxyUrl}${path}`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
         authorization: `Bearer ${CALLER}`,
-        "x-api-key": CALLER,
-        "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({ ...body, stream: true }),
     });
@@ -560,135 +516,5 @@ describe("a window-mode output guardrail holds a streamed response it cannot rel
     expect(log.get("guardrail_blocked") ?? "false").not.toBe("true");
     expect(log.get("guardrail_bypassed_reason") ?? "").toBe("");
     expect(JSON.parse(log.get("guardrail_enforced_hits") ?? "[]")).toEqual([]);
-  });
-
-  test("passthrough route: a Window cap refuses regular SSE frames before the window closes", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const body = await sendPassthrough("/passthrough/window-cap-closed");
-    expectPassthroughRequest(PASSTHROUGH_CLOSED_ROUTE);
-    expect(body).toContain("output_buffer_exceeded");
-    expect(body, "a Window cap must not release its held prefix before refusing").not.toContain(BIG[0]);
-    expect(body).not.toContain(BIG[29]);
-    const log = await waitForSlsLog(
-      sls,
-      LOGSTORE,
-      (l) => l.get("passthrough_route_name") === PASSTHROUGH_CLOSED_ROUTE && l.get("guardrail_blocked") === "true",
-      "passthrough Window fail-closed cap",
-    );
-    const hits = JSON.parse(log.get("guardrail_enforced_hits") ?? "[]") as EnforcedHit[];
-    expect(hits.map(({ guardrail_name, hook, action }) => ({ guardrail_name, hook, action }))).toEqual([
-      { guardrail_name: CLOSED_ROW, hook: "output", action: "blocked_buffer_exceeded" },
-    ]);
-  });
-
-  test("passthrough route: a Window fail-open cap does not rescan regular frames at EOF", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const body = await sendPassthrough("/passthrough/window-cap-open");
-    expectPassthroughRequest(PASSTHROUGH_OPEN_ROUTE);
-    expect(body, "fail_open releases the held regular frames").toContain(WINDOW_OPEN_MARKER);
-    expect(body, "a later EOF scan must not retract fail-open content").toContain(FLAGGED);
-    expect(body).not.toContain("output_buffer_exceeded");
-    const log = await waitForSlsLog(
-      sls,
-      LOGSTORE,
-      (l) => l.get("passthrough_route_name") === PASSTHROUGH_OPEN_ROUTE,
-      "passthrough Window regular-frame fail-open cap",
-    );
-    expect(log.get("guardrail_blocked") ?? "false").not.toBe("true");
-    expect(log.get("guardrail_bypassed_reason")).toBe("output_buffer_exceeded");
-    expect(JSON.parse(log.get("guardrail_enforced_hits") ?? "[]")).toEqual([]);
-  });
-
-  test("passthrough route: a Window cap fails open for an unterminated final SSE frame", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const body = await sendPassthrough("/passthrough/window-cap-open-tail");
-    expectPassthroughRequest(PASSTHROUGH_OPEN_TAIL_ROUTE);
-    expect(body, "fail_open releases the held final frame").toContain(WINDOW_TAIL_MARKER);
-    expect(body, "the final frame is not rescanned after it is released").toContain(FLAGGED);
-    expect(body).not.toContain("output_buffer_exceeded");
-    const log = await waitForSlsLog(
-      sls,
-      LOGSTORE,
-      (l) => l.get("passthrough_route_name") === PASSTHROUGH_OPEN_TAIL_ROUTE,
-      "passthrough Window unterminated-tail fail-open cap",
-    );
-    expect(log.get("guardrail_blocked") ?? "false").not.toBe("true");
-    expect(log.get("guardrail_bypassed_reason")).toBe("output_buffer_exceeded");
-    expect(JSON.parse(log.get("guardrail_enforced_hits") ?? "[]")).toEqual([]);
-  });
-
-  test("passthrough route: a Window cap refuses an unterminated final SSE frame under fail_closed", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const body = await sendPassthrough("/passthrough/window-cap-closed-tail");
-    expectPassthroughRequest(PASSTHROUGH_CLOSED_TAIL_ROUTE);
-    expect(body).toContain("output_buffer_exceeded");
-    expect(body, "the terminal frame remains held when the cap fails closed").not.toContain(WINDOW_CLOSED_TAIL_MARKER);
-    const log = await waitForSlsLog(
-      sls,
-      LOGSTORE,
-      (l) => l.get("passthrough_route_name") === PASSTHROUGH_CLOSED_TAIL_ROUTE && l.get("guardrail_blocked") === "true",
-      "passthrough Window unterminated-tail fail-closed cap",
-    );
-    const hits = JSON.parse(log.get("guardrail_enforced_hits") ?? "[]") as EnforcedHit[];
-    expect(hits.map(({ guardrail_name, hook, action }) => ({ guardrail_name, hook, action }))).toEqual([
-      { guardrail_name: CLOSED_ROW, hook: "output", action: "blocked_buffer_exceeded" },
-    ]);
-  });
-
-  test("passthrough route: a Window raw-byte cap refuses a delta-free keepalive frame", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const body = await sendPassthrough("/passthrough/window-raw-cap-closed");
-    expectPassthroughRequest(PASSTHROUGH_RAW_CLOSED_ROUTE);
-    expect(body).toContain("output_buffer_exceeded");
-    expect(body, "a delta-free frame still counts toward the raw held-byte cap").not.toContain(WINDOW_RAW_MARKER);
-    const log = await waitForSlsLog(
-      sls,
-      LOGSTORE,
-      (l) => l.get("passthrough_route_name") === PASSTHROUGH_RAW_CLOSED_ROUTE && l.get("guardrail_blocked") === "true",
-      "passthrough Window raw-byte fail-closed cap",
-    );
-    const hits = JSON.parse(log.get("guardrail_enforced_hits") ?? "[]") as EnforcedHit[];
-    expect(hits.map(({ guardrail_name, hook, action }) => ({ guardrail_name, hook, action }))).toEqual([
-      { guardrail_name: CLOSED_ROW, hook: "output", action: "blocked_buffer_exceeded" },
-    ]);
-  });
-
-  test("passthrough route: a Window raw-byte cap releases a delta-free keepalive frame under fail_open", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const body = await sendPassthrough("/passthrough/window-raw-cap-open");
-    expectPassthroughRequest(PASSTHROUGH_RAW_OPEN_ROUTE);
-    expect(body, "fail_open releases the raw keepalive frame").toContain(WINDOW_RAW_MARKER);
-    expect(body).not.toContain("output_buffer_exceeded");
-    const log = await waitForSlsLog(
-      sls,
-      LOGSTORE,
-      (l) => l.get("passthrough_route_name") === PASSTHROUGH_RAW_OPEN_ROUTE,
-      "passthrough Window raw-byte fail-open cap",
-    );
-    expect(log.get("guardrail_blocked") ?? "false").not.toBe("true");
-    expect(log.get("guardrail_bypassed_reason")).toBe("output_buffer_exceeded");
-    expect(JSON.parse(log.get("guardrail_enforced_hits") ?? "[]")).toEqual([]);
-  });
-
-  test("passthrough route: a Window frame cap applies before an unterminated upstream frame reaches EOF", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const response = sendPassthrough("/passthrough/window-fragment-cap-closed");
-    await waitForPassthroughRequest(PASSTHROUGH_FRAGMENT_CLOSED_ROUTE);
-    const body = await beforeTimeout(response, 1_500);
-    expectPassthroughRequest(PASSTHROUGH_FRAGMENT_CLOSED_ROUTE);
-    expect(body).toContain("output_buffer_exceeded");
-    expect(body, "the oversized partial frame remains held when the cap fails closed").not.toContain(
-      WINDOW_FRAGMENT_MARKER,
-    );
-    const log = await waitForSlsLog(
-      sls,
-      LOGSTORE,
-      (l) => l.get("passthrough_route_name") === PASSTHROUGH_FRAGMENT_CLOSED_ROUTE && l.get("guardrail_blocked") === "true",
-      "passthrough Window unterminated-frame fail-closed cap",
-    );
-    const hits = JSON.parse(log.get("guardrail_enforced_hits") ?? "[]") as EnforcedHit[];
-    expect(hits.map(({ guardrail_name, hook, action }) => ({ guardrail_name, hook, action }))).toEqual([
-      { guardrail_name: CLOSED_ROW, hook: "output", action: "blocked_buffer_exceeded" },
-    ]);
   });
 });

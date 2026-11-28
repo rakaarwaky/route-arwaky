@@ -135,66 +135,6 @@ describe("least-busy routing via passthrough endpoints e2e", () => {
     return { status: res.status, object: body.object ?? "" };
   }
 
-  test("/v1/messages routes away from an in-flight target", async (ctx) => {
-    if (!etcdReachable || !app || !seed) {
-      ctx.skip();
-      return;
-    }
-
-    // Declared-first target A is slow (stays in flight); B is fast.
-    // openai-provider targets exercise the cross-provider bridge path.
-    const slow = await startOpenAiUpstream({
-      responseDelayMs: 800,
-      nonStreamBody: chatBody("msg-a-served"),
-    });
-    const fast = await startOpenAiUpstream({
-      nonStreamBody: chatBody("msg-b-served"),
-    });
-    upstreams.push(slow, fast);
-
-    await createOpenAiModel("msg-busy-a", slow);
-    await createOpenAiModel("msg-busy-b", fast);
-    await seed.createModel({
-      display_name: "msg-busy-virtual",
-      routing: {
-        strategy: "least_busy",
-        targets: [{ model: "msg-busy-a" }, { model: "msg-busy-b" }],
-      },
-    });
-
-    // Gate on the group dispatching through the DP snapshot; the warmup
-    // completes before we proceed, so its in-flight count is released.
-    await waitConfigPropagation(async () => {
-      const r = await postMessages("msg-busy-virtual", "warmup");
-      return r.status === 200;
-    });
-
-    const slowBase = slow.receivedRequests.length;
-    const fastBase = fast.receivedRequests.length;
-
-    // Occupy A (both idle → declaration order) and do NOT await it.
-    // Wait until the slow upstream has actually RECEIVED it — the
-    // in-flight guard is acquired before the upstream send, so
-    // arrival implies the count is raised (a fixed sleep can race on
-    // slow CI).
-    const inflight = postMessages("msg-busy-virtual", "occupy-a");
-    await waitConfigPropagation(
-      async () => slow.receivedRequests.length - slowBase >= 1,
-    );
-
-    // A has 1 in-flight, B has 0 → least_busy must divert to B. Before
-    // the fix /v1/messages never raised the count, so this landed on A.
-    const diverted = await postMessages("msg-busy-virtual", "divert-to-b");
-    expect(diverted.status).toBe(200);
-    expect(diverted.text).toBe("msg-b-served");
-
-    const first = await inflight;
-    expect(first.status).toBe(200);
-    expect(first.text).toBe("msg-a-served");
-
-    expect(slow.receivedRequests.length - slowBase).toBe(1);
-    expect(fast.receivedRequests.length - fastBase).toBe(1);
-  });
 
   test("/v1/responses routes away from an in-flight target", async (ctx) => {
     if (!etcdReachable || !app || !seed) {

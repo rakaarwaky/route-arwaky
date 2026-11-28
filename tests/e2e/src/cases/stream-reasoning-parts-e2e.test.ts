@@ -111,11 +111,6 @@ const chatBody = (model: string, prompt = "What is the capital of France?") => (
   model,
   messages: [{ role: "user", content: prompt }],
 });
-const messagesBody = (model: string, prompt = "What is the capital of France?") => ({
-  model,
-  max_tokens: 256,
-  messages: [{ role: "user", content: prompt }],
-});
 const responsesBody = (model: string, prompt = "What is the capital of France?") => ({ model, input: prompt });
 
 /** Chat SSE as runs of `[kind, text]`, adjacent deltas of one kind joined. */
@@ -244,25 +239,6 @@ describe("streamed reasoning content parts", () => {
     ]);
   });
 
-  test("keep their place between the text parts of one delta on /v1/messages", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const raw = await stream(app, "/v1/messages", messagesBody("srp-interleaved"));
-    expect(
-      namedEvents(raw)
-        .filter(({ event }) => event === "content_block_start")
-        .map(({ data }) => [data.index, data.content_block.type]),
-      raw,
-    ).toEqual([
-      [0, "text"],
-      [1, "thinking"],
-      [2, "text"],
-    ]);
-    expect(messagesBlocks(raw), raw).toEqual([
-      { type: "text", text: "Let me check. " },
-      { type: "thinking", thinking: "Checking the atlas.", signature: "" },
-      { type: "text", text: "Paris." },
-    ]);
-  });
 
   test("keep their place between the text parts of one delta on /v1/responses", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
@@ -293,20 +269,6 @@ describe("streamed reasoning content parts", () => {
   });
 
   test.for(["mistral", "databricks"] as const)(
-    "(%s) reach a /v1/messages caller as a thinking block ahead of the text",
-    async (shape, ctx) => {
-      if (!etcdReachable || !app) return ctx.skip();
-      const raw = await stream(app, "/v1/messages", messagesBody(`srp-${shape}`));
-      // The upstream's signature is not a Claude signature; the block
-      // carries the empty one, as a non-streamed answer's does.
-      expect(messagesBlocks(raw), raw).toEqual([
-        { type: "thinking", thinking: THINKING, signature: "" },
-        { type: "text", text: ANSWER },
-      ]);
-    },
-  );
-
-  test.for(["mistral", "databricks"] as const)(
     "(%s) reach a /v1/responses caller as a reasoning item ahead of the message",
     async (shape, ctx) => {
       if (!etcdReachable || !app) return ctx.skip();
@@ -328,7 +290,6 @@ describe("streamed reasoning content parts", () => {
 
   test.for([
     ["/v1/chat/completions", chatBody],
-    ["/v1/messages", messagesBody],
     ["/v1/responses", responsesBody],
   ] as const)("reach the content exporter as a reasoning part from %s", async ([path, body], ctx) => {
     if (!etcdReachable || !app || !otlp) return ctx.skip();

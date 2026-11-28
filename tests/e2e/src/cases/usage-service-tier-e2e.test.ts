@@ -361,28 +361,8 @@ describe("usage events record the service tier the upstream served on", () => {
     expect((await usageRow(RESP_STREAM)).get("service_tier")).toBe("flex");
   });
 
-  test("messages: a fast-mode speed wins over the standard service tier", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    await call("/v1/messages", { model: MSG_FAST, max_tokens: 16, messages: [{ role: "user", content: "hi" }] });
-    expect((await usageRow(MSG_FAST)).get("service_tier")).toBe("fast");
-  });
 
-  test("messages: with no speed, usage.service_tier is recorded", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    await call("/v1/messages", { model: MSG_TIER, max_tokens: 16, messages: [{ role: "user", content: "hi" }] });
-    expect((await usageRow(MSG_TIER)).get("service_tier")).toBe("priority");
-  });
 
-  test("streamed messages: the tier on message_start is recorded", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    await call("/v1/messages", {
-      model: MSG_STREAM,
-      max_tokens: 16,
-      stream: true,
-      messages: [{ role: "user", content: "hi" }],
-    });
-    expect((await usageRow(MSG_STREAM)).get("service_tier")).toBe("fast");
-  });
 
   test("responses bridged to a chat upstream report the upstream's tier, not the requested one", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();

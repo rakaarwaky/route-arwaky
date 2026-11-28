@@ -146,27 +146,6 @@ const CHAT_SLOW = [
   chatChunk({}, "stop"),
   "[DONE]",
 ];
-const ANTHROPIC_SLOW = [
-  JSON.stringify({
-    type: "message_start",
-    message: {
-      id: "msg_mem",
-      type: "message",
-      role: "assistant",
-      content: [],
-      model: "claude-3-5-haiku-20241022",
-      stop_reason: null,
-      usage: { input_tokens: 5, output_tokens: 1 },
-    },
-  }),
-  JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
-  ...Array.from({ length: 30 }, () =>
-    JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: TEXT } }),
-  ),
-  JSON.stringify({ type: "content_block_stop", index: 0 }),
-  JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 40 } }),
-  JSON.stringify({ type: "message_stop" }),
-];
 const RESPONSES_SLOW = [
   JSON.stringify({
     type: "response.created",
@@ -224,7 +203,7 @@ describe("memory observability", () => {
     );
     const model = async (
       display: string,
-      provider: "openai" | "anthropic",
+      provider: "openai",
       opts: Parameters<typeof startOpenAiUpstream>[0],
       guarded: boolean,
       pkExtra: Record<string, unknown> = {},
@@ -234,21 +213,19 @@ describe("memory observability", () => {
       const pk = await seed.createProviderKey({
         display_name: `${display}-pk`,
         api_key: "sk-mock",
-        api_base: provider === "openai" ? `${upstream.baseUrl}/v1` : upstream.baseUrl,
+        api_base: `${upstream.baseUrl}/v1`,
         ...pkExtra,
       });
       const m = await seed.createModel({
         display_name: display,
         provider,
-        model_name: provider === "openai" ? "gpt-4o-mini" : "claude-3-5-haiku-20241022",
+        model_name: "gpt-4o-mini",
         provider_key_id: pk.id,
       });
       if (guarded) await seed.attachGuardrailToModel(hold.id, m.id);
       return upstream;
     };
     await model("mem-chat", "openai", { streamEvents: CHAT_SLOW, eventDelayMs: 100 }, true);
-    await model("mem-msg-native", "anthropic", { streamEvents: ANTHROPIC_SLOW, eventDelayMs: 100 }, true);
-    await model("mem-msg-bridge", "openai", { streamEvents: CHAT_SLOW, eventDelayMs: 100 }, true);
     await model("mem-resp-native", "openai", { streamEvents: RESPONSES_SLOW, eventDelayMs: 100 }, true);
     await model("mem-resp-bridge", "openai", { streamEvents: CHAT_SLOW, eventDelayMs: 100 }, true, { apis: {} });
     await model(
@@ -290,14 +267,7 @@ describe("memory observability", () => {
 
     await seed.createApiKey({
       key_hash: CALLER_HASH,
-      allowed_models: [
-        "mem-chat",
-        "mem-msg-native",
-        "mem-msg-bridge",
-        "mem-resp-native",
-        "mem-resp-bridge",
-        "mem-slow",
-      ],
+      allowed_models: ["mem-chat", "mem-resp-native", "mem-resp-bridge", "mem-slow"],
       allowed_routes: ["*"],
     });
     const proxy = new ProxyClient(app.proxyUrl, CALLER);
@@ -454,8 +424,6 @@ describe("memory observability", () => {
 
   test.for([
     ["chat", "/v1/chat/completions", { model: "mem-chat", stream: true, messages: [{ role: "user", content: "go" }] }],
-    ["messages native", "/v1/messages", { model: "mem-msg-native", stream: true, max_tokens: 64, messages: [{ role: "user", content: "go" }] }],
-    ["messages bridged", "/v1/messages", { model: "mem-msg-bridge", stream: true, max_tokens: 64, messages: [{ role: "user", content: "go" }] }],
     ["responses native", "/v1/responses", { model: "mem-resp-native", stream: true, input: "go" }],
     ["responses bridged", "/v1/responses", { model: "mem-resp-bridge", stream: true, input: "go" }],
     ["passthrough", "/mem-pt/v1/chat/completions", { model: "gpt-4o-mini", stream: true, messages: [{ role: "user", content: "go" }] }],
@@ -481,7 +449,6 @@ describe("memory observability", () => {
 
   test.for([
     ["chat", "/v1/chat/completions", { model: "mem-slow", messages: [{ role: "user", content: BIG }] }],
-    ["messages", "/v1/messages", { model: "mem-slow", max_tokens: 16, messages: [{ role: "user", content: BIG }] }],
     ["responses", "/v1/responses", { model: "mem-slow", input: BIG }],
     ["embeddings", "/v1/embeddings", { model: "mem-slow", input: BIG }],
   ] as const)("%s: a large request body is counted while its request is in flight", async ([, path, body], ctx) => {

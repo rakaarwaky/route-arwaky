@@ -26,21 +26,6 @@ const hash = (s: string) => createHash("sha256").update(s).digest("hex");
 const REFUSAL = "blocked by content policy";
 const SCRIPT = `export function checkOutput() { return { action: "block" }; }`;
 
-const anthropicFrames = [
-  JSON.stringify({
-    type: "message_start",
-    message: {
-      id: "msg_textless",
-      role: "assistant",
-      content: [],
-      model: "claude-3-5-haiku-20241022",
-      stop_reason: null,
-      usage: { input_tokens: 5, output_tokens: 1 },
-    },
-  }),
-  JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } }),
-  JSON.stringify({ type: "message_stop" }),
-];
 const chatChunk = (delta: Record<string, unknown>, finish_reason: string | null) =>
   JSON.stringify({
     id: "chatcmpl-textless",
@@ -99,7 +84,6 @@ const TERMINAL: Record<string, string> = {
 
 interface Route {
   name: string;
-  provider: "anthropic" | "openai";
   upstream: { streamEvents?: string[]; rawStreamFrames?: string[]; nonStreamBody?: unknown };
   // `apis: {}` declares an OpenAI-compatible endpoint with no
   // `/v1/responses`, which puts `/v1/responses` on the Chat bridge.
@@ -110,44 +94,27 @@ interface Route {
 const ROUTES: Route[] = [
   {
     name: "chat",
-    provider: "openai",
     upstream: { streamEvents: chatFrames },
     send: (u, model) => json(u, "/v1/chat/completions", { model, stream: true, messages: HI }),
   },
   {
-    name: "messages-native",
-    provider: "anthropic",
-    upstream: { streamEvents: anthropicFrames },
-    send: (u, model) => json(u, "/v1/messages", { model, stream: true, max_tokens: 64, messages: HI }),
-  },
-  {
-    name: "messages-bridge",
-    provider: "openai",
-    upstream: { streamEvents: chatFrames },
-    send: (u, model) => json(u, "/v1/messages", { model, stream: true, max_tokens: 64, messages: HI }),
-  },
-  {
     name: "responses-native",
-    provider: "openai",
     upstream: { streamEvents: responsesFrames },
     send: (u, model) => json(u, "/v1/responses", { model, stream: true, input: "hi" }),
   },
   {
     name: "responses-bridge",
-    provider: "openai",
     upstream: { streamEvents: chatFrames },
     apis: {},
     send: (u, model) => json(u, "/v1/responses", { model, stream: true, input: "hi" }),
   },
   {
     name: "transcription-stream",
-    provider: "openai",
     upstream: { rawStreamFrames: transcriptFrames },
     send: (u, model) => transcribe(u, model, true),
   },
   {
     name: "transcription",
-    provider: "openai",
     upstream: { nonStreamBody: { text: "" } },
     send: (u, model) => transcribe(u, model, false),
   },
@@ -213,13 +180,13 @@ describe("output guardrails decide a response with no text", () => {
         const pk = await seed.createProviderKey({
           display_name: `${display}-pk`,
           api_key: "sk-mock",
-          api_base: route.provider === "anthropic" ? upstream.baseUrl : `${upstream.baseUrl}/v1`,
+          api_base: `${upstream.baseUrl}/v1`,
           ...(route.apis ? { apis: route.apis } : {}),
         });
         const model = await seed.createModel({
           display_name: display,
-          provider: route.provider,
-          model_name: route.provider === "anthropic" ? "claude-3-5-haiku-20241022" : "gpt-4o-mini",
+          provider: "openai",
+          model_name: "gpt-4o-mini",
           provider_key_id: pk.id,
         });
         await seed.attachGuardrailToModel(guardrail.id as string, model.id as string);
@@ -342,18 +309,6 @@ describe("output guardrails decide a response with no text", () => {
     expect(await textless.text()).toContain(REFUSAL);
   });
 
-  test("an in-band upstream error on a held stream stays the upstream's error", async (ctx) => {
-    if (!app) return ctx.skip();
-    const res = await json(app.proxyUrl, "/v1/messages", {
-      model: "messages-native-failed",
-      stream: true,
-      max_tokens: 64,
-      messages: HI,
-    });
-    const body = await res.text();
-    expect(body).toContain("overloaded_error");
-    expect(body).not.toContain(REFUSAL);
-  });
 
   test("a stream the upstream failed is no verdict for a monitor-mode script", async (ctx) => {
     if (!app || !sls) return ctx.skip();

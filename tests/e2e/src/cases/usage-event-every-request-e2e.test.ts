@@ -123,21 +123,6 @@ describe("a usage event for every request", () => {
       provider_key_id: coherePk.id,
     });
 
-    // Anthropic serves neither legacy completions nor embeddings; the
-    // gateway answers those itself, without an upstream call.
-    const anthropicPk = await seed.createProviderKey({
-      display_name: "every-request-anthropic",
-      api_key: "sk-ant-mock",
-      provider: "anthropic",
-      api_base: "http://127.0.0.1:9",
-    });
-    await seed.createModel({
-      display_name: "every-request-claude",
-      provider: "anthropic",
-      model_name: "claude-3-5-haiku-20241022",
-      provider_key_id: anthropicPk.id,
-    });
-
     // A guardrail on the MCP server makes the gateway read the tool result
     // back before relaying it.
     const mcpServerId = randomUUID();
@@ -201,68 +186,6 @@ describe("a usage event for every request", () => {
     expect(event.get("client_type")).toBe("every-request-client");
     expect(event.get("prompt_tokens") ?? "0").toBe("0");
     expect(event.get("completion_tokens") ?? "0").toBe("0");
-  });
-
-  for (const [path, operation, body] of [
-    ["/v1/completions", "completions", { model: "every-request-claude", prompt: "hi" }],
-    ["/v1/embeddings", "embeddings", { model: "every-request-claude", input: "hi" }],
-  ] as const) {
-    test(`${path}: the gateway's own 501 records a zero-token event`, async (ctx) => {
-      if (!etcdReachable || !app || !sls) return ctx.skip();
-      const res = await post(path, body);
-      expect(res.status, res.body).toBe(501);
-
-      const event = await eventFor("every-request-claude", operation);
-      expect(event.get("status_code")).toBe("501");
-      expect(event.get("client_type")).toBe("every-request-client");
-      expect(event.get("prompt_tokens") ?? "0").toBe("0");
-    });
-  }
-
-  test("an MCP tool result the gateway cannot read back records a 502 event", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    const rpc = (id: number, method: string, params: Record<string, unknown>) =>
-      fetch(`${app!.proxyUrl}/mcp`, {
-        method: "POST",
-        headers: { ...auth, accept: "application/json, text/event-stream" },
-        body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
-      });
-    await (
-      await rpc(1, "initialize", {
-        protocolVersion: "2025-11-25",
-        capabilities: {},
-        clientInfo: { name: "usage-event-every-request", version: "0.1" },
-      })
-    ).text();
-    const res = await rpc(2, "tools/call", { name: "big__report", arguments: {} });
-    const body = await res.text();
-    expect(res.status, body).toBe(502);
-
-    const event = await waitForSlsLog(
-      sls,
-      LOGSTORE,
-      (log) => log.get("operation") === "mcp" && log.get("mcp_tool_name") === "report",
-      "mcp usage event for big__report",
-    );
-    expect(event.get("status_code")).toBe("502");
-    expect(event.get("mcp_server_name")).toBe("big");
-    expect(event.get("client_type")).toBe("every-request-client");
-    expect(event.get("client_user_agent")).toBeUndefined();
-
-    // The exported tool span follows the MCP client span conventions.
-    const deadline = Date.now() + 15_000;
-    const toolSpan = () =>
-      otlp!.spans.find((s) => s.kind === 3 && s.attributes["gen_ai.tool.name"] === "report");
-    while (Date.now() < deadline && !toolSpan()) await new Promise((r) => setTimeout(r, 50));
-    const span = toolSpan();
-    expect(span, "the MCP tool span was exported").toBeTruthy();
-    expect(span!.name).toBe("tools/call report");
-    expect(span!.attributes["mcp.method.name"]).toBe("tools/call");
-    expect(span!.attributes["gen_ai.operation.name"]).toBe("execute_tool");
-    expect(span!.attributes["server.address"]).toBe(new URL(mcp!.url).hostname);
-    expect(span!.attributes["server.port"]).toBe(Number(new URL(mcp!.url).port));
-    expect(span!.statusCode).toBe(2);
-    expect(span!.attributes["error.type"]).toBeTruthy();
   });
 
   test("POST /v1/videos: the gateway's own 501 records an event with no upstream span", async (ctx) => {

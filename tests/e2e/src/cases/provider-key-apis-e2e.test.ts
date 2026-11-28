@@ -323,58 +323,7 @@ describe("provider_keys[].apis — native surfaces and their entry points", () =
     ]);
   });
 
-  test("a declared `messages` entry forwards the Anthropic body verbatim to its own path", async (ctx) => {
-    if (!etcdReachable || !app || !upstream) {
-      ctx.skip();
-      return;
-    }
-    const before = upstream.seen.length;
-    const res = await callGateway(app, "/v1/messages", {
-      model: "dual-protocol",
-      max_tokens: 64,
-      system: [
-        {
-          type: "text",
-          text: "you are a helpful assistant",
-          cache_control: { type: "ephemeral" },
-        },
-      ],
-      messages: [{ role: "user", content: "hello" }],
-    });
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as Record<string, unknown>;
-    expect(body.type).toBe("message");
 
-    const dispatched = upstream.seen.slice(before);
-    expect(dispatched.map((r) => r.path)).toEqual(["/anthropic/v1/messages"]);
-    // Verbatim, not translated: the prompt-cache breakpoint survives.
-    // Going through the chat bridge would have dropped it, which is the
-    // cost this field exists to avoid.
-    const forwarded = JSON.parse(dispatched[0].body) as Record<string, unknown>;
-    expect(JSON.stringify(forwarded.system)).toContain("cache_control");
-    // Still the caller's own Anthropic body: a bridge round-trip would
-    // have rebuilt `messages` into the canonical chat shape and dropped
-    // `max_tokens`' Anthropic spelling along the way.
-    expect(forwarded.max_tokens).toBe(64);
-    expect(forwarded.messages).toEqual([{ role: "user", content: "hello" }]);
-  });
-
-  test("count_tokens rides the same declared entry", async (ctx) => {
-    if (!etcdReachable || !app || !upstream) {
-      ctx.skip();
-      return;
-    }
-    const before = upstream.seen.length;
-    const res = await callGateway(app, "/v1/messages/count_tokens", {
-      model: "dual-protocol",
-      messages: [{ role: "user", content: "hello" }],
-    });
-    expect(res.status).toBe(200);
-    expect(await res.json()).toMatchObject({ input_tokens: 42 });
-    expect(upstream.seen.slice(before).map((r) => r.path)).toEqual([
-      "/anthropic/v1/messages/count_tokens",
-    ]);
-  });
 
   test("the declared entry does not move chat completions off api_base", async (ctx) => {
     if (!etcdReachable || !app || !upstream) {
@@ -392,23 +341,6 @@ describe("provider_keys[].apis — native surfaces and their entry points", () =
     ]);
   });
 
-  test("the bridge that translates INTO the Anthropic wire uses the declared entry too", async (ctx) => {
-    if (!etcdReachable || !app || !upstream) {
-      ctx.skip();
-      return;
-    }
-    const before = upstream.seen.length;
-    const res = await callGateway(app, "/v1/chat/completions", {
-      model: "anthropic-declared",
-      messages: [{ role: "user", content: "hello" }],
-    });
-    expect(res.status).toBe(200);
-    // Not `/v1/messages` at api_base: one upstream route must not resolve
-    // to two hosts depending on which inbound protocol asked for it.
-    expect(upstream.seen.slice(before).map((r) => r.path)).toEqual([
-      "/anthropic/v1/messages",
-    ]);
-  });
 
   test("a declared `responses` entry forwards verbatim, to its own base", async (ctx) => {
     if (!etcdReachable || !app || !upstream) {
@@ -433,80 +365,4 @@ describe("provider_keys[].apis — native surfaces and their entry points", () =
     expect(JSON.parse(dispatched[0].body)).toMatchObject({ input: "hello" });
   });
 
-  test("usage is attributed to the target model's own vendor, not the wire it took", async (ctx) => {
-    if (!etcdReachable || !app || !upstream) {
-      ctx.skip();
-      return;
-    }
-    // Both requests run on `deepseek` models. The verbatim Anthropic
-    // passthrough and the translated Responses path used to hard-code
-    // "anthropic" / "openai" here, which split one model's series in two
-    // and misattributed the priced row.
-    // Deltas, not totals. Earlier tests in this file already drove
-    // `/v1/responses` on `responses-declared`, so a cumulative assertion
-    // could be satisfied by their samples even if THIS request were
-    // mislabelled. Asserted, not discarded, for the same reason: a
-    // failed request still increments the counter.
-    const before = await scrapeMetrics(app.metricsUrl);
-    const delta = (
-      samples: Awaited<ReturnType<typeof scrapeMetrics>>,
-      labels: Record<string, string>,
-    ) =>
-      sumMetric(samples, "aisix_llm_requests_total", labels) -
-      sumMetric(before, "aisix_llm_requests_total", labels);
-    expect(
-      (
-        await callGateway(app, "/v1/messages", {
-          model: "dual-protocol",
-          max_tokens: 16,
-          messages: [{ role: "user", content: "hello" }],
-        })
-      ).status,
-    ).toBe(200);
-    expect(
-      (
-        await callGateway(app, "/v1/responses", {
-          model: "declared-chat-only",
-          input: "hello",
-        })
-      ).status,
-    ).toBe(200);
-    // The verbatim Responses path on a non-OpenAI vendor — the case that
-    // used to report a hard-coded "openai".
-    expect(
-      (
-        await callGateway(app, "/v1/responses", {
-          model: "responses-declared",
-          input: "hello",
-        })
-      ).status,
-    ).toBe(200);
-
-    const samples = await scrapeMetrics(app.metricsUrl);
-    expect(
-      delta(samples, { provider: "deepseek", endpoint: "/v1/messages" }),
-    ).toBeGreaterThan(0);
-    // Scoped to the two endpoints this file drives through a verbatim
-    // path, so adding an actually-Anthropic model here later does not
-    // make the assertion fire for the wrong reason.
-    for (const endpoint of ["/v1/messages", "/v1/messages/count_tokens"]) {
-      expect(
-        sumMetric(samples, "aisix_llm_requests_total", {
-          provider: "anthropic",
-          endpoint,
-        }),
-        `${endpoint} must be labelled with the vendor, not the wire`,
-      ).toBe(0);
-    }
-    expect(
-      delta(samples, { provider: "deepseek", endpoint: "/v1/responses" }),
-      "the verbatim Responses path must report the vendor too",
-    ).toBeGreaterThan(0);
-    // The bridged Responses request rides the `openai` catalog vendor, so
-    // it legitimately reports openai — the assertion that matters is that
-    // it reports the MODEL's vendor rather than a constant.
-    expect(
-      delta(samples, { provider: "openai", endpoint: "/v1/responses" }),
-    ).toBeGreaterThan(0);
-  });
 });

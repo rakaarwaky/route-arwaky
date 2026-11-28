@@ -132,32 +132,6 @@ describe("Gemini OpenAI-compatible streamed parallel tool calls", () => {
       .map((l) => JSON.parse(l.slice("data: ".length)));
   }
 
-  test("/v1/messages emits one tool_use block per call", async (ctx) => {
-    if (!etcdReachable || !app || !upstream) {
-      ctx.skip();
-      return;
-    }
-    const events = await streamEvents("/v1/messages", {
-      model: MODEL,
-      max_tokens: 256,
-      stream: true,
-      messages: [{ role: "user", content: PROMPT }],
-      tools: [{ name: "get_weather", input_schema: WEATHER_PARAMS }],
-    });
-
-    const blocks = new Map<number, { id: string; json: string }>();
-    for (const e of events) {
-      if (e.type === "content_block_start" && e.content_block.type === "tool_use") {
-        blocks.set(e.index, { id: e.content_block.id, json: "" });
-      } else if (e.type === "content_block_delta" && e.delta.type === "input_json_delta") {
-        blocks.get(e.index)!.json += e.delta.partial_json;
-      }
-    }
-    expect([...blocks.values()]).toEqual([
-      { id: "call_59014", json: '{"city":"Paris"}' },
-      { id: "call_59015", json: '{"city":"Rome"}' },
-    ]);
-  });
 
   test("/v1/responses emits one function_call item per call", async (ctx) => {
     if (!etcdReachable || !app || !upstream) {

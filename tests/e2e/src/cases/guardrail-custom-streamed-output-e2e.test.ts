@@ -49,39 +49,6 @@ const SCRIPT_FAULT = `export function checkOutput() { return { action: "permit" 
 // split across two deltas (or, for the clean stream, a clean tail).
 const pieces = (risky: boolean) => (risky ? [LEAD, "cstmstreamed", "marker"] : [LEAD, CLEAN_TAIL]);
 
-const anthropicEvents = (risky: boolean) => [
-  JSON.stringify({
-    type: "message_start",
-    message: {
-      id: "msg_custom_stream",
-      role: "assistant",
-      content: [],
-      model: "claude-3-5-haiku-20241022",
-      stop_reason: null,
-      usage: { input_tokens: 5, output_tokens: 1 },
-    },
-  }),
-  JSON.stringify({
-    type: "content_block_start",
-    index: 0,
-    content_block: { type: "text", text: "" },
-  }),
-  ...pieces(risky).map((text) =>
-    JSON.stringify({
-      type: "content_block_delta",
-      index: 0,
-      delta: { type: "text_delta", text },
-    }),
-  ),
-  JSON.stringify({ type: "content_block_stop", index: 0 }),
-  JSON.stringify({
-    type: "message_delta",
-    delta: { stop_reason: "end_turn" },
-    usage: { output_tokens: 12 },
-  }),
-  JSON.stringify({ type: "message_stop" }),
-];
-
 const chatEvents = (risky: boolean) => [
   JSON.stringify({
     id: "chatcmpl-custom-stream",
@@ -124,30 +91,21 @@ const responsesEvents = (risky: boolean) => [
   "[DONE]",
 ];
 
-type Wire = "anthropic" | "chat" | "responses";
+type Wire = "chat" | "responses";
 
 interface Route {
   name: string;
   path: string;
   wire: Wire;
-  provider: "anthropic" | "openai";
-  // `apis: {}` declares an OpenAI-compatible endpoint with no
-  // `/v1/responses`, which puts `/v1/responses` on the Chat bridge.
-  apis?: Record<string, never>;
+  provider: "openai";
 }
 
 const ROUTES: Route[] = [
-  { name: "messages-native", path: "/v1/messages", wire: "anthropic", provider: "anthropic" },
-  // An OpenAI-shape upstream answering `/v1/messages`: the Anthropic stream
-  // is encoded by the gateway from Chat chunks.
-  { name: "messages-bridge", path: "/v1/messages", wire: "chat", provider: "openai" },
   { name: "chat", path: "/v1/chat/completions", wire: "chat", provider: "openai" },
   { name: "responses-native", path: "/v1/responses", wire: "responses", provider: "openai" },
-  { name: "responses-bridge", path: "/v1/responses", wire: "chat", provider: "openai", apis: {} },
 ];
 
 const EVENTS: Record<Wire, (risky: boolean) => string[]> = {
-  anthropic: anthropicEvents,
   chat: chatEvents,
   responses: responsesEvents,
 };
@@ -240,13 +198,12 @@ describe("custom output guardrail on streamed responses", () => {
         const pk = await seed.createProviderKey({
           display_name: `${display}-pk`,
           api_key: "sk-mock",
-          api_base: route.provider === "anthropic" ? upstream.baseUrl : `${upstream.baseUrl}/v1`,
-          ...(route.apis ? { apis: route.apis } : {}),
+          api_base: `${upstream.baseUrl}/v1`,
         });
         const model = await seed.createModel({
           display_name: display,
           provider: route.provider,
-          model_name: route.provider === "anthropic" ? "claude-3-5-haiku-20241022" : "gpt-4o-mini",
+          model_name: "gpt-4o-mini",
           provider_key_id: pk.id,
         });
         await seed.attachGuardrailToModel(guardrail.id as string, model.id as string);
@@ -269,18 +226,14 @@ describe("custom output guardrail on streamed responses", () => {
 
   const stream = async (route: Route, model: string) => {
     const body =
-      route.wire === "anthropic" || route.path === "/v1/messages"
-        ? { model, max_tokens: 64, stream: true, messages: [{ role: "user", content: "plan it" }] }
-        : route.path === "/v1/chat/completions"
-          ? { model, stream: true, messages: [{ role: "user", content: "plan it" }] }
-          : { model, stream: true, input: "plan it" };
+      route.path === "/v1/chat/completions"
+        ? { model, stream: true, messages: [{ role: "user", content: "plan it" }] }
+        : { model, stream: true, input: "plan it" };
     const res = await fetch(`${app!.proxyUrl}${route.path}`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
         authorization: `Bearer ${CALLER}`,
-        "x-api-key": CALLER,
-        "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify(body),
     });
