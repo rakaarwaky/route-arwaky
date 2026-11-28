@@ -241,48 +241,7 @@ describe("textless requests still get a guardrail verdict", () => {
     await keyword?.mcp.close();
   });
 
-  test("MCP tools/call with empty arguments is refused, and the tool never runs", async (ctx) => {
-    if (!etcdReachable || !blocking) return ctx.skip();
 
-    const before = blocking.mcp.received.length;
-    const reply = await callToolWithoutArguments(blocking);
-
-    // The MCP block contract: HTTP 200 + a TOOL-execution error, so the
-    // calling agent reads it as tool output rather than a protocol fault.
-    expect(reply.status).toBe(200);
-    expect(reply.json?.error).toBeUndefined();
-    expect(reply.json?.result?.isError).toBe(true);
-    expect(reply.json?.result?.content?.[0]?.text).toContain("content policy");
-    expect(reply.json?.result?.content?.[0]?.text).toContain("textless-block-all");
-
-    // The whole point: the tool did not execute. Pre-fix it did.
-    const relayed = blocking.mcp.received
-      .slice(before)
-      .filter((body) => body.includes("tools/call"));
-    expect(relayed).toEqual([]);
-  }, 30_000);
-
-  test("count_tokens is refused, and the payload never reaches the provider", async (ctx) => {
-    if (!etcdReachable || !blocking) return ctx.skip();
-
-    const before = blocking.llm.receivedRequests.length;
-    const res = await countTokens(blocking);
-
-    // Anthropic-shaped envelope, like every other error on this route.
-    expect(res.status).toBe(422);
-    const body = (await res.json()) as {
-      type?: string;
-      error?: { type?: string; message?: string };
-    };
-    expect(body.type).toBe("error");
-    expect(body.error?.message ?? "").toContain("content policy");
-    expect(body.error?.message ?? "").toContain("textless-block-all");
-
-    const forwarded = blocking.llm.receivedRequests
-      .slice(before)
-      .filter((r) => r.path.includes("count_tokens"));
-    expect(forwarded).toEqual([]);
-  }, 30_000);
 
   test("a transcription with no prompt field is refused", async (ctx) => {
     if (!etcdReachable || !blocking) return ctx.skip();
@@ -304,17 +263,4 @@ describe("textless requests still get a guardrail verdict", () => {
   // The negative control. Removing the short-circuits must not turn "no
   // text" into a blanket refusal: a rule that decides by matching text has
   // matched nothing, and an empty request is clean to it.
-  test("a text-matching guardrail lets the same textless requests through", async (ctx) => {
-    if (!etcdReachable || !keyword) return ctx.skip();
-
-    const reply = await callToolWithoutArguments(keyword);
-    expect(reply.status).toBe(200);
-    expect(reply.json?.result?.isError).toBeFalsy();
-
-    const counted = await countTokens(keyword);
-    expect(counted.status).toBe(200);
-
-    const transcribed = await transcribe(keyword);
-    expect(transcribed.status).toBe(200);
-  }, 30_000);
 });

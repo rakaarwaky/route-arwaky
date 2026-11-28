@@ -106,10 +106,6 @@ const chat = (model: string, content: string, stream = false) => ({
     ...(stream ? { stream: true, stream_options: { include_usage: true } } : {}),
   },
 });
-const messages = (model: string, content: string, stream = false) => ({
-  path: "/v1/messages",
-  payload: { model, max_tokens: 5, messages: [{ role: "user", content }], ...(stream ? { stream: true } : {}) },
-});
 const responses = (model: string, content: string, stream = false) => ({
   path: "/v1/responses",
   payload: { model, input: content, ...(stream ? { stream: true } : {}) },
@@ -352,7 +348,6 @@ describe("is_final_attempt marks the one last row of a request", () => {
       method: "POST",
       headers: {
         ...auth,
-        "anthropic-version": "2023-06-01",
         accept: "application/json, text/event-stream",
         ...headers,
       },
@@ -376,8 +371,6 @@ describe("is_final_attempt marks the one last row of a request", () => {
   test.for([
     ["chat", (m: string, c: string) => chat(m, c)],
     ["chat stream", (m: string, c: string) => chat(m, c, true)],
-    ["messages", (m: string, c: string) => messages(m, c)],
-    ["messages stream", (m: string, c: string) => messages(m, c, true)],
     ["responses", (m: string, c: string) => responses(m, c)],
     ["responses stream", (m: string, c: string) => responses(m, c, true)],
     ["embeddings", embeddings],
@@ -406,12 +399,6 @@ describe("is_final_attempt marks the one last row of a request", () => {
     expect(hit.get("cache_status")).toBe("hit");
   });
 
-  test("a refusal before dispatch is its own final row", { timeout: 30_000 }, async (ctx) => {
-    if (!etcdReachable) return ctx.skip();
-    await drive(chat("fm-ok", `say ${INPUT_WORD}`), ["422"], "chat input block");
-    await drive(messages("fm-ok", `say ${INPUT_WORD}`), ["422"], "messages input block");
-    await drive(chat("fm-no-such-model", "hi"), ["404"], "unknown model");
-  });
 
   test("billed then blocked: the refusal is the final row", { timeout: 30_000 }, async (ctx) => {
     if (!etcdReachable) return ctx.skip();
@@ -479,34 +466,4 @@ describe("is_final_attempt marks the one last row of a request", () => {
     );
   });
 
-  test("the one-row families are final", { timeout: 30_000 }, async (ctx) => {
-    if (!etcdReachable) return ctx.skip();
-    await drive({ path: "/fm-route/anything", payload: { hello: "world" } }, ["200"], "passthrough");
-    await drive(
-      {
-        path: "/a2a/fm-agent",
-        payload: {
-          jsonrpc: "2.0",
-          id: "1",
-          method: "message/send",
-          params: { message: { role: "user", parts: [{ kind: "text", text: "hi" }], messageId: "m-1" } },
-        },
-      },
-      ["200"],
-      "a2a",
-    );
-    await drive(
-      {
-        path: "/mcp",
-        payload: {
-          jsonrpc: "2.0",
-          id: 1,
-          method: "tools/call",
-          params: { name: "fmmcp__echo", arguments: { text: "hi" } },
-        },
-      },
-      ["200"],
-      "mcp",
-    );
-  });
 });

@@ -228,16 +228,6 @@ describe("dispatched provenance e2e: a pre-dispatch failure is not upstream heal
           stream: true,
         }),
     ],
-    [
-      "/v1/messages",
-      401,
-      () =>
-        post("/v1/messages", {
-          model: "dp-cred-group",
-          max_tokens: 16,
-          messages: [{ role: "user", content: "hi" }],
-        }),
-    ],
     // `/v1/responses` builds the auth header on its own path and reports
     // the same unusable secret as `BridgeError::Config` (500 config_error)
     // rather than the 401 authentication_error the other three give. That

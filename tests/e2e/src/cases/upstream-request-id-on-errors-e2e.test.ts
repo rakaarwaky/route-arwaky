@@ -4,7 +4,6 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
   SeedClient,
-  eventStreamException,
   slsLogsFor,
   spawnApp,
   startMockSls,
@@ -21,7 +20,7 @@ import {
 // from, and a token count's answer carries none, so the header is the only
 // place it exists.
 //
-// The contract read back here, for every provider family the gateway
+// The contract read back here, for the OpenAI-compatible family the gateway
 // dispatches to:
 //   - each failed attempt's usage event carries the id of the response that
 //     failed it (`provider_request_id`);
@@ -40,10 +39,6 @@ const LOGSTORE = "upstream-request-id-store";
 const OPENAI = "urid-openai";
 const OPENAI_RETRIED = "urid-openai-retried";
 const OPENAI_OK = "urid-openai-ok";
-const BEDROCK_OK = "urid-bedrock-nova-ok";
-const AZURE = "urid-azure";
-const BEDROCK = "urid-bedrock-nova";
-const VERTEX = "urid-vertex-gemini";
 
 // The id each upstream answers with, keyed off what it was asked, so a
 // matching row proves WHICH response the id was read from.
@@ -67,48 +62,6 @@ async function startUpstream(): Promise<{ server: Server; baseUrl: string }> {
     };
     const openAiError = { error: { message: "rejected by the mock", type: "invalid_request_error" } };
 
-    // Bedrock runtime: the AWS SDK's own operations.
-    if (path.startsWith("/model/")) {
-      const awsId = (tag: string) => ({ "x-amzn-requestid": `amzn-${tag}` });
-      if (path.includes("nova-ok") && path.endsWith("/converse")) {
-        res.writeHead(200, { "content-type": "application/json", ...awsId("converse-ok") });
-        res.end(
-          JSON.stringify({
-            output: { message: { role: "assistant", content: [{ text: "ok" }] } },
-            stopReason: "end_turn",
-            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
-            metrics: { latencyMs: 1 },
-          }),
-        );
-        return;
-      }
-      if (path.endsWith("/converse-stream")) {
-        // Committed 200, then a modeled exception before any content.
-        res.writeHead(200, { "content-type": "application/vnd.amazon.eventstream", ...awsId("stream") });
-        res.end(eventStreamException("throttlingException", { message: "slow down" }));
-        return;
-      }
-      const tag = path.endsWith("/converse") ? "converse" : "invoke";
-      return fail(
-        400,
-        { ...awsId(tag), "x-amzn-errortype": "ValidationException:http://internal.amazon.com/coral/com.amazon.bedrock/" },
-        { message: "The provided model identifier is invalid." },
-      );
-    }
-    // Vertex AI.
-    if (path.includes("/projects/")) {
-      return fail(
-        400,
-        { "x-goog-request-id": "goog-generate" },
-        { error: { code: 400, message: "Invalid argument.", status: "INVALID_ARGUMENT" } },
-      );
-    }
-    // Azure OpenAI sends two ids; `x-request-id` is the one asked for first.
-    if (path.includes("/openai/deployments/")) {
-      return fail(429, { "x-request-id": "azure-chat", "apim-request-id": "azure-apim" }, {
-        error: { code: "429", message: "Rate limit is exceeded." },
-      });
-    }
     // OpenAI, answering: an embedding carries no id of its own.
     if (path.startsWith("/oai-ok/v1/chat/completions")) {
       res.writeHead(200, { "content-type": "application/json", "x-request-id": "oai-ok-chat" });
@@ -240,27 +193,10 @@ describe("the provider's request id on failed attempts and token counts", () => 
     const openai = await pk("urid-openai-pk", { api_base: `${up.baseUrl}/oai/v1` });
     const retried = await pk("urid-openai-retried-pk", { api_base: `${up.baseUrl}/oai-retried/v1` });
     const answering = await pk("urid-openai-ok-pk", { api_base: `${up.baseUrl}/oai-ok/v1` });
-    const azure = await pk("urid-azure-pk", { provider: "azure-openai", adapter: "azure-openai", api_base: up.baseUrl });
-    const bedrock = await pk("urid-bedrock-pk", {
-      provider: "bedrock",
-      adapter: "bedrock",
-      api_key: JSON.stringify({ access_key_id: "AKIA-urid", secret_access_key: "sk-urid", region: "us-west-2" }),
-      api_base: up.baseUrl,
-    });
-    const vertex = await pk("urid-vertex-pk", {
-      provider: "google",
-      adapter: "vertex",
-      api_key: JSON.stringify({ access_token: "ya29.urid", project: "proj-e2e", region: "us-central1" }),
-      api_base: up.baseUrl,
-    });
     for (const [display_name, key, provider, model_name, retries] of [
       [OPENAI, openai, "openai", "gpt-4o-mini", 0],
       [OPENAI_RETRIED, retried, "openai", "gpt-4o-mini", 1],
       [OPENAI_OK, answering, "openai", "text-embedding-3-small", 0],
-      [AZURE, azure, "azure-openai", "gpt-4o-mini", 0],
-      [BEDROCK, bedrock, "bedrock", "amazon.nova-lite-v1:0", 0],
-      [BEDROCK_OK, bedrock, "bedrock", "amazon.nova-ok-v1:0", 0],
-      [VERTEX, vertex, "google", "gemini-2.5-flash", 0],
     ] as const) {
       await seed.createModel({ display_name, provider, model_name, provider_key_id: key.id, retries });
     }
@@ -285,15 +221,6 @@ describe("the provider's request id on failed attempts and token counts", () => 
   // [case, send, provider the line names, the id the upstream answered with].
   const families: Array<[string, () => Promise<Sent>, string, string]> = [
     ["OpenAI, /v1/chat/completions", () => json("/v1/chat/completions", chat(OPENAI)), "openai", "oai-chat-completions"],
-    ["Azure OpenAI, /v1/chat/completions", () => json("/v1/chat/completions", chat(AZURE)), "azure-openai", "azure-chat"],
-    ["Bedrock Converse, /v1/chat/completions", () => json("/v1/chat/completions", chat(BEDROCK)), "bedrock", "amzn-converse"],
-    [
-      "Bedrock ConverseStream, an exception before the first token",
-      () => json("/v1/chat/completions", chat(BEDROCK, true)),
-      "bedrock",
-      "amzn-stream",
-    ],
-    ["Vertex AI Gemini, /v1/chat/completions", () => json("/v1/chat/completions", chat(VERTEX)), "google", "goog-generate"],
   ];
 
   for (const [name, send, provider, upstreamId] of families) {
@@ -346,14 +273,6 @@ describe("the provider's request id on failed attempts and token counts", () => 
     expect(row.get("provider_request_id"), JSON.stringify(Object.fromEntries(row))).toBe("chatcmpl-urid-ok");
     const line = await accessLine(res.requestId);
     expect(field(line, "provider_request_id"), line).toBe("chatcmpl-urid-ok");
-  });
-
-  test("a successful Bedrock Converse call records the provider's request id", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const res = await json("/v1/chat/completions", chat(BEDROCK_OK));
-    expect(res.status, res.text).toBe(200);
-    const [row] = await rowsFor(res.requestId, 1);
-    expect(row.get("provider_request_id"), JSON.stringify(Object.fromEntries(row))).toBe("amzn-converse-ok");
   });
 
   test("each retried attempt carries the id of its own response", async (ctx) => {

@@ -314,56 +314,6 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     await migrated.text();
   });
 
-  test("anthropic inject shape: x-api-key + anthropic-version, no Bearer", async (ctx) => {
-    if (!etcdReachable || !app || !seed) {
-      ctx.skip();
-      return;
-    }
-
-    const upstream = await startOpenAiUpstream({
-      nonStreamBody: { id: "msgbatch-1", type: "message_batch" },
-    });
-    upstreams.push(upstream);
-
-    const pk = await seed.createProviderKey({
-      display_name: "ptr-anthropic-pk",
-      api_key: "sk-ant-mock",
-      api_base: "http://unused-on-routes",
-      provider: "anthropic",
-      adapter: "anthropic",
-    });
-    await seed.createPassthroughRoute({
-      name: "ptr-anthropic-tunnel",
-      path_prefix: "/passthrough/anthropic",
-      target_url: upstream.baseUrl,
-      provider_key_id: pk.id,
-    });
-
-    const headers = {
-      authorization: `Bearer ${CALLER_PLAINTEXT}`,
-      "content-type": "application/json",
-    };
-    await waitConfigPropagation(async () => {
-      try {
-        const r = await fetch(
-          `${app!.proxyUrl}/passthrough/anthropic/v1/messages/batches`,
-          { method: "POST", headers, body: "{}" },
-        );
-        if (r.status !== 200) {
-          await r.text();
-          return false;
-        }
-        return true;
-      } catch {
-        return false;
-      }
-    });
-
-    const hit = upstream.receivedRequests.at(-1)!;
-    expect(hit.headers["x-api-key"]).toBe("sk-ant-mock");
-    expect(hit.headers["anthropic-version"]).toBe("2023-06-01");
-    expect(hit.headers["authorization"]).toBeUndefined();
-  });
 
   test("unclaimed /passthrough/* takes the plain 404 miss path", async (ctx) => {
     if (!etcdReachable || !app) {

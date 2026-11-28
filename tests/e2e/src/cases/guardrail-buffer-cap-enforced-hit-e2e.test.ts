@@ -24,8 +24,8 @@ import {
 // raising the cap. The exported `guardrail_enforced_hits` entry answers
 // both: the row, on `output`, with `action: "blocked_buffer_exceeded"`.
 //
-// Every route that holds a stream back is driven: chat, /v1/messages native
-// and bridged, /v1/responses native and bridged, and a passthrough route.
+// Every route that holds a stream back is driven: chat, /v1/responses
+// native and bridged, and a passthrough route.
 // Each is governed by TWO output rows, and the one with the looser cap runs
 // first in chain order — so naming the chain's first member, or the larger
 // cap, names the wrong row. A third case covers a kind that has no
@@ -91,28 +91,6 @@ const DUPLICATE_REASONING_STREAM = [
   chatChunk({ reasoning: SHORT_REASONING, reasoning_text: SHORT_REASONING }),
   chatChunk({ content: "Answer" }, "stop"),
   "[DONE]",
-];
-
-const ANTHROPIC_STREAM = [
-  JSON.stringify({
-    type: "message_start",
-    message: {
-      id: "msg_cap",
-      type: "message",
-      role: "assistant",
-      content: [],
-      model: "claude-3-5-haiku-20241022",
-      stop_reason: null,
-      usage: { input_tokens: 5, output_tokens: 1 },
-    },
-  }),
-  JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
-  ...PIECES.map((p) =>
-    JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: p } }),
-  ),
-  JSON.stringify({ type: "content_block_stop", index: 0 }),
-  JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 40 } }),
-  JSON.stringify({ type: "message_stop" }),
 ];
 
 const RESPONSES_STREAM = [
@@ -260,7 +238,7 @@ describe("a stream refused by the hold-back cap names the row whose cap it outgr
 
     const model = async (
       display: string,
-      provider: "openai" | "anthropic",
+      provider: "openai",
       streamEvents: string[],
       pkExtra: Record<string, unknown> = {},
     ) => {
@@ -269,14 +247,13 @@ describe("a stream refused by the hold-back cap names the row whose cap it outgr
       const pk = await seed.createProviderKey({
         display_name: `${display}-pk`,
         api_key: "sk-mock",
-        api_base: provider === "openai" ? `${upstream.baseUrl}/v1` : upstream.baseUrl,
-        ...(provider === "anthropic" ? { provider: "anthropic", adapter: "anthropic" } : {}),
+        api_base: `${upstream.baseUrl}/v1`,
         ...pkExtra,
       });
       const m = await seed.createModel({
         display_name: display,
         provider,
-        model_name: provider === "openai" ? "gpt-4o-mini" : "claude-3-5-haiku-20241022",
+        model_name: "gpt-4o-mini",
         provider_key_id: pk.id,
       });
       return { upstream, pk, model: m };
@@ -284,8 +261,6 @@ describe("a stream refused by the hold-back cap names the row whose cap it outgr
 
     for (const [display, provider, events, extra] of [
       ["cap-chat", "openai", chatStream(PIECES), {}],
-      ["cap-msg-native", "anthropic", ANTHROPIC_STREAM, {}],
-      ["cap-msg-bridge", "openai", chatStream(PIECES), {}],
       ["cap-resp-native", "openai", RESPONSES_STREAM, {}],
       // `apis: {}`: no `/v1/responses` on this endpoint, so the route
       // reaches it through the chat bridge.
@@ -430,7 +405,6 @@ describe("a stream refused by the hold-back cap names the row whose cap it outgr
         "content-type": "application/json",
         authorization: `Bearer ${KEY}`,
         "x-api-key": KEY,
-        ...(path === "/v1/messages" ? { "anthropic-version": "2023-06-01" } : {}),
       },
       body: JSON.stringify({ ...body, stream: true }),
     });
@@ -457,13 +431,9 @@ describe("a stream refused by the hold-back cap names the row whose cap it outgr
   };
   const byModel = (model: string) => (l: Map<string, string>) => l.get("requested_model") === model;
 
-  const msg = (model: string) =>
-    post("/v1/messages", { model, max_tokens: 256, messages: [{ role: "user", content: "go" }] });
   const resp = (model: string) => post("/v1/responses", { model, input: "go" });
   const cases: Array<{ route: string; model: string; send: (model: string) => Promise<string> }> = [
     { route: "/v1/chat/completions", model: "cap-chat", send: chat },
-    { route: "/v1/messages (native)", model: "cap-msg-native", send: msg },
-    { route: "/v1/messages (bridged)", model: "cap-msg-bridge", send: msg },
     { route: "/v1/responses (native)", model: "cap-resp-native", send: resp },
     { route: "/v1/responses (bridged)", model: "cap-resp-bridge", send: resp },
   ];

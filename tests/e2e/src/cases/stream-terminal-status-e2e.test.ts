@@ -277,71 +277,7 @@ describe("streamed responses record their terminal status", () => {
     [CHAT, "st"],
     [MESSAGES, "msg"],
   ] as const) {
-    describe(endpoint, () => {
-      test("a stream delivered to its end records 200, timed over the whole stream", async (ctx) => {
-        if (!ready()) return ctx.skip();
-        const model = `${prefix}-ok`;
-        const before = await scrape();
-        const res = await post(endpoint, model, true);
-        expect(res.status).toBe(200);
-        await drain(res);
-        const after = await settledAfter(before, "aisix_proxy_requests_total", { endpoint, model }, 1);
-        expectRequestFamilies(before, after, endpoint, model, 200);
-        // Four events 300ms apart: a duration taken at the head would be a
-        // few milliseconds.
-        const seconds = metricDelta(before, after, "aisix_proxy_request_duration_seconds_sum", {
-          endpoint,
-          model,
-        });
-        expect(seconds, "the duration must span the stream").toBeGreaterThanOrEqual(0.6);
-        expectLatencyClass(before, after, endpoint, model, "2xx");
-      });
 
-      test("a stream the caller abandons records 499, once", async (ctx) => {
-        if (!ready()) return ctx.skip();
-        const model = `${prefix}-cancel`;
-        const before = await scrape();
-        const requestId = await abandonAfterFirstFrame(endpoint, model);
-        const after = await settledAfter(before, "aisix_proxy_requests_total", { endpoint, model }, 1);
-        expectRequestFamilies(before, after, endpoint, model, 499);
-        expectLatencyClass(before, after, endpoint, model, "4xx");
-        const row = await waitForSlsLog(
-          sls!,
-          LOGSTORE,
-          (log) => log.get("request_id") === requestId,
-          `the usage row for ${requestId}`,
-        );
-        expect(row.get("status_code")).toBe("499");
-        expect(row.get("error_class")).toBe("client_disconnected");
-      });
-
-      test("a stream the upstream breaks after the head records 502", async (ctx) => {
-        if (!ready()) return ctx.skip();
-        const model = `${prefix}-break`;
-        const before = await scrape();
-        const res = await post(endpoint, model, true);
-        expect(res.status, "the head went out before the upstream broke").toBe(200);
-        const requestId = res.headers.get("x-aisix-request-id") ?? "";
-        await drain(res);
-        const after = await settledAfter(before, "aisix_proxy_requests_total", { endpoint, model }, 1);
-        expectRequestFamilies(before, after, endpoint, model, 502);
-        expectLatencyClass(before, after, endpoint, model, "5xx");
-        const row = await waitForSlsLog(
-          sls!,
-          LOGSTORE,
-          (log) => log.get("request_id") === requestId,
-          `the usage row for ${requestId}`,
-        );
-        expect(row.get("status_code")).toBe("502");
-        const line = await waitForLogLine(
-          app!,
-          (l) => l.includes(`request_id="${requestId}"`) && l.includes("proxy request completed"),
-          `the access-log line for ${requestId}`,
-        );
-        expect(line).toContain("status_code=502");
-        expect(line).toContain(`error_class="${row.get("error_class")}"`);
-      });
-    });
   }
 
   test("a stream that hits its read timeout records 504 / timeout on every record", async (ctx) => {

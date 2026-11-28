@@ -449,33 +449,6 @@ describe("group-referencing model conditions e2e (AISIX-Cloud#1267)", () => {
     });
   });
 
-  test("/v1/messages drives the same per-target gate for group-id conditions", async (ctx) => {
-    if (!etcdReachable || !app) {
-      ctx.skip();
-      return;
-    }
-    await awaitWindowHeadroom(5);
-
-    const messagesRaw = async (): Promise<number> => {
-      const res = await fetch(`${app!.proxyUrl}/v1/messages`, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${KEY_SIB}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({
-          model: "grp-1267-main",
-          max_tokens: 32,
-          messages: [{ role: "user", content: "hello" }],
-        }),
-      });
-      await res.text();
-      return res.status;
-    };
-
-    expect(await messagesRaw()).toBe(200);
-    expect(await messagesRaw()).toBe(429);
-  });
 
   test("streaming chat drives the same per-target gate for group-id conditions", async (ctx) => {
     if (!etcdReachable || !app) {

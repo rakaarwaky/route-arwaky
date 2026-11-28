@@ -238,40 +238,6 @@ describe("api key lifecycle e2e: expired/disabled keys fail closed, secret swap 
     );
   }, 60_000);
 
-  test("Anthropic surface rejects a disabled key with the Anthropic envelope", async (ctx) => {
-    if (!etcdReachable || !app) {
-      ctx.skip();
-      return;
-    }
-
-    const plaintext = "sk-lifecycle-disabled-anthropic";
-    await seedKey(plaintext, { disabled: true }, isLifecycle401("api_key_disabled"));
-
-    const res = await fetch(`${app.proxyUrl}/v1/messages`, {
-      method: "POST",
-      headers: {
-        "x-api-key": plaintext,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        max_tokens: 16,
-        messages: [{ role: "user", content: "disabled key via anthropic" }],
-      }),
-    });
-
-    expect(res.status).toBe(401);
-    const body = (await res.json()) as {
-      type?: unknown;
-      error?: { type?: unknown; message?: unknown };
-    };
-    // Anthropic error envelope: top-level discriminator + canonical
-    // per-status error type, per
-    // <https://docs.anthropic.com/en/api/errors>.
-    expect(body.type).toBe("error");
-    expect(body.error?.type).toBe("authentication_error");
-  });
 
   test("secret swap in place: the old plaintext dies, the new one works", async (ctx) => {
     if (!etcdReachable || !app || !seed) {

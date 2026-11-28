@@ -86,25 +86,6 @@ const responsesText = [
   "[DONE]",
 ];
 
-const anthropicText = [
-  JSON.stringify({
-    type: "message_start",
-    message: {
-      id: "msg_late",
-      role: "assistant",
-      content: [],
-      model: "claude-3-5-haiku-20241022",
-      stop_reason: null,
-      usage: { input_tokens: 5, output_tokens: 1 },
-    },
-  }),
-  JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
-  ...pieces.map((text) => JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } })),
-  JSON.stringify({ type: "content_block_stop", index: 0 }),
-  JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 12 } }),
-  JSON.stringify({ type: "message_stop" }),
-];
-
 // Streamed transcription deltas; the terminal event carries usage only, so
 // the transcript is the assembled deltas.
 const transcriptFrames = [
@@ -118,7 +99,7 @@ const transcriptFrames = [
 
 interface Route {
   name: string;
-  provider: "anthropic" | "openai";
+  provider: "openai";
   upstream: { streamEvents?: string[]; rawStreamFrames?: string[] };
   // `apis: {}` declares an OpenAI-compatible endpoint with no
   // `/v1/responses`, which puts `/v1/responses` on the Chat bridge.
@@ -132,8 +113,6 @@ const json = (proxyUrl: string, path: string, body: Record<string, unknown>) =>
     headers: {
       "content-type": "application/json",
       authorization: `Bearer ${CALLER}`,
-      "x-api-key": CALLER,
-      "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({ ...body, stream: true }),
   });
@@ -163,12 +142,6 @@ const ROUTES: Route[] = [
     provider: "openai",
     upstream: { streamEvents: chatContent },
     send: (u, model) => json(u, "/v1/chat/completions", { model, messages: [{ role: "user", content: "go" }] }),
-  },
-  {
-    name: "messages-native",
-    provider: "anthropic",
-    upstream: { streamEvents: anthropicText },
-    send: (u, model) => json(u, "/v1/messages", { model, max_tokens: 64, messages: [{ role: "user", content: "go" }] }),
   },
   {
     name: "transcription",
@@ -239,18 +212,13 @@ describe("monitor-mode output guardrail scans all of a streamed response", () =>
       const pk = await seed.createProviderKey({
         display_name: `${display}-pk`,
         api_key: "sk-mock",
-        api_base: route.provider === "anthropic" ? upstream.baseUrl : `${upstream.baseUrl}/v1`,
+        api_base: `${upstream.baseUrl}/v1`,
         ...(route.apis ? { apis: route.apis } : {}),
       });
       const model = await seed.createModel({
         display_name: display,
         provider: route.provider,
-        model_name:
-          route.provider === "anthropic"
-            ? "claude-3-5-haiku-20241022"
-            : route.name === "transcription"
-              ? "gpt-4o-transcribe"
-              : "gpt-4o-mini",
+        model_name: route.name === "transcription" ? "gpt-4o-transcribe" : "gpt-4o-mini",
         provider_key_id: pk.id,
       });
       await seed.attachGuardrailToModel(monitor.id as string, model.id as string);

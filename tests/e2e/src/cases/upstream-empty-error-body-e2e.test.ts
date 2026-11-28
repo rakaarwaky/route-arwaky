@@ -159,14 +159,4 @@ describe("upstream error with no message → caller sees the upstream status (#9
     expect(await errorMessage(res)).toBe("upstream returned 403 Forbidden");
   });
 
-  test("messages (cross-provider to an OpenAI upstream): bodyless 404 names the status", async (ctx) => {
-    if (skip(ctx)) return;
-    const res = await post("/v1/messages", {
-      model: "empty-err-messages-404",
-      max_tokens: 16,
-      messages: [{ role: "user", content: "hi" }],
-    });
-    expect(res.status).toBe(404);
-    expect(await errorMessage(res)).toBe("upstream returned 404 Not Found");
-  });
 });

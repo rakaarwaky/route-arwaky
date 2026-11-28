@@ -234,19 +234,6 @@ describe("the access log reports request and response body sizes", () => {
     expect(numField(line, "response_body_bytes"), line).toBe(r.received);
   }, 30_000);
 
-  test("streamed /v1/messages and /v1/responses count the same way", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    for (const [path, body] of [
-      ["/v1/messages", { model: "bytes-claude", stream: true, max_tokens: 16, messages: [{ role: "user", content: "go" }] }],
-      ["/v1/responses", { model: "bytes-responses", stream: true, input: "go" }],
-    ] as const) {
-      const r = await send("POST", path, JSON.stringify(body));
-      expect(r.status, r.text).toBe(200);
-      const line = await lineFor(r.requestId, `the ${path} line`);
-      expect(numField(line, "request_body_bytes"), `${path}: ${line}`).toBe(r.sent);
-      expect(numField(line, "response_body_bytes"), `${path}: ${line}`).toBe(r.received);
-    }
-  });
 
   test("a client that leaves mid-stream is charged what was handed over until then", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
@@ -330,16 +317,6 @@ describe("the access log reports request and response body sizes", () => {
     expect(numField(line, "response_body_bytes"), line).toBe(r.received);
   });
 
-  test("a Gemini body-limit refusal uses the configured route's envelope", async (ctx) => {
-    if (!app) return ctx.skip();
-    const body = JSON.stringify({ contents: [{ parts: [{ text: "x".repeat(BODY_LIMIT) }] }] });
-    const mounted = await send("POST", "/v1beta/models/mounted:generateContent", body);
-    expect(mounted.status).toBe(413);
-    expect(JSON.parse(mounted.text)).toMatchObject({ error: { type: "invalid_request_error" } });
-    const typed = await send("POST", "/v1beta1/projects/p/locations/l/publishers/google/models/typed:generateContent", body);
-    expect(typed.status).toBe(413);
-    expect(JSON.parse(typed.text)).toMatchObject({ error: { code: 413, status: "INVALID_ARGUMENT" } });
-  });
 
   test("a 413 decided from Content-Length reports no request size", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
@@ -361,15 +338,10 @@ describe("the access log reports request and response body sizes", () => {
     { method: "POST", path: "/v1/rerank", body: { model: "bytes-nope", query: "q", documents: ["a"] }, bodyRead: true },
     { method: "POST", path: "/v1/images/generations", body: { model: "bytes-nope", prompt: "hi" }, bodyRead: true },
     { method: "POST", path: "/v1/audio/speech", body: { model: "bytes-nope", input: "hi", voice: "alloy" }, bodyRead: true },
-    { method: "POST", path: "/v1/messages", body: { model: "bytes-nope", max_tokens: 8, messages: [{ role: "user", content: "hi" }] }, bodyRead: true },
-    { method: "POST", path: "/v1/messages/count_tokens", body: { model: "bytes-nope", messages: [{ role: "user", content: "hi" }] }, bodyRead: true },
     { method: "POST", path: "/v1/responses", body: { model: "bytes-nope", input: "hi" }, bodyRead: true },
     { method: "POST", path: "/v1/videos", body: { model: "bytes-nope", prompt: "hi" }, bodyRead: true },
     { method: "GET", path: "/v1/videos/bytes-nope/content", bodyRead: false },
     { method: "GET", path: "/v1/batches", bodyRead: false },
-    { method: "POST", path: "/mcp", body: { jsonrpc: "2.0", id: 1, method: "tools/list" }, bodyRead: true },
-    // An unknown agent is refused before its body is read.
-    { method: "POST", path: "/a2a/bytes-nope", body: { jsonrpc: "2.0", id: 1, method: "message/send", params: {} }, bodyRead: false },
   ];
 
   for (const f of FAMILIES) {

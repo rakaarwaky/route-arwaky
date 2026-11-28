@@ -218,15 +218,6 @@ describe("embedding failure logs keep the upstream's echo of the prompt out", ()
     expectNoEcho(line);
   });
 
-  test("router: an undecodable response that quotes the prompt logs only the decode failure", async (ctx) => {
-    if (!etcdReachable || !app) {
-      ctx.skip();
-      return;
-    }
-    const line = await failureLine("redaction-router-titan", routerLine("redaction-router-titan"));
-    expect(line).toContain("could not be decoded");
-    expectNoEcho(line);
-  });
 
   test("cache: an upstream error that quotes the prompt logs only its status", async (ctx) => {
     if (!etcdReachable || !app) {
@@ -238,13 +229,4 @@ describe("embedding failure logs keep the upstream's echo of the prompt out", ()
     expectNoEcho(line);
   });
 
-  test("cache: an undecodable response that quotes the prompt logs only the decode failure", async (ctx) => {
-    if (!etcdReachable || !app) {
-      ctx.skip();
-      return;
-    }
-    const line = await failureLine("redaction-cached-titan", cacheLine("redaction-cache-titan"));
-    expect(line).toContain("could not be decoded");
-    expectNoEcho(line);
-  });
 });

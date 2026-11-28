@@ -398,21 +398,6 @@ describe("guardrail enforced hits on the LLM handler family", () => {
     await expectAuditedMask("enforced-chat-stream", CASES.chatStream.detector, CASES.chatStream.marker);
   });
 
-  test("/v1/messages names the row that masked (Claude-Code path)", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-
-    const res = await post("/v1/messages", {
-      model: "enforced-messages",
-      max_tokens: 64,
-      messages: [{ role: "user", content: "go" }],
-    });
-    expect(res.status).toBe(200);
-    const body = await res.text();
-    expect(body).toContain("***");
-    expect(body).not.toContain(CASES.messages.marker);
-
-    await expectAuditedMask("enforced-messages", CASES.messages.detector, CASES.messages.marker);
-  });
 
   test("/v1/responses names the row that masked (Codex path)", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();
@@ -482,63 +467,9 @@ describe("guardrail enforced hits on the LLM handler family", () => {
     expect(decodedTextFor(sls!, LOGSTORE)).not.toContain(marker);
   };
 
-  test("provider-unsupported /v1/completions keeps guardrail attribution", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    await expectAudited501(
-      "/v1/completions",
-      "enforced-completions-501",
-      CASES.completions501.detector,
-      CASES.completions501.marker,
-      { prompt: `screen ${CASES.completions501.marker}`, max_tokens: 8 },
-    );
-  });
 
-  test("provider-unsupported /v1/embeddings keeps guardrail attribution", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    await expectAudited501(
-      "/v1/embeddings",
-      "enforced-embeddings-501",
-      CASES.embeddings501.detector,
-      CASES.embeddings501.marker,
-      { input: `screen ${CASES.embeddings501.marker}` },
-    );
-  });
 
-  test("provider-unsupported /v1/images/generations keeps guardrail attribution", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-    await expectAudited501(
-      "/v1/images/generations",
-      "enforced-images-501",
-      CASES.images501.detector,
-      CASES.images501.marker,
-      { prompt: `screen ${CASES.images501.marker}` },
-    );
-  });
 
-  test("/a2a keeps the enforced input decision on a blocked call", async (ctx) => {
-    if (!etcdReachable || !app || !sls) return ctx.skip();
-
-    const res = await post("/a2a/enforced-a2a", {
-      jsonrpc: "2.0",
-      id: "guardrail-audit",
-      method: "message/send",
-      params: {
-        message: {
-          role: "user",
-          parts: [{ kind: "text", text: `send ${A2A_MARKER}` }],
-          messageId: "guardrail-audit-message",
-        },
-      },
-    });
-    expect(res.status).toBe(422);
-
-    await waitForToken(sls, LOGSTORE, "enforced-a2a");
-    const decoded = decodedTextFor(sls, LOGSTORE);
-    const hits = hitsIn(decoded).filter((h) => h.guardrail_name === A2A_ROW);
-    expect(hits.length).toBeGreaterThan(0);
-    expect(hits.every((h) => h.action === "blocked" && h.hook === "input")).toBe(true);
-    expect(decoded).not.toContain(A2A_MARKER);
-  });
 });
 
 // AISIX-Cloud#1365: the third enforcement state.

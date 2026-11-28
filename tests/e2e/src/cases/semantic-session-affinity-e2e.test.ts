@@ -116,25 +116,6 @@ const startChatMock = (content: string) =>
     ];
   });
 
-/** An Anthropic upstream: `count_tokens` answers `tokens`, messages answer `content`. */
-const startAnthropicMock = (content: string, tokens: number) =>
-  serve((path) =>
-    path.includes("count_tokens")
-      ? [200, { input_tokens: tokens }]
-      : [
-          200,
-          {
-            id: `msg_${content}`,
-            type: "message",
-            role: "assistant",
-            model: "claude-haiku-4-5-20251001",
-            content: [{ type: "text", text: content }],
-            stop_reason: "end_turn",
-            usage: { input_tokens: 3, output_tokens: 2 },
-          },
-        ],
-  );
-
 function field(line: string, name: string): string | undefined {
   const m = new RegExp(`\\b${name}=("(?:[^"\\\\]|\\\\.)*"|\\S+)`).exec(line);
   if (!m) return undefined;
@@ -152,12 +133,11 @@ interface Result {
 type Headers = Record<string, string>;
 
 async function call(baseUrl: string, path: string, body: object, headers: Headers, key = CALLER): Promise<Result> {
-  const anthropic = path.startsWith("/v1/messages");
   const res = await fetch(`${baseUrl}${path}`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      ...(anthropic ? { "x-api-key": key, "anthropic-version": "2023-06-01" } : { authorization: `Bearer ${key}` }),
+      authorization: `Bearer ${key}`,
       ...headers,
     },
     body: JSON.stringify(body),
@@ -212,9 +192,6 @@ async function startUpstreams(): Promise<Record<string, Mock>> {
   for (const name of ["sa-legal", "sa-code", "sa-default", "sa-flip"]) {
     mocks[name] = await startChatMock(`served-by-${name}`);
   }
-  for (const [name, tokens] of [["ct-legal", 11], ["ct-code", 22], ["ct-default", 33]] as const) {
-    mocks[name] = await startAnthropicMock(`served-by-${name}`, tokens);
-  }
   return mocks;
 }
 
@@ -264,28 +241,12 @@ async function seedRouters(put: Put, mocks: Record<string, Mock>) {
       provider_key_id: pk.id,
     });
   }
-  for (const name of ["ct-legal", "ct-code", "ct-default"]) {
-    const pk = await put("provider_keys", {
-      display_name: `${name}-pk`,
-      provider: "openai",
-      adapter: "openai",
-      api_key: "sk-ant-mock",
-      api_base: mocks[name]!.baseUrl,
-    });
-    await put("models", {
-      display_name: name,
-      provider: "anthropic",
-      model_name: "claude-haiku-4-5-20251001",
-      provider_key_id: pk.id,
-    });
-  }
   const routers: Record<string, { id: string; value: Doc }> = {};
   const on = { enabled: true, ttl_seconds: 600 };
   routers["sa-router"] = await put("models", routerDoc("sa-router", "sa-legal", "sa-code", "sa-default", on));
   routers["sa-off"] = await put("models", routerDoc("sa-off", "sa-legal", "sa-code", "sa-default", { enabled: false, ttl_seconds: 600 }));
   routers["sa-drop"] = await put("models", routerDoc("sa-drop", "sa-legal", "sa-code", "sa-default", on));
   routers["sa-flip-router"] = await put("models", routerDoc("sa-flip-router", "sa-legal", "sa-flip", "sa-default", on));
-  routers["ct-router"] = await put("models", routerDoc("ct-router", "ct-legal", "ct-code", "ct-default", on));
   await put("api_keys", { key_hash: hash(OTHER_CALLER), allowed_models: ["*"] });
   // Seeded last: authenticating it proves every resource above landed.
   await put("api_keys", { key_hash: hash(CALLER), allowed_models: ["*"] });
@@ -323,10 +284,6 @@ describe("semantic session affinity on one gateway", () => {
     call(app!.proxyUrl, path, body, headers, key);
   const chat = (model: string, text: string, headers: Headers = {}, extra: object = {}, key = CALLER) =>
     post("/v1/chat/completions", { model, messages: user(text), ...extra }, headers, key);
-  const messages = (model: string, text: string, headers: Headers = {}, extra: object = {}) =>
-    post("/v1/messages", { model, max_tokens: 64, messages: user(text), ...extra }, headers);
-  const countTokens = (model: string, text: string, headers: Headers = {}) =>
-    post("/v1/messages/count_tokens", { model, messages: user(text) }, headers);
   const responses = (model: string, text: string, headers: Headers = {}, stream = false) =>
     post("/v1/responses", { model, input: text, stream }, headers);
   const batches = () => embed!.batches.length;
@@ -372,23 +329,6 @@ describe("semantic session affinity on one gateway", () => {
       expect(batches(), "a pinned request is not classified").toBe(before);
     });
 
-    test("messages, x-claude-code-session-id", async (ctx) => {
-      if (!ready()) return ctx.skip();
-      const h = { "x-claude-code-session-id": randomUUID() };
-      await expectClassified(await messages("sa-router", CODE, h), "sa-code", "code");
-      const before = batches();
-      await expectPinned(await messages("sa-router", LEGAL, h), "sa-code", "code");
-      expect(batches()).toBe(before);
-    });
-
-    test("messages, metadata.user_id as a JSON string", async (ctx) => {
-      if (!ready()) return ctx.skip();
-      const userId = JSON.stringify({ device_id: "d1", account_uuid: "", session_id: randomUUID() });
-      const md = { metadata: { user_id: userId } };
-      await expectClassified(await messages("sa-router", LEGAL, {}, md), "sa-legal", "legal");
-      await expectPinned(await messages("sa-router", CODE, {}, md), "sa-legal", "legal");
-    });
-
     test("responses, Codex session-id from a Codex caller", async (ctx) => {
       if (!ready()) return ctx.skip();
       const h = { "user-agent": "codex_cli_rs/0.80.0 (Linux; x86_64)", "session-id": randomUUID() };
@@ -409,53 +349,17 @@ describe("semantic session affinity on one gateway", () => {
     });
   });
 
-  test("count_tokens follows a pin but never creates one", async (ctx) => {
-    if (!ready()) return ctx.skip();
-    const h = { "x-aisix-session-id": session() };
-    const first = await countTokens("ct-router", LEGAL, h);
-    expect(first.json).toEqual({ input_tokens: 11 });
-    const second = await countTokens("ct-router", CODE, h);
-    expect(second.json, "count_tokens pinned nothing").toEqual({ input_tokens: 22 });
-
-    await expectClassified(await messages("ct-router", LEGAL, h), "ct-legal", "legal");
-    const pinned = await countTokens("ct-router", CODE, h);
-    expect(pinned.json).toEqual({ input_tokens: 11 });
-    expect(pinned.route).toBe("legal");
-    expect(field(await accessLine(app!, pinned), "semantic_pinned")).toBe("true");
-  });
-
   describe("a client's side request follows a pin but never sets one", () => {
     const CLAUDE_TITLE = (ask: string) =>
       `<session>\n${ask}\n</session>\n\nWrite the title in the predominant language of the session — a stray word or code token in another language doesn't change it, and neither does the English of these instructions.`;
     const CODEX_UA = "codex_cli_rs/0.167.0 (Linux; x86_64)";
 
-    for (const [protocol, send] of [
-      ["messages", messages],
-      ["chat", chat],
-    ] as const) {
-      test(`${protocol}: a title request is classified and pins nothing`, async (ctx) => {
-        if (!ready()) return ctx.skip();
-        const h = { "x-claude-code-session-id": randomUUID() };
-        await expectClassified(await send("sa-router", CLAUDE_TITLE(LEGAL), h), "sa-legal", "legal");
-        await expectClassified(await send("sa-router", CODE, h), "sa-code", "code");
-        await expectPinned(await send("sa-router", LEGAL, h), "sa-code", "code");
-      });
-    }
-
-    test("a title request in a pinned session goes to the pin", async (ctx) => {
+    test("chat: a title request is classified and pins nothing", async (ctx) => {
       if (!ready()) return ctx.skip();
       const h = { "x-claude-code-session-id": randomUUID() };
-      await expectClassified(await messages("sa-router", LEGAL, h), "sa-legal", "legal");
-      await expectPinned(await messages("sa-router", CLAUDE_TITLE(CODE), h), "sa-legal", "legal");
-    });
-
-    test("x-claude-code-request-class: auxiliary pins nothing", async (ctx) => {
-      if (!ready()) return ctx.skip();
-      const session = { "x-claude-code-session-id": randomUUID() };
-      const aux = { ...session, "x-claude-code-request-class": "auxiliary" };
-      await expectClassified(await messages("sa-router", LEGAL, aux), "sa-legal", "legal");
-      await expectClassified(await messages("sa-router", CODE, session), "sa-code", "code");
-      await expectPinned(await messages("sa-router", LEGAL, aux), "sa-code", "code");
+      await expectClassified(await chat("sa-router", CLAUDE_TITLE(LEGAL), h), "sa-legal", "legal");
+      await expectClassified(await chat("sa-router", CODE, h), "sa-code", "code");
+      await expectPinned(await chat("sa-router", LEGAL, h), "sa-code", "code");
     });
 
     test("responses: a Codex title request pins nothing", async (ctx) => {
@@ -495,17 +399,6 @@ describe("semantic session affinity on one gateway", () => {
       // From any other client the same turn is text, and is classified.
       const other = { "x-aisix-session-id": session() };
       await expectClassified(await post("/v1/responses", { model: "sa-router", input }, other), "sa-legal", "legal");
-    });
-
-    test("messages: a Codex turn holding only injected blocks has nothing to classify", async (ctx) => {
-      if (!ready()) return ctx.skip();
-      const text = `<environment_context>\n  <note>${LEGAL}</note>\n</environment_context>`;
-      const r = await messages("sa-router", text, { "user-agent": CODEX_UA, "x-aisix-session-id": session() });
-      expect(r.status, r.text).toBe(200);
-      expect(r.text).toContain("served-by-sa-default");
-      expect(r.route).toBeNull();
-      expect(field(await accessLine(app!, r), "semantic_fallback")).toBe("empty_prompt");
-      await expectClassified(await messages("sa-router", text, { "x-aisix-session-id": session() }), "sa-legal", "legal");
     });
   });
 

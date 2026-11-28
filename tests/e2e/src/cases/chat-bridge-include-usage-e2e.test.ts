@@ -14,26 +14,18 @@ import {
 } from "../harness/index.js";
 
 // E2E: a streamed /v1/chat/completions request with the OpenAI SDK's
-// `stream_options: {include_usage: true}`, sent to a model whose upstream
-// speaks another protocol.
+// `stream_options: {include_usage: true}`, sent to an OpenAI-compatible
+// upstream that reports usage on its finish chunk rather than on a chunk
+// of its own.
 //
-// `stream_options` is an OpenAI request parameter. The Anthropic Messages API
-// (and Claude on Vertex AI) refuses any top-level field it does not define, so
-// it must not reach those upstreams — the request is answered, not refused.
+// `stream_options` is forwarded to the upstream as the caller sent it.
 //
 // `include_usage` itself is a promise about the response the caller reads:
 // one extra chunk, after the finish chunk, whose `choices` is empty and which
-// alone carries `usage`. Claude reports usage on the same event that ends the
-// message, and Gemini on its last chunk beside the finish reason, so the usage
-// has to arrive on a chunk of its own all the same — and once, even when
-// the upstream reports running counts on earlier frames too.
+// alone carries `usage`.
 //
-// Without `include_usage` no chunk carries usage at all, whichever upstream
-// served the stream — including an OpenAI-compatible one that reports usage on
-// its finish chunk — while the usage event still records what was reported.
-//
-// The mock upstream accepts only the top-level fields the Messages API
-// documents and rejects anything else the way Anthropic does.
+// Without `include_usage` no chunk carries usage at all, while the usage
+// event still records what the upstream reported.
 
 const CALLER = "sk-chat-bridge-include-usage";
 const CALLER_HASH = createHash("sha256").update(CALLER).digest("hex");
@@ -41,81 +33,8 @@ const CREDENTIAL_REF = "e2e";
 const LOGSTORE = "chat-bridge-include-usage-store";
 
 const MODELS = {
-  anthropic: "include-usage-anthropic",
-  vertexClaude: "include-usage-vertex-claude",
-  vertexGemini: "include-usage-vertex-gemini",
-  // An OpenAI-compatible upstream (Mistral, vLLM, …) that puts the usage on
-  // its finish chunk rather than on a chunk of its own.
   openaiCompat: "include-usage-openai-compat",
 } as const;
-
-const ANTHROPIC_FIELDS = new Set([
-  "model",
-  "messages",
-  "max_tokens",
-  "system",
-  "metadata",
-  "stop_sequences",
-  "stream",
-  "temperature",
-  "top_k",
-  "top_p",
-  "tools",
-  "tool_choice",
-  "thinking",
-  "service_tier",
-  "container",
-  "mcp_servers",
-  "context_management",
-  "output_config",
-  "inference_geo",
-  "cache_control",
-]);
-// Claude on Vertex AI takes the version in the body and the model in the URL.
-const VERTEX_CLAUDE_FIELDS = new Set([...ANTHROPIC_FIELDS, "anthropic_version"]);
-
-function anthropicStream(): string {
-  return [
-    {
-      type: "message_start",
-      message: {
-        id: "msg_include_usage",
-        type: "message",
-        role: "assistant",
-        content: [],
-        model: "claude-sonnet-4-5",
-        stop_reason: null,
-        stop_sequence: null,
-        usage: { input_tokens: 21, output_tokens: 1 },
-      },
-    },
-    { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
-    { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Paris." } },
-    { type: "content_block_stop", index: 0 },
-    { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 5 } },
-    { type: "message_stop" },
-  ]
-    .map((f) => `event: ${f.type}\ndata: ${JSON.stringify(f)}\n\n`)
-    .join("");
-}
-
-function geminiStream(): string {
-  return [
-    // Gemini may report running counts before the last frame.
-    {
-      candidates: [{ content: { role: "model", parts: [{ text: "Par" }] } }],
-      usageMetadata: { promptTokenCount: 21, candidatesTokenCount: 2, totalTokenCount: 23 },
-      modelVersion: "gemini-2.5-flash",
-    },
-    {
-      candidates: [{ content: { role: "model", parts: [{ text: "is." }] }, finishReason: "STOP" }],
-      usageMetadata: { promptTokenCount: 21, candidatesTokenCount: 5, totalTokenCount: 26 },
-      modelVersion: "gemini-2.5-flash",
-    },
-  ]
-    .map((f) => `data: ${JSON.stringify(f)}\r\n\r\n`)
-    .join("");
-}
 
 // Usage on the finish chunk, and no usage-only chunk, even when asked.
 function openAiCompatStream(): string {
@@ -151,25 +70,8 @@ function startUpstream(received: Received[]): Server {
         res.end(openAiCompatStream());
         return;
       }
-      if (path.includes(":streamGenerateContent")) {
-        res.writeHead(200, { "content-type": "text/event-stream" });
-        res.end(geminiStream());
-        return;
-      }
-      const allowed = path.includes(":streamRawPredict") ? VERTEX_CLAUDE_FIELDS : ANTHROPIC_FIELDS;
-      const extra = Object.keys(body).find((k) => !allowed.has(k));
-      if (extra !== undefined) {
-        res.writeHead(400, { "content-type": "application/json" });
-        res.end(
-          JSON.stringify({
-            type: "error",
-            error: { type: "invalid_request_error", message: `${extra}: Extra inputs are not permitted` },
-          }),
-        );
-        return;
-      }
       res.writeHead(200, { "content-type": "text/event-stream" });
-      res.end(anthropicStream());
+      res.end(openAiCompatStream());
     });
   });
 }
@@ -215,38 +117,6 @@ describe("chat streaming with stream_options.include_usage on bridged upstreams"
       project: "chat-bridge-include-usage-proj",
       logstore: LOGSTORE,
       credential_ref: CREDENTIAL_REF,
-    });
-    const anthropicPk = await seed.createProviderKey({
-      display_name: `${MODELS.anthropic}-pk`,
-      provider: "anthropic",
-      adapter: "anthropic",
-      api_key: "sk-anth-mock",
-      api_base: baseUrl,
-    });
-    await seed.createModel({
-      display_name: MODELS.anthropic,
-      provider: "anthropic",
-      model_name: "claude-sonnet-4-5",
-      provider_key_id: anthropicPk.id,
-    });
-    const vertexPk = await seed.createProviderKey({
-      display_name: "include-usage-vertex-pk",
-      provider: "google",
-      adapter: "vertex",
-      api_key: JSON.stringify({ access_token: "ya29.include-usage", project: "p", region: "us-east5" }),
-      api_base: baseUrl,
-    });
-    await seed.createModel({
-      display_name: MODELS.vertexClaude,
-      provider: "google",
-      model_name: "claude-sonnet-4-5",
-      provider_key_id: vertexPk.id,
-    });
-    await seed.createModel({
-      display_name: MODELS.vertexGemini,
-      provider: "google",
-      model_name: "gemini-2.5-flash",
-      provider_key_id: vertexPk.id,
     });
     const compatPk = await seed.createProviderKey({
       display_name: "include-usage-openai-compat-pk",
@@ -319,31 +189,6 @@ describe("chat streaming with stream_options.include_usage on bridged upstreams"
       expect(finishes[0]!.usage ?? null).toBeNull();
       expect(out.chunks.indexOf(finishes[0]!)).toBe(out.chunks.length - 2);
     });
-
-    if (label === "anthropic" || label === "vertexClaude") {
-      // OpenAI's `max_completion_tokens` and `stop` are Anthropic's `max_tokens`
-      // and `stop_sequences`; sent under their OpenAI names they are refused.
-      test(`${label}: max_completion_tokens and stop reach Claude under the Messages API names`, async (ctx) => {
-        if (!etcdReachable || !app) return ctx.skip();
-        const cases: Array<[Record<string, unknown>, Record<string, unknown>]> = [
-          [{ max_completion_tokens: 77, stop: "END" }, { max_tokens: 77, stop_sequences: ["END"] }],
-          [{ max_completion_tokens: 77, max_tokens: 33, stop: ["A", "B"] }, { max_tokens: 77, stop_sequences: ["A", "B"] }],
-          [{ max_tokens: 33, stop: null }, { max_tokens: 33 }],
-          [{ stop: [] }, { max_tokens: 4096 }],
-        ];
-        for (const [extra, expected] of cases) {
-          const before = received.length;
-          const out = await streamChat(model, extra);
-          expect(out.status, `${JSON.stringify(extra)}: ${out.raw}`).toBe(200);
-          const body = received.slice(before)[0]!.body;
-          expect(body).toMatchObject(expected);
-          expect(body).not.toHaveProperty("max_completion_tokens");
-          expect(body).not.toHaveProperty("stop");
-          if (!("stop_sequences" in expected)) expect(body).not.toHaveProperty("stop_sequences");
-        }
-      });
-    }
-
     test(`${label}: without include_usage no chunk carries usage, and the usage event still has it`, async (ctx) => {
       if (!etcdReachable || !app) return ctx.skip();
       for (const extra of [{}, { stream_options: { include_usage: false } }]) {

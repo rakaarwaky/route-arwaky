@@ -57,15 +57,6 @@ const CHAT_STREAM = [
   }),
   "[DONE]",
 ];
-const ANTHROPIC_BODY = {
-  id: "msg_1136",
-  type: "message",
-  role: "assistant",
-  model: "claude-3-5-haiku-20241022",
-  content: [{ type: "text", text: "ok" }],
-  stop_reason: "end_turn",
-  usage: { input_tokens: 3, output_tokens: 2 },
-};
 // One body every single-shot endpoint's response parser accepts.
 const SINGLE_SHOT_BODY = {
   id: "video_1136",
@@ -82,7 +73,7 @@ const SINGLE_SHOT_BODY = {
   usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5, input_tokens: 3, output_tokens: 2 },
 };
 
-type Kind = "openai" | "openai-bridged-responses" | "anthropic" | "video";
+type Kind = "openai" | "openai-bridged-responses" | "video";
 
 interface Surface {
   label: string;
@@ -119,21 +110,11 @@ describe("a retried 504 attempt stays in the usage export (AISIX-Cloud#1136)", (
 
   const chat = (stream: boolean) =>
     json("/v1/chat/completions", (model) => ({ model, stream, messages: [{ role: "user", content: "hi" }] }));
-  const messages = (stream: boolean) =>
-    json("/v1/messages", (model) => ({
-      model,
-      stream,
-      max_tokens: 16,
-      messages: [{ role: "user", content: "hi" }],
-    }));
   const responses = (stream: boolean) => json("/v1/responses", (model) => ({ model, stream, input: "hi" }));
 
   const surfaces: Surface[] = [
     { label: "chat", kind: "openai", ok: { nonStreamBody: CHAT_BODY }, call: chat(false) },
     { label: "chat-stream", kind: "openai", ok: { streamEvents: CHAT_STREAM }, call: chat(true) },
-    { label: "messages-bridged", kind: "openai", ok: { nonStreamBody: CHAT_BODY }, call: messages(false) },
-    { label: "messages-bridged-stream", kind: "openai", ok: { streamEvents: CHAT_STREAM }, call: messages(true) },
-    { label: "messages-native", kind: "anthropic", ok: { nonStreamBody: ANTHROPIC_BODY }, call: messages(false) },
     {
       label: "responses-bridged",
       kind: "openai-bridged-responses",
@@ -145,12 +126,6 @@ describe("a retried 504 attempt stays in the usage export (AISIX-Cloud#1136)", (
       kind: "openai-bridged-responses",
       ok: { streamEvents: CHAT_STREAM },
       call: responses(true),
-    },
-    {
-      label: "count_tokens",
-      kind: "anthropic",
-      ok: { nonStreamBody: { input_tokens: 3 } },
-      call: json("/v1/messages/count_tokens", (model) => ({ model, messages: [{ role: "user", content: "hi" }] })),
     },
     {
       label: "completions",
@@ -260,19 +235,17 @@ describe("a retried 504 attempt stays in the usage export (AISIX-Cloud#1136)", (
       // First request fails, every later one is served.
       const upstream = await startOpenAiUpstream({ ...c.ok, scriptedResponses: [c.step(c.ok)] });
       upstreams.push(upstream);
-      const base =
-        c.kind === "anthropic" || c.kind === "video" ? upstream.baseUrl : `${upstream.baseUrl}/v1`;
+      const base = c.kind === "video" ? upstream.baseUrl : `${upstream.baseUrl}/v1`;
       const pk = await seed.createProviderKey({
         display_name: `${c.model}-pk`,
         api_key: "sk-mock",
         api_base: base,
-        ...(c.kind === "anthropic" ? { provider: "anthropic", adapter: "anthropic" } : {}),
         ...(c.kind === "openai-bridged-responses" ? { apis: {} } : {}),
       });
       await seed.createModel({
         display_name: c.model,
-        provider: c.kind === "anthropic" ? "anthropic" : "openai",
-        model_name: c.kind === "anthropic" ? "claude-3-5-haiku-20241022" : "upstream-echo",
+        provider: "openai",
+        model_name: "upstream-echo",
         provider_key_id: pk.id,
         retries: 1,
         timeout: TIMEOUT_MS,

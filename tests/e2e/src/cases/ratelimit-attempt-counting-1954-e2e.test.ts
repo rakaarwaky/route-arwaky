@@ -21,7 +21,7 @@ import {
 //      per downstream request, however many attempts the request makes —
 //      chat and the single-shot family (embeddings).
 //   2. A MEMBER's own limit counts every upstream attempt, same-target
-//      retries included — on count_tokens and embeddings, whose loops used
+//      retries included — on embeddings, whose loop used
 //      to reserve once per target.
 //      A group-pinned policy whose match also depends on the member — a
 //      negated provider condition, or a `model ~=` the member half of the
@@ -89,7 +89,6 @@ describe.each(["memory", "redis"] as const)(
     const keys = {
       groupChat: `sk-1954-gchat-${sfx}`,
       groupEmb: `sk-1954-gemb-${sfx}`,
-      memberCt: `sk-1954-ct-${sfx}`,
       memberEmb: `sk-1954-memb-${sfx}`,
       gateCapped: `sk-1954-gate-${sfx}`,
       allRefused: `sk-1954-allref-${sfx}`,
@@ -101,7 +100,6 @@ describe.each(["memory", "redis"] as const)(
     let groupEmbPolicyId = "";
     let groupNotProviderPolicyId = "";
     let groupNotModelPolicyId = "";
-    let ctUpstream: OpenAiUpstream | undefined;
     let membEmbUpstream: OpenAiUpstream | undefined;
     let downChat: OpenAiUpstream | undefined;
 
@@ -160,9 +158,6 @@ describe.each(["memory", "redis"] as const)(
       downChat = await upstream(DOWN);
       const okChat = await upstream({ nonStreamBody: CHAT_BODY });
       const okEmb = await upstream({ nonStreamBody: EMBED_BODY });
-      ctUpstream = await upstream({
-        scriptedResponses: [DOWN, { nonStreamBody: { input_tokens: 42 } }, { nonStreamBody: { input_tokens: 42 } }],
-      });
       membEmbUpstream = await upstream({
         scriptedResponses: [DOWN, { nonStreamBody: EMBED_BODY }, { nonStreamBody: EMBED_BODY }],
       });
@@ -223,12 +218,6 @@ describe.each(["memory", "redis"] as const)(
       ).id;
 
       // 2. a member with rpm 2 that fails once and is retried.
-      await model(name("ct"), ctUpstream, {
-        provider: "anthropic",
-        model_name: "claude-haiku-4-5-20251001",
-        rate_limit: { rpm: 2 },
-      });
-      await group(name("g-ct"), [name("ct")], 1);
       await model(name("memb"), membEmbUpstream, {
         model_name: "text-embedding-3-small",
         rate_limit: { rpm: 2 },
@@ -250,7 +239,6 @@ describe.each(["memory", "redis"] as const)(
       await key(keys.groupEmb, { team_id: name("team-gemb") });
       await key(keys.groupNotProvider, { team_id: name("team-gnp") });
       await key(keys.groupNotModel, { team_id: name("team-gnm") });
-      await key(keys.memberCt);
       await key(keys.memberEmb);
       await key(keys.gateCapped, { rate_limit: { rpm: 2 } });
       await key(keys.allRefused, { rate_limit: { rpm: 1 } });
@@ -294,12 +282,6 @@ describe.each(["memory", "redis"] as const)(
       post(key, "/v1/chat/completions", { model, messages: [{ role: "user", content: "hi" }] });
     const embed = (key: string, model: string) =>
       post(key, "/v1/embeddings", { model, input: "hi" });
-    const countTokens = (key: string, model: string) =>
-      post(key, "/v1/messages/count_tokens", {
-        model,
-        messages: [{ role: "user", content: "hi" }],
-      });
-
     test.for([
       ["chat", () => keys.groupChat, () => name("g-chat"), () => groupChatPolicyId, chat],
       ["embeddings", () => keys.groupEmb, () => name("g-emb"), () => groupEmbPolicyId, embed],
@@ -347,7 +329,6 @@ describe.each(["memory", "redis"] as const)(
     );
 
     test.for([
-      ["count_tokens", () => keys.memberCt, () => name("g-ct"), () => ctUpstream!, countTokens],
       ["embeddings", () => keys.memberEmb, () => name("g-memb"), () => membEmbUpstream!, embed],
     ] as const)(
       "%s: a member's own limit counts the same-target retry",

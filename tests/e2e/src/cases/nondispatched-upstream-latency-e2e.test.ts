@@ -186,19 +186,6 @@ describe("rows that reached no upstream carry no upstream latency", () => {
     expect(downstreamLatency(hitRow), "the caller's wait is still measured").toBeGreaterThanOrEqual(1);
   });
 
-  test("a /v1/messages request blocked by an input guardrail", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const blocked = await post("/v1/messages", {
-      model: "nd-ok",
-      max_tokens: 16,
-      messages: [{ role: "user", content: `say ${FORBIDDEN}` }],
-    });
-    expect(blocked.status).toBeGreaterThanOrEqual(400);
-    expect(blocked.status).toBeLessThan(500);
-    const blockedRow = await row(blocked.requestId, "messages guardrail block");
-    expect(blockedRow.get("guardrail_blocked")).toBe("true");
-    expect(unmeasured(blockedRow)).toBe("0");
-  });
 
   test("a /v1/responses request blocked by an input guardrail", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();

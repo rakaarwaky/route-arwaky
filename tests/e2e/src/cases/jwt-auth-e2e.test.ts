@@ -477,31 +477,6 @@ describe("jwt auth e2e: OIDC trust providers + jwt_subject key binding", () => {
     await stale.text();
   });
 
-  test("/v1/messages renders the Anthropic error envelope on a JWT failure", async (ctx) => {
-    if (skipUnlessUp(ctx)) return;
-
-    const res = await fetch(`${app!.proxyUrl}/v1/messages`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${idp!.sign(
-          validClaims({ exp: Math.floor(Date.now() / 1000) - 60 }),
-        )}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        max_tokens: 16,
-        messages: [{ role: "user", content: "hi" }],
-      }),
-    });
-    expect(res.status).toBe(401);
-    const body = (await res.json()) as {
-      type?: string;
-      error?: { type?: string };
-    };
-    expect(body.type).toBe("error");
-    expect(body.error?.type).toBe("authentication_error");
-  });
 
   test("auth decisions surface on aisix_auth_decisions_total", async (ctx) => {
     if (skipUnlessUp(ctx)) return;

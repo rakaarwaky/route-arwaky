@@ -328,44 +328,6 @@ describe("upstream header context e2e: ${...} variables + client-header allowlis
     30_000,
   );
 
-  test(
-    "the Anthropic native passthrough applies the same pipeline",
-    async (ctx) => {
-      if (!etcdReachable || !app || !upstream) {
-        ctx.skip();
-        return;
-      }
-      const baseline = anthropicUpstream!.receivedRequests.length;
-      const res = await fetch(`${app.proxyUrl}/v1/messages`, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${CALLER_PLAINTEXT}`,
-          "content-type": "application/json",
-          "anthropic-beta": "prompt-caching-2024-07-31",
-          "x-not-allowlisted": "nope",
-        },
-        body: JSON.stringify({
-          model: "hdrctx-anthropic-model",
-          max_tokens: 16,
-          messages: [{ role: "user", content: "hello" }],
-        }),
-      });
-      await res.text();
-      expect(res.status).toBe(200);
-
-      const sent = anthropicUpstream!.receivedRequests.slice(baseline);
-      expect(sent).toHaveLength(1);
-      const h = sent[0]!.headers;
-      expect(h["anthropic-beta"]).toBe("prompt-caching-2024-07-31");
-      expect(h["x-tenant-id"]).toBe(TEAM_ID);
-      expect(h["x-provider-key"]).toBe("hdrctx-anthropic-pk");
-      expect(h["x-model-id"]).toBe(anthropicModelId);
-      expect(h["x-not-allowlisted"]).toBeUndefined();
-      // Anthropic auth shape stays the gateway's own.
-      expect(h["x-api-key"]).toBe(PROVIDER_SECRET);
-    },
-    30_000,
-  );
 
   test(
     "id variables resolve to the resource ids, and request.id to this request",

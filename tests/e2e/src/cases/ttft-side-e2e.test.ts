@@ -1,11 +1,9 @@
-import { createServer, type Server } from "node:http";
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
   ProxyClient,
   SeedClient,
-  pickFreePort,
   scrapeMetrics,
   spawnApp,
   startOpenAiUpstream,
@@ -33,61 +31,18 @@ const D = GUARDRAIL_DELAY_MS / 1000;
 const REQUEST_TTFT = "aisix_request_ttft_seconds";
 const DETAILED_TTFT = "aisix_llm_time_to_first_token_seconds";
 
-/** green-cip stand-in that passes everything, GUARDRAIL_DELAY_MS late. */
-async function startSlowAliyun(): Promise<{ baseUrl: string; close(): Promise<void> }> {
-  const server: Server = createServer((req, res) => {
-    req.resume();
-    req.on("end", () => {
-      setTimeout(() => {
-        res.statusCode = 200;
-        res.setHeader("content-type", "application/json");
-        res.end(
-          JSON.stringify({
-            Code: 200,
-            Message: "OK",
-            RequestId: "slow",
-            Data: { RiskLevel: "none", Result: [] },
-          }),
-        );
-      }, GUARDRAIL_DELAY_MS);
-    });
-  });
-  const port = await pickFreePort();
-  await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
-  return {
-    baseUrl: `http://127.0.0.1:${port}`,
-    close: () =>
-      new Promise<void>((resolve, reject) =>
-        server.close((err) => (err ? reject(err) : resolve())),
-      ),
-  };
-}
+/** A custom-script guardrail that passes everything, GUARDRAIL_DELAY_MS late. */
+const SLOW_GUARDRAIL_SCRIPT = `export async function checkInput() {
+  const end = Date.now() + ${GUARDRAIL_DELAY_MS};
+  while (Date.now() < end) {}
+  return { action: "none" };
+}`;
 
 const CHAT_EVENTS = [
   '{"id":"c1","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}',
   '{"id":"c1","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}',
   '{"id":"c1","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}',
   "[DONE]",
-];
-
-const MESSAGES_EVENTS = [
-  JSON.stringify({
-    type: "message_start",
-    message: {
-      id: "msg_side",
-      type: "message",
-      role: "assistant",
-      content: [],
-      model: "claude-3-5-haiku-20241022",
-      stop_reason: null,
-      usage: { input_tokens: 3, output_tokens: 1 },
-    },
-  }),
-  JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
-  JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hi" } }),
-  JSON.stringify({ type: "content_block_stop", index: 0 }),
-  JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } }),
-  JSON.stringify({ type: "message_stop" }),
 ];
 
 const RESPONSES_EVENTS = [
@@ -115,19 +70,6 @@ const CASES = [
     body: (model: string) => ({ model, stream: true, messages: [{ role: "user", content: "go" }] }),
   },
   {
-    endpoint: "/v1/messages",
-    model: "ttft-side-messages",
-    provider: "anthropic",
-    modelName: "claude-3-5-haiku-20241022",
-    events: MESSAGES_EVENTS,
-    body: (model: string) => ({
-      model,
-      stream: true,
-      max_tokens: 16,
-      messages: [{ role: "user", content: "go" }],
-    }),
-  },
-  {
     endpoint: "/v1/responses",
     model: "ttft-side-responses",
     provider: "openai",
@@ -139,7 +81,6 @@ const CASES = [
 
 describe("TTFT metrics split the wait by side", () => {
   let app: SpawnedApp | undefined;
-  let aliyun: Awaited<ReturnType<typeof startSlowAliyun>> | undefined;
   const upstreams: OpenAiUpstream[] = [];
   let etcdReachable = false;
 
@@ -148,7 +89,6 @@ describe("TTFT metrics split the wait by side", () => {
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
-    aliyun = await startSlowAliyun();
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
 
@@ -158,8 +98,7 @@ describe("TTFT metrics split the wait by side", () => {
       const pk = await seed.createProviderKey({
         display_name: `${c.model}-pk`,
         api_key: "sk-mock",
-        api_base: c.provider === "anthropic" ? up.baseUrl : `${up.baseUrl}/v1`,
-        provider: c.provider,
+        api_base: `${up.baseUrl}/v1`,
       });
       await seed.createModel({
         display_name: c.model,
@@ -173,12 +112,8 @@ describe("TTFT metrics split the wait by side", () => {
       enabled: true,
       hook_point: "input",
       fail_open: false,
-      kind: "aliyun_text_moderation",
-      region: "cn-shanghai",
-      endpoint: aliyun.baseUrl,
-      access_key_id: "LTAI_E2E",
-      access_key_secret: "e2e-secret",
-      risk_level_threshold: "high",
+      kind: "custom",
+      script: SLOW_GUARDRAIL_SCRIPT,
       timeout_ms: GUARDRAIL_DELAY_MS * 10,
     });
 
@@ -190,7 +125,6 @@ describe("TTFT metrics split the wait by side", () => {
   afterAll(async () => {
     await app?.exit();
     await Promise.all(upstreams.map((u) => u.close()));
-    await aliyun?.close();
   });
 
   const delta = (
@@ -210,8 +144,6 @@ describe("TTFT metrics split the wait by side", () => {
         headers: {
           "content-type": "application/json",
           authorization: `Bearer ${KEY}`,
-          "x-api-key": KEY,
-          "anthropic-version": "2023-06-01",
         },
         body: JSON.stringify(c.body(c.model)),
       });

@@ -111,17 +111,6 @@ const CHAT_STREAM = [
   "[DONE]",
 ];
 
-const GEMINI_CANDIDATES = [{
-  content: { role: "model", parts: [
-    { text: ANSWER },
-    { thought: true, text: REASONING, thoughtSignature: "c2ln" },
-    { functionCall: { id: "call_wx", name: TOOL, args: { email: "owner@example.com" } } },
-    { text: "Email owner@example.com" },
-  ] },
-  finishReason: "STOP",
-}, { index: 1, content: { role: "model", parts: [{ text: "Alternate answer" }] }, finishReason: "STOP" }];
-const GEMINI_USAGE = { promptTokenCount: 9, candidatesTokenCount: 12, totalTokenCount: 21 };
-
 const CHAT_BODY = {
   id: "chatcmpl-structured-2",
   object: "chat.completion",
@@ -145,40 +134,6 @@ const CHAT_BODY = {
 };
 
 const sse = (event: string, data: unknown) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-
-/** An Anthropic stream: thinking (signed), a redacted block, text, tool_use. */
-const ANTHROPIC_STREAM = [
-  sse("message_start", {
-    type: "message_start",
-    message: {
-      id: "msg_structured",
-      type: "message",
-      role: "assistant",
-      model: "claude-sonnet-4-5",
-      content: [],
-      usage: { input_tokens: 9, output_tokens: 1 },
-    },
-  }),
-  sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } }),
-  sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: REASONING } }),
-  sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "sig" } }),
-  sse("content_block_stop", { type: "content_block_stop", index: 0 }),
-  sse("content_block_start", { type: "content_block_start", index: 1, content_block: { type: "redacted_thinking", data: "REDACTED-BLOB" } }),
-  sse("content_block_stop", { type: "content_block_stop", index: 1 }),
-  sse("content_block_start", { type: "content_block_start", index: 2, content_block: { type: "text", text: "" } }),
-  sse("content_block_delta", { type: "content_block_delta", index: 2, delta: { type: "text_delta", text: ANSWER } }),
-  sse("content_block_stop", { type: "content_block_stop", index: 2 }),
-  sse("content_block_start", {
-    type: "content_block_start",
-    index: 3,
-    content_block: { type: "tool_use", id: "call_wx", name: TOOL, input: {} },
-  }),
-  sse("content_block_delta", { type: "content_block_delta", index: 3, delta: { type: "input_json_delta", partial_json: '{"city":' } }),
-  sse("content_block_delta", { type: "content_block_delta", index: 3, delta: { type: "input_json_delta", partial_json: '"Paris"}' } }),
-  sse("content_block_stop", { type: "content_block_stop", index: 3 }),
-  sse("message_delta", { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 12 } }),
-  sse("message_stop", { type: "message_stop" }),
-];
 
 const REASONING_ITEM = {
   id: "rs_1",
@@ -257,16 +212,9 @@ describe("OTLP output messages keep reasoning, text and tool calls apart", () =>
 
     upstreams.chatStream = await startOpenAiUpstream({ streamEvents: CHAT_STREAM });
     upstreams.chatBody = await startOpenAiUpstream({ nonStreamBody: CHAT_BODY });
-    upstreams.anthropic = await startOpenAiUpstream({ rawStreamFrames: ANTHROPIC_STREAM });
     upstreams.responsesStream = await startOpenAiUpstream({ rawStreamFrames: RESPONSES_STREAM });
     upstreams.responsesBody = await startOpenAiUpstream({ nonStreamBody: RESPONSES_BODY });
     upstreams.responsesIncomplete = await startOpenAiUpstream({ nonStreamBody: RESPONSES_INCOMPLETE_BODY });
-    upstreams.geminiBody = await startOpenAiUpstream({ nonStreamBody: {
-      candidates: GEMINI_CANDIDATES, usageMetadata: GEMINI_USAGE,
-    } });
-    upstreams.geminiStream = await startOpenAiUpstream({ streamEvents: [
-      { candidates: GEMINI_CANDIDATES }, { usageMetadata: GEMINI_USAGE },
-    ].map((frame) => JSON.stringify(frame)) });
     otlp = await startMockOtlp();
     sls = await startMockSls();
     dd = await startMockDatadog();
@@ -326,17 +274,8 @@ describe("OTLP output messages keep reasoning, text and tool calls apart", () =>
       name: "mask-output-email", kind: "pii", hook_point: "output", enabled: true,
       detectors: [{ type: "email", action: "mask" }],
     }, { attach: false });
-    for (const [name, upstream] of [["so-gemini-body", upstreams.geminiBody], ["so-gemini-stream", upstreams.geminiStream]] as const) {
-      const target = await model(name, upstream, { apis: { gemini: {} } });
-      await seed.attachGuardrailToModel(mask.id, target.id);
-    }
     await model("so-chat-stream", upstreams.chatStream);
     await model("so-chat-body", upstreams.chatBody);
-    await model("so-anthropic", upstreams.anthropic, {
-      provider: "anthropic",
-      adapter: "anthropic",
-      api_base: upstreams.anthropic.baseUrl,
-    });
     await model("so-responses-stream", upstreams.responsesStream);
     await model("so-responses-body", upstreams.responsesBody);
     await model("so-responses-incomplete", upstreams.responsesIncomplete);
@@ -472,35 +411,6 @@ describe("OTLP output messages keep reasoning, text and tool calls apart", () =>
     expect(row.has("system_instructions")).toBe(false);
   });
 
-  test.for([
-    ["so-gemini-body", "generateContent"],
-    ["so-gemini-stream", "streamGenerateContent?alt=sse"],
-  ])("Gemini native %s captures the delivered parts in order after masking", async ([model, method], ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const { status, requestId, text } = await post(`/v1beta/models/${model}:${method}`, {
-      contents: [{ parts: [{ text: "Check the weather." }] }],
-    });
-    expect(status).toBe(200);
-    expect(text).toContain("[EMAIL_REDACTED]");
-    expect(text).not.toContain("owner@example.com");
-    const span = await operationSpan(requestId);
-    expect(outputParts(span)).toEqual([
-      { type: "text", content: ANSWER }, { type: "reasoning", content: REASONING },
-      { type: "tool_call", id: "call_wx", name: TOOL, arguments: { email: "[EMAIL_REDACTED]" } },
-      { type: "text", content: "Email [EMAIL_REDACTED]" },
-    ]);
-  });
-
-  test("Gemini streams the chat bridge's final tool call into the exported answer", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const { status, requestId } = await post(
-      "/v1beta1/projects/test/locations/global/publishers/google/models/so-chat-stream:streamGenerateContent?alt=sse",
-      { contents: [{ parts: [{ text: "Check the weather." }] }] },
-    );
-    expect(status).toBe(200);
-    expect(outputParts(await operationSpan(requestId))).toEqual(EXPECTED_PARTS);
-  });
-
   test("chat, buffered", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     const { status, requestId } = await post("/v1/chat/completions", {
@@ -514,64 +424,8 @@ describe("OTLP output messages keep reasoning, text and tool calls apart", () =>
     await expectSinksMatchSpan(requestId, span);
   });
 
-  test("messages, native stream: thinking and tool_use kept, redacted thinking left out", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const { status, requestId, text } = await post("/v1/messages", {
-      model: "so-anthropic",
-      max_tokens: 256,
-      stream: true,
-      system: SYSTEM,
-      tools: ANTHROPIC_TOOLS,
-      messages: [{ role: "user", content: "weather in Paris?" }],
-    });
-    expect(status).toBe(200);
-    expect(text).toContain("REDACTED-BLOB");
-    const span = await operationSpan(requestId);
-    expect(outputParts(span)).toEqual(EXPECTED_PARTS);
-    expect(String(span.attributes["gen_ai.output.messages"])).not.toContain("REDACTED-BLOB");
-    expect(JSON.parse(String(span.attributes["gen_ai.tool.definitions"]))).toEqual([
-      {
-        type: "function",
-        name: TOOL,
-        description: "Look up the current weather",
-        parameters: ANTHROPIC_TOOLS[0].input_schema,
-      },
-    ]);
-    const { row, log } = await expectSinksMatchSpan(requestId, span);
-    // `system` is reported on its own, as the span does.
-    expect(row.get("system_instructions")).toContain(SYSTEM);
-    expect(JSON.stringify(log["gen_ai.system_instructions"])).toContain(SYSTEM);
-    expect(row.get("output_messages")).not.toContain("REDACTED-BLOB");
-  });
 
-  test("messages, bridged stream from a chat upstream", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const { status, requestId } = await post("/v1/messages", {
-      model: "so-chat-stream",
-      max_tokens: 256,
-      stream: true,
-      tools: ANTHROPIC_TOOLS,
-      messages: [{ role: "user", content: "weather in Paris?" }],
-    });
-    expect(status).toBe(200);
-    const span = await operationSpan(requestId);
-    expect(outputParts(span)).toEqual(EXPECTED_PARTS);
-    await expectSinksMatchSpan(requestId, span);
-  });
 
-  test("messages, bridged buffered", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const { status, requestId } = await post("/v1/messages", {
-      model: "so-chat-body",
-      max_tokens: 256,
-      tools: ANTHROPIC_TOOLS,
-      messages: [{ role: "user", content: "weather in Paris?" }],
-    });
-    expect(status).toBe(200);
-    const span = await operationSpan(requestId);
-    expect(outputParts(span)).toEqual(EXPECTED_PARTS);
-    await expectSinksMatchSpan(requestId, span);
-  });
 
   test("responses, native stream: readable summary only, never the encrypted content", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();

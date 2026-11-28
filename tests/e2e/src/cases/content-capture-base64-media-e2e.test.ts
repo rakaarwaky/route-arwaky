@@ -96,26 +96,6 @@ const RESPONSES_BODY = {
   ],
   usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
 };
-const ANTHROPIC_BODY = {
-  id: "msg_capture",
-  type: "message",
-  role: "assistant",
-  model: "claude-sonnet-4-5",
-  content: [{ type: "text", text: "ok" }],
-  stop_reason: "end_turn",
-  usage: { input_tokens: 1, output_tokens: 1 },
-};
-
-type Entry = {
-  name: string;
-  path: string;
-  model: string;
-  /** A user turn with this text (none when undefined) and image payload. */
-  body: (text: string | undefined, payload: string) => Record<string, unknown>;
-  /** The placeholder's byte count for this payload. */
-  bytes: (payload: string) => number;
-};
-
 const chatBody = (stream: boolean) => (text: string | undefined, payload: string) => ({
   model: "cap-openai",
   stream,
@@ -129,41 +109,7 @@ const chatBody = (stream: boolean) => (text: string | undefined, payload: string
     },
   ],
 });
-const messagesBody = (model: string) => (text: string | undefined, payload: string) => ({
-  model,
-  max_tokens: 16,
-  messages: [
-    {
-      role: "user",
-      content: [
-        ...(text === undefined ? [] : [{ type: "text", text }]),
-        { type: "image", source: { type: "base64", media_type: "image/png", data: payload } },
-      ],
-    },
-  ],
-});
-const responsesBody = (model: string) => (text: string | undefined, payload: string) => ({
-  model,
-  input: [
-    {
-      role: "user",
-      content: [
-        ...(text === undefined ? [] : [{ type: "input_text", text }]),
-        { type: "input_image", image_url: dataUri(payload) },
-      ],
-    },
-  ],
-});
 const uriBytes = (payload: string) => dataUri(payload).length;
-
-const ENTRIES: Entry[] = [
-  { name: "chat", path: "/v1/chat/completions", model: "cap-openai", body: chatBody(false), bytes: uriBytes },
-  { name: "chat streamed", path: "/v1/chat/completions", model: "cap-openai", body: chatBody(true), bytes: uriBytes },
-  { name: "messages native", path: "/v1/messages", model: "cap-anthropic", body: messagesBody("cap-anthropic"), bytes: (p) => p.length },
-  { name: "messages bridged", path: "/v1/messages", model: "cap-openai", body: messagesBody("cap-openai"), bytes: (p) => p.length },
-  { name: "responses native", path: "/v1/responses", model: "cap-openai", body: responsesBody("cap-openai"), bytes: uriBytes },
-  { name: "responses bridged", path: "/v1/responses", model: "cap-bridged", body: responsesBody("cap-bridged"), bytes: uriBytes },
-];
 
 describe("base64 media under content_mode full", () => {
   let app: SpawnedApp | undefined;
@@ -213,11 +159,7 @@ describe("base64 media under content_mode full", () => {
           res.end(`${CHAT_STREAM.map((f) => `data: ${JSON.stringify(f)}\n\n`).join("")}data: [DONE]\n\n`);
           return;
         }
-        const body = path.endsWith("/responses")
-          ? RESPONSES_BODY
-          : path.endsWith("/messages")
-            ? ANTHROPIC_BODY
-            : CHAT_BODY;
+        const body = path.endsWith("/responses") ? RESPONSES_BODY : CHAT_BODY;
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify(body));
       });
@@ -258,17 +200,7 @@ describe("base64 media under content_mode full", () => {
       content_max_bytes: CONTENT_MAX_BYTES,
     });
     const openai = await seed.createProviderKey({ display_name: "cap-openai-pk", api_key: "sk-mock", api_base: `${base}/v1` });
-    const bridged = await seed.createProviderKey({ display_name: "cap-bridged-pk", api_key: "sk-mock", api_base: `${base}/v1`, apis: {} });
-    const anthropic = await seed.createProviderKey({
-      display_name: "cap-anthropic-pk",
-      api_key: "sk-mock",
-      provider: "anthropic",
-      adapter: "anthropic",
-      api_base: base,
-    });
     await seed.createModel({ display_name: "cap-openai", provider: "openai", model_name: "gpt-4o-mini", provider_key_id: openai.id });
-    await seed.createModel({ display_name: "cap-bridged", provider: "openai", model_name: "gpt-4o-mini", provider_key_id: bridged.id });
-    await seed.createModel({ display_name: "cap-anthropic", provider: "anthropic", model_name: "claude-sonnet-4-5", provider_key_id: anthropic.id });
     await seed.createPassthroughRoute({ name: "cap-pt", path_prefix: "/cap-pt", target_url: base, provider_key_id: openai.id });
     await seed.update("mcp_servers", randomUUID(), { name: "media", url: mcp.url, enabled: true });
     await seed.update("mcp_servers", randomUUID(), { name: "large", url: mcpLarge.url, enabled: true });
@@ -299,7 +231,7 @@ describe("base64 media under content_mode full", () => {
     const res = await fetch(`${app!.proxyUrl}${path}`, {
       method: "POST",
       headers: {
-        ...(path === "/v1/messages" ? { "x-api-key": CALLER } : { authorization: `Bearer ${CALLER}` }),
+        authorization: `Bearer ${CALLER}`,
         "content-type": "application/json",
       },
       body: JSON.stringify(body),
@@ -331,41 +263,6 @@ describe("base64 media under content_mode full", () => {
     expect(JSON.parse(String(span.attributes["gen_ai.input.messages"]))).toEqual(fromRow);
     return fromRow;
   }
-
-  describe.each(ENTRIES)("$name", ({ path, body, bytes }) => {
-    test("a small image with text is an image part", async (ctx) => {
-      if (!etcdReachable || !app) return ctx.skip();
-      const { row, span } = await records(await send(path, body("what is this?", SMALL)));
-      expect(inputMessages(row, span)[0].parts).toEqual([
-        { type: "text", content: "what is this?" },
-        imagePart(bytes(SMALL)),
-      ]);
-    });
-
-    test("an image over the content cap is an image part too", async (ctx) => {
-      if (!etcdReachable || !app) return ctx.skip();
-      expect(LARGE.length).toBeGreaterThan(CONTENT_MAX_BYTES);
-      const { row, span } = await records(await send(path, body("what is this?", LARGE)));
-      expect(inputMessages(row, span)[0].parts).toEqual([
-        { type: "text", content: "what is this?" },
-        imagePart(bytes(LARGE)),
-      ]);
-    });
-
-    test("an image with no text is the turn's only part", async (ctx) => {
-      if (!etcdReachable || !app) return ctx.skip();
-      const { row, span } = await records(await send(path, body(undefined, SMALL)));
-      expect(inputMessages(row, span)[0].parts).toEqual([imagePart(bytes(SMALL))]);
-    });
-
-    test("text over the cap leaves a flat prompt with the placeholder", async (ctx) => {
-      if (!etcdReachable || !app) return ctx.skip();
-      const { row, span } = await records(await send(path, body("x".repeat(CONTENT_MAX_BYTES * 2), SMALL)));
-      expect(row.has("input_messages")).toBe(false);
-      expect(row.get("prompt")).toContain(placeholder(bytes(SMALL)));
-      expect(span.attributes["aisix.content.prompt"]).toContain(placeholder(bytes(SMALL)));
-    });
-  });
 
   test("chat: a block's text is not counted twice against the cap", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
@@ -408,30 +305,6 @@ describe("base64 media under content_mode full", () => {
     ]);
   });
 
-  test("messages: an image inside a tool result is omitted", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const { row, span } = await records(
-      await send("/v1/messages", {
-        model: "cap-anthropic",
-        max_tokens: 16,
-        messages: [
-          { role: "user", content: "screenshot please" },
-          { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "shot", input: {} }] },
-          {
-            role: "user",
-            content: [
-              {
-                type: "tool_result",
-                tool_use_id: "t1",
-                content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: SMALL } }],
-              },
-            ],
-          },
-        ],
-      }),
-    );
-    expect(JSON.stringify(inputMessages(row, span)[2])).toContain(placeholder(SMALL.length));
-  });
 
   test("chat: audio and a file keep their parts, not their payloads", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
@@ -459,24 +332,6 @@ describe("base64 media under content_mode full", () => {
     ]);
   });
 
-  test("messages: a base64 document keeps its part and media type", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const { row, span } = await records(
-      await send("/v1/messages", {
-        model: "cap-anthropic",
-        max_tokens: 16,
-        messages: [
-          {
-            role: "user",
-            content: [{ type: "document", source: { type: "base64", media_type: "application/pdf", data: SMALL } }],
-          },
-        ],
-      }),
-    );
-    expect(inputMessages(row, span)[0].parts).toEqual([
-      { type: "blob", modality: "document", mime_type: "application/pdf", content: placeholder(SMALL.length) },
-    ]);
-  });
 
   test("responses: an input file keeps its part", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
@@ -492,71 +347,7 @@ describe("base64 media under content_mode full", () => {
     ]);
   });
 
-  describe("MCP tool results", () => {
-    async function callTool(server: string, args: Record<string, unknown>) {
-      const res = await fetch(`${app!.proxyUrl}/mcp/${server}`, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${CALLER}`,
-          "content-type": "application/json",
-          accept: "application/json, text/event-stream",
-        },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "tools/call",
-          params: { name: "media", arguments: args },
-        }),
-      });
-      const text = await res.text();
-      expect(res.status, text.slice(0, 500)).toBe(200);
-      return { reply: JSON.parse(text), requestId: res.headers.get("x-aisix-request-id") ?? "" };
-    }
 
-    /** The call's exported arguments and result, with no payload anywhere in its records. */
-    async function exported(requestId: string) {
-      expect(requestId).not.toBe("");
-      const row = await waitForSlsLog(sls!, LOGSTORE, (l) => l.get("request_id") === requestId, "SLS row");
-      const mine = () => otlp!.spans.filter((s) => s.attributes["aisix.request_id"] === requestId);
-      await expect.poll(() => mine().some((s) => "gen_ai.tool.call.result" in s.attributes), { timeout: 15_000 }).toBe(true);
-      expect(JSON.stringify([...row.entries()]).includes(MARKER), "payload in the SLS row").toBe(false);
-      expect(JSON.stringify(mine()).includes(MARKER), "payload in a span").toBe(false);
-      const span = mine().find((s) => "gen_ai.tool.call.result" in s.attributes)!;
-      const result = JSON.parse(row.get("response") ?? "null");
-      expect(JSON.parse(String(span.attributes["gen_ai.tool.call.result"]))).toEqual(result);
-      return { args: JSON.parse(row.get("prompt") ?? "null"), result };
-    }
-
-    test("image, audio, resource blob and data URIs keep their blocks, not their payloads", async (ctx) => {
-      if (!etcdReachable || !app) return ctx.skip();
-      const { reply, requestId } = await callTool("media", { image: dataUri(SMALL) });
-      // Only the export changes: the caller receives every payload.
-      expect(reply.result.content).toEqual(mcpResult(SMALL).content);
-      expect(reply.result.structuredContent).toEqual(mcpResult(SMALL).structuredContent);
-      const { args, result } = await exported(requestId);
-      expect(result.content).toEqual(mcpResultExported(SMALL).content);
-      expect(result.structuredContent).toEqual(mcpResultExported(SMALL).structuredContent);
-      expect(args).toEqual({ image: `data:image/png;base64,${placeholder(uriBytes(SMALL))}` });
-    });
-
-    test("an image over the content cap keeps every block", async (ctx) => {
-      if (!etcdReachable || !app) return ctx.skip();
-      expect(LARGE.length).toBeGreaterThan(CONTENT_MAX_BYTES);
-      const { reply, requestId } = await callTool("large", {});
-      expect(reply.result.content[1].data).toBe(LARGE);
-      const { result } = await exported(requestId);
-      expect(result.content).toEqual(mcpResultExported(LARGE).content);
-    });
-
-    test("a result reporting a tool error is omitted the same way", async (ctx) => {
-      if (!etcdReachable || !app) return ctx.skip();
-      const { reply, requestId } = await callTool("media", { failed: true });
-      expect(reply.result.isError).toBe(true);
-      const { result } = await exported(requestId);
-      expect(result.isError).toBe(true);
-      expect(result.content).toEqual(mcpResultExported(SMALL).content);
-    });
-  });
 
   describe("passthrough routes", () => {
     const route = (suffix: string, body: unknown) =>

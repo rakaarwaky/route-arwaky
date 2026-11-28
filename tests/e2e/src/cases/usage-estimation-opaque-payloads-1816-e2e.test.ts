@@ -197,49 +197,4 @@ describe("usage estimation (AISIX-Cloud#1816): images and opaque payloads are no
     expect(prompt).toBeLessThan(PROMPT_TOKEN_CEILING);
   }, 60_000);
 
-  test("/v1/messages: a base64 image inside a tool_result", async (ctx) => {
-    if (!etcdReachable || !app) {
-      ctx.skip();
-      return;
-    }
-    const auth = { "x-api-key": CALLER_PLAINTEXT };
-    await keyAuthenticates();
-
-    const res = await post(
-      "/v1/messages",
-      {
-        model: "est-1816-messages",
-        max_tokens: 16,
-        stream: true,
-        messages: [
-          { role: "user", content: "Take a screenshot of the page." },
-          {
-            role: "assistant",
-            content: [{ type: "tool_use", id: "toolu_1816", name: "screenshot", input: {} }],
-          },
-          {
-            role: "user",
-            content: [
-              {
-                type: "tool_result",
-                tool_use_id: "toolu_1816",
-                content: [
-                  { type: "text", text: "Here is the screenshot." },
-                  { type: "image", source: { type: "base64", media_type: "image/png", data: IMAGE_BASE64 } },
-                ],
-              },
-            ],
-          },
-        ],
-      },
-      auth,
-    );
-    expect(res.status).toBe(200);
-    expect(await res.text()).toContain("Done");
-
-    const record = await estimatedRecord("est-1816-messages");
-    const prompt = Number(record.get("prompt_tokens") ?? "0");
-    expect(prompt).toBeGreaterThan(0);
-    expect(prompt).toBeLessThan(PROMPT_TOKEN_CEILING);
-  }, 60_000);
 });

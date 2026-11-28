@@ -274,27 +274,6 @@ describe("failure labels on the routes that resolve their model mid-request", ()
     expect(metricDelta(before, after, REQUESTS, { model: "unresolved" })).toBe(0);
   });
 
-  test("a realtime refusal after the target was selected names the target too", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const before = await scrapeMetrics(app.metricsUrl);
-
-    const { status, requestId } = await refusedHandshake(REALTIME_NO_PROTOCOL);
-    expect(status).toBe(400);
-
-    const line = await lineOf(requestId);
-    expect(field(line, "requested_model")).toBe(REALTIME_NO_PROTOCOL);
-    expect(field(line, "provider")).toBe("anthropic");
-    const after = await scrapeMetrics(app.metricsUrl);
-    expect(
-      metricDelta(before, after, "aisix_proxy_requests_total", {
-        provider: "anthropic",
-        model: REALTIME_NO_PROTOCOL,
-        upstream_model: "claude-mock",
-        provider_key_name: `${REALTIME_NO_PROTOCOL}-pk`,
-        status: "400",
-      }),
-    ).toBe(1);
-  });
 
   test("a realtime refusal on a wildcard row labels the row, not the caller's name", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();

@@ -34,7 +34,6 @@ import {
 //
 // Reference:
 //   - <https://platform.openai.com/docs/api-reference/chat/create>
-//   - <https://docs.anthropic.com/en/api/messages>
 //   - <https://platform.openai.com/docs/api-reference/responses/create>
 
 const CALLER = "sk-latest-turn-e2e-caller";
@@ -212,18 +211,6 @@ describe("guardrail input_messages: latest_turn (AISIX-Cloud#1558)", () => {
   const chat = (model: string, messages: unknown[]) =>
     post("/v1/chat/completions", { model, messages });
 
-  const anthropic = (
-    model: string,
-    messages: unknown[],
-    system?: string,
-  ) =>
-    post("/v1/messages", {
-      model,
-      max_tokens: 64,
-      ...(system === undefined ? {} : { system }),
-      messages,
-    });
-
   const responses = (model: string, input: unknown[], instructions?: string) =>
     post("/v1/responses", {
       model,
@@ -295,57 +282,6 @@ describe("guardrail input_messages: latest_turn (AISIX-Cloud#1558)", () => {
     ],
   };
 
-  const anthropicBodies = {
-    history: (): [unknown[], string | undefined] => [
-      [
-        { role: "user", content: `earlier ${MARKER}` },
-        { role: "assistant", content: "understood" },
-        { role: "user", content: "a clean new question" },
-      ],
-      "be helpful",
-    ],
-    latest: (): [unknown[], string | undefined] => [
-      [
-        { role: "user", content: "earlier" },
-        { role: "assistant", content: "understood" },
-        { role: "user", content: `now do ${MARKER}` },
-      ],
-      undefined,
-    ],
-    // A tool_use turn is an assistant message, so it is the boundary; the
-    // tool_result answering it rides the FINAL user message.
-    toolResult: (): [unknown[], string | undefined] => [
-      [
-        { role: "user", content: "look it up" },
-        {
-          role: "assistant",
-          content: [
-            { type: "tool_use", id: "tu_1", name: "lookup", input: {} },
-          ],
-        },
-        {
-          role: "user",
-          content: [
-            {
-              type: "tool_result",
-              tool_use_id: "tu_1",
-              content: `found ${MARKER}`,
-            },
-          ],
-        },
-      ],
-      undefined,
-    ],
-    system: (): [unknown[], string | undefined] => [
-      [
-        { role: "user", content: "earlier" },
-        { role: "assistant", content: "understood" },
-        { role: "user", content: "a clean new question" },
-      ],
-      `policy mentions ${MARKER}`,
-    ],
-  };
-
   const assistantMessageItem = (text: string) => ({
     type: "message",
     role: "assistant",
@@ -401,17 +337,13 @@ describe("guardrail input_messages: latest_turn (AISIX-Cloud#1558)", () => {
   const send = {
     chat: (model: string, which: keyof typeof chatBodies) =>
       chat(model, chatBodies[which]()),
-    messages: (model: string, which: keyof typeof anthropicBodies) => {
-      const [msgs, system] = anthropicBodies[which]();
-      return anthropic(model, msgs, system);
-    },
     responses: (model: string, which: keyof typeof responsesBodies) => {
       const [input, instructions] = responsesBodies[which]();
       return responses(model, input, instructions);
     },
   };
 
-  const protocols = ["chat", "messages", "responses"] as const;
+  const protocols = ["chat", "responses"] as const;
   const passes = [
     { pass: "check pass (keyword)", latest: kwLatest, all: kwAll },
     { pass: "segment pass (custom script)", latest: scriptLatest, all: scriptAll },

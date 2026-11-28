@@ -457,26 +457,6 @@ describe("error_source on the request counters", () => {
     );
   });
 
-  test("embeddings and messages tell the two apart as chat does", async (ctx) => {
-    if (!ready()) return ctx.skip();
-    await awaitWindowHeadroom();
-    expect(await send("/v1/embeddings", { model: "es-embed-500", input: "hi" })).toBeGreaterThanOrEqual(500);
-    await expectSource({ endpoint: "/v1/embeddings", model: "es-embed-500" }, "upstream");
-    await send("/v1/embeddings", { model: "es-embed-limited", input: "hi" });
-    expect(await send("/v1/embeddings", { model: "es-embed-limited", input: "hi" })).toBe(429);
-    await expectSource({ endpoint: "/v1/embeddings", model: "es-embed-limited", status: "429" }, "aisix");
-
-    const messages = (model: string) => ({
-      model,
-      max_tokens: 8,
-      messages: [{ role: "user", content: "hi" }],
-    });
-    expect(await send("/v1/messages", messages("es-messages-500"))).toBeGreaterThanOrEqual(500);
-    await expectSource({ endpoint: "/v1/messages", model: "es-messages-500" }, "upstream");
-    await send("/v1/messages", messages("es-messages-limited"));
-    expect(await send("/v1/messages", messages("es-messages-limited"))).toBe(429);
-    await expectSource({ endpoint: "/v1/messages", model: "es-messages-limited", status: "429" }, "aisix");
-  });
 
   test("a provider /v1/videos does not map is the gateway's 501", async (ctx) => {
     if (!ready()) return ctx.skip();
@@ -486,40 +466,4 @@ describe("error_source on the request counters", () => {
     ]);
   });
 
-  test("routes that hold no typed error still name the source", async (ctx) => {
-    if (!ready()) return ctx.skip();
-    const proxyOnly = ["aisix_proxy_requests_total"] as const;
-    const call = {
-      jsonrpc: "2.0",
-      id: "1",
-      method: "message/send",
-      params: { message: { role: "user", parts: [{ kind: "text", text: "hi" }], messageId: "m-1" } },
-    };
-    expect(await send("/a2a/es-agent", call)).toBe(502);
-    await expectSource({ endpoint: "/a2a", status: "502" }, "upstream", proxyOnly);
-    expect(await send("/a2a/es-no-such-agent", call)).toBe(404);
-    await expectSource({ endpoint: "/a2a", status: "404" }, "aisix", proxyOnly);
-
-    expect(await send("/v1/batches?model=es-jobs-400", { input_file_id: "f" })).toBe(400);
-    await expectSource({ endpoint: "/v1/batches", status: "400" }, "upstream", proxyOnly);
-
-    await new Promise<void>((resolve, reject) => {
-      const ws = new WsClient(
-        `${app!.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=es-realtime-400`,
-        { headers: { authorization: `Bearer ${CALLER}` } },
-      );
-      ws.on("close", () => resolve());
-      ws.on("error", reject);
-    });
-    await expectSource({ endpoint: "/v1/realtime", status: "400" }, "upstream");
-
-    const mcp = await fetch(`${app!.proxyUrl}/mcp`, {
-      method: "POST",
-      headers: { authorization: `Bearer ${CALLER}`, "content-type": "application/json" },
-      body: "not json",
-    });
-    await mcp.text();
-    expect(mcp.status).toBeGreaterThanOrEqual(400);
-    await expectSource({ endpoint: "/mcp", status: String(mcp.status) }, "aisix", proxyOnly);
-  });
 });

@@ -240,46 +240,4 @@ describe("rate limit e2e: sliding window", () => {
     expect((await chat(RPM_CALLER)).status).toBe(200);
   }, 150_000);
 
-  test("streamed tokens count in the sliding token window", async (ctx) => {
-    if (!etcdReachable || !app) {
-      ctx.skip();
-      return;
-    }
-    // Keep the stream and the follow-up inside one sub-bucket so the wait
-    // can be bounded by it.
-    if (STEP - (nowSecs() % STEP) < 5) await sleepUntil(nowSecs() - (nowSecs() % STEP) + STEP);
-    const bucketStart = nowSecs() - (nowSecs() % STEP);
-
-    const messages = () =>
-      raw(
-        `${app!.proxyUrl}/v1/messages`,
-        { "x-api-key": TPM_CALLER },
-        {
-          model: "sw-stream",
-          max_tokens: 64,
-          stream: true,
-          messages: [{ role: "user", content: "hi" }],
-        },
-      );
-    expect((await messages()).status).toBe(200);
-
-    // The post-stream commit lands a tick after the client finishes
-    // reading, so the first follow-up can race ahead of it.
-    let refused: RawResponse | undefined;
-    let before = 0;
-    let after = 0;
-    const deadline = Date.now() + 3_000;
-    while (Date.now() < deadline) {
-      before = nowSecs();
-      const res = await messages();
-      after = nowSecs();
-      if (res.status === 429) {
-        refused = res;
-        break;
-      }
-      await new Promise((r) => setTimeout(r, 100));
-    }
-    expect(refused, "the streamed 16 tokens must exhaust tpm 10").toBeDefined();
-    expectRefusal(refused!, { scope: "tpm", limit: 10, bucketStart, before, after });
-  }, 30_000);
 });

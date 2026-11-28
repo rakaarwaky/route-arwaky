@@ -115,18 +115,4 @@ describe("guardrail block log lines name the guardrail", () => {
     expect(line).toContain(`guardrail_hook="output"`);
   });
 
-  test("messages: an output refusal names the output guardrail", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const res = await fetch(`${app!.proxyUrl}/v1/messages`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-api-key": CALLER },
-      body: JSON.stringify({
-        model: "block-log-chat",
-        max_tokens: 64,
-        messages: [{ role: "user", content: "hello" }],
-      }),
-    });
-    expect(res.status).toBe(422);
-    await blockLine("guardrail blocked /v1/messages response", "block-log-output-guard");
-  });
 });

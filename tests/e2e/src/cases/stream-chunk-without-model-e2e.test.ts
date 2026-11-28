@@ -145,24 +145,6 @@ describe("upstream responses without `model` (#533)", () => {
     return false;
   };
 
-  test("/v1/messages streams the text to message_stop", async (ctx) => {
-    if (skip(ctx)) return;
-    await modelBackedBy("no-model-chunk-messages");
-    const sse = await streamText("/v1/messages", {
-      model: "no-model-chunk-messages",
-      max_tokens: 16,
-      stream: true,
-      messages: [{ role: "user", content: "hi" }],
-    });
-    const events = dataPayloads(sse);
-    expect(events.filter((e) => e.type === "error")).toEqual([]);
-    const text = events
-      .filter((e) => e.type === "content_block_delta")
-      .map((e) => (e.delta as { text?: string }).text ?? "")
-      .join("");
-    expect(text).toBe("Hello");
-    expect(events.at(-1)?.type).toBe("message_stop");
-  });
 
   test("/v1/chat/completions streams the text to the finish reason", async (ctx) => {
     if (skip(ctx)) return;

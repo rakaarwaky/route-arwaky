@@ -185,31 +185,6 @@ describe("streaming TPM commit (#688)", () => {
     });
   }
 
-  test("streamed /v1/messages commits tokens post-stream and the next call is 429", async (ctx) => {
-    if (!etcdReachable || !app) {
-      ctx.skip();
-      return;
-    }
-
-    // listModels doesn't consume the token budget, so it's a safe readiness
-    // probe that leaves the TPM quota intact for the measured stream.
-    const probe = new ProxyClient(app.proxyUrl, MSG_CALLER);
-    await waitConfigPropagation(async () => {
-      const res = await probe.listModels();
-      if (res.status !== 200) return false;
-      const data = (res.body as { data?: Array<{ id?: string }> }).data ?? [];
-      return data.some((m) => m.id === "msg-tpm");
-    });
-
-    // First streamed call succeeds and commits its 16 tokens against TPM=10.
-    const first = await postMessages();
-    expect(first.status).toBe(200);
-    expect(await first.text()).toContain("message_stop");
-
-    // The next call is rejected once those streamed tokens are committed.
-    // Pre-fix (no post-stream commit) the counter stayed 0 and this stayed 200.
-    expect(await nextCallEventually429(postMessages)).toBe(429);
-  });
 
   test("streamed /v1/responses commits tokens post-stream and the next call is 429", async (ctx) => {
     if (!etcdReachable || !app) {

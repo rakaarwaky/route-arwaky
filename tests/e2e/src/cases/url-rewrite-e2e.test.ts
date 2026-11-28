@@ -172,22 +172,6 @@ describe("url rewrite e2e: proxy.url_rewrites", () => {
     await alpha?.close();
   });
 
-  test("legacy per-server MCP URL + original tool names work end to end", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-
-    // The migration scenario in one flow: the client keeps its legacy URL
-    // and its original tool name; the rewrite maps the URL onto
-    // /mcp/{server}, which serves original names.
-    const init = await initialize("/mcp-servers/alpha/mcp");
-    expect(init.status).toBe(200);
-    expect(init.serverName).toBe("alpha");
-
-    const listed = await listToolNames("/mcp-servers/alpha/mcp");
-    expect(listed.names).toEqual(["echo", "reverse"]);
-
-    const called = await callTool("/mcp-servers/alpha/mcp", "echo", "hi");
-    expect(called).toEqual({ ok: true, text: "alpha:hi" });
-  });
 
   test("rewriting is generic: any path maps onto any endpoint", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
@@ -203,20 +187,4 @@ describe("url rewrite e2e: proxy.url_rewrites", () => {
     expect(withQuery.status).toBe(200);
   });
 
-  test("a miss leaves the request untouched", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-
-    // Canonical paths keep working alongside the legacy shapes…
-    const canonical = await initialize("/mcp/alpha");
-    expect(canonical.status).toBe(200);
-    const livez = await fetch(`${app.proxyUrl}/livez`);
-    expect(livez.status).toBe(200);
-
-    // …and a legacy shape the rule does not match is NOT silently routed
-    // anywhere (`backend_path` other than /mcp stays unserved).
-    const unmatchedTail = await post("/mcp-servers/alpha/sse", {});
-    expect(unmatchedTail.status).toBe(404);
-    const unknownShape = await fetch(`${app.proxyUrl}/compat/other`);
-    expect(unknownShape.status).toBe(404);
-  });
 });

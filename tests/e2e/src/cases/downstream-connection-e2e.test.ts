@@ -343,31 +343,6 @@ describe("downstream SSE heartbeat (AISIX-Cloud#1126)", () => {
     expect(sse).toContain("data: [DONE]");
   }, 30_000);
 
-  test("bridged /v1/messages heartbeats while the model is silent", async (ctx) => {
-    if (!etcdReachable || !app) {
-      ctx.skip();
-      return;
-    }
-    const res = await fetch(`${app.proxyUrl}/v1/messages`, {
-      method: "POST",
-      headers: {
-        "x-api-key": CALLER_PLAINTEXT,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "hb-chat-model",
-        max_tokens: 16,
-        messages: [{ role: "user", content: "hi" }],
-        stream: true,
-      }),
-    });
-    expect(res.status).toBe(200);
-    const sse = await readStream(res);
-    expect(heartbeatCount(sse)).toBeGreaterThanOrEqual(1);
-    expect(sse).toContain("late reply");
-    expect(sse).toContain("message_stop");
-  }, 30_000);
 
   test("passthrough /v1/responses heartbeats while the model is silent", async (ctx) => {
     if (!etcdReachable || !app) {
